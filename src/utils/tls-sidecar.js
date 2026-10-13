@@ -14,14 +14,15 @@ import { fileURLToPath } from 'url';
 import logger from './logger.js';
 import http from 'http';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const moduleFilename = fileURLToPath(import.meta.url);
+const moduleDirname = path.dirname(moduleFilename);
 
 const DEFAULT_PORT = 9090;
 const HEALTH_CHECK_INTERVAL = 30000; // 30s
 const HEALTH_CHECK_TIMEOUT = 3000;   // 3s
 const MAX_RESTART_ATTEMPTS = 5;
 const RESTART_DELAY = 2000;          // 2s
+const sidecarHttpAgent = new http.Agent({ keepAlive: true });
 
 class TLSSidecar {
     constructor() {
@@ -192,10 +193,13 @@ class TLSSidecar {
         axiosConfig.headers['X-Target-Url'] = targetUrl;
         if (proxyUrl) {
             axiosConfig.headers['X-Proxy-Url'] = proxyUrl;
+        } else {
+            delete axiosConfig.headers['X-Proxy-Url'];
         }
 
-        // 走 sidecar 不需要 Node.js 侧的 TLS agent
-        delete axiosConfig.httpAgent;
+        // Explicitly override inherited axios/gaxios proxy agents for the local hop.
+        axiosConfig.httpAgent = sidecarHttpAgent;
+        axiosConfig.agent = sidecarHttpAgent;
         delete axiosConfig.httpsAgent;
         // 确保 axios 不使用自己的代理
         axiosConfig.proxy = false;
@@ -206,7 +210,7 @@ class TLSSidecar {
     // ──── 内部方法 ────
 
     _findBinary() {
-        const projectRoot = path.resolve(__dirname, '..', '..');
+        const projectRoot = path.resolve(moduleDirname, '..', '..');
         const isWin = process.platform === 'win32';
         const ext = isWin ? '.exe' : '';
 

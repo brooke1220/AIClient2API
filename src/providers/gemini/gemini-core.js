@@ -12,7 +12,7 @@ import { configureTLSSidecar } from '../../utils/proxy-utils.js';
 import { API_ACTIONS, formatExpiryTime, isRetryableNetworkError, formatExpiryLog, getRetryAfterMs, normalizeProviderErrorMessage } from '../../utils/common.js';
 import { getProviderModels } from '../provider-models.js';
 import { handleGeminiCliOAuth } from '../../auth/oauth-handlers.js';
-import { getProxyConfigForProvider, getGoogleAuthProxyConfig, isTLSSidecarEnabledForProvider } from '../../utils/proxy-utils.js';
+import { getProxyConfigForProvider, getGoogleAuthProxyConfig } from '../../utils/proxy-utils.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
 import { MODEL_PROVIDER } from '../../utils/common.js';
 
@@ -268,18 +268,14 @@ export class GeminiApiService {
         // 检查是否需要使用代理
         const proxyConfig = getGoogleAuthProxyConfig(config, config.MODEL_PROVIDER || MODEL_PROVIDER.GEMINI_CLI);
         
-        // 检查是否启用了 TLS Sidecar
-        const isTLSSidecarEnabled = isTLSSidecarEnabledForProvider(config, config.MODEL_PROVIDER || MODEL_PROVIDER.GEMINI_CLI);
-        
         // 配置 OAuth2Client 使用自定义的 HTTP agent
         const oauth2Options = {
             clientId: OAUTH_CLIENT_ID,
             clientSecret: OAUTH_CLIENT_SECRET,
         };
         
-        if (isTLSSidecarEnabled) {
-            logger.info('[Gemini] TLS Sidecar enabled, skipping proxy/agent configuration for OAuth2Client');
-        } else if (proxyConfig) {
+        // OAuth refresh does not pass through _applySidecar, so retain its proxy agent.
+        if (proxyConfig) {
             oauth2Options.transporterOptions = proxyConfig;
             logger.info('[Gemini] Using proxy for OAuth2Client');
         } else {
@@ -318,7 +314,11 @@ export class GeminiApiService {
     }
 
     _applySidecar(requestOptions) {
-        return configureTLSSidecar(requestOptions, this.config, this.config.MODEL_PROVIDER || MODEL_PROVIDER.GEMINI_CLI);
+        configureTLSSidecar(requestOptions, this.config, this.config.MODEL_PROVIDER || MODEL_PROVIDER.GEMINI_CLI);
+        const agent = String(requestOptions.url).startsWith('http:')
+            ? requestOptions.httpAgent : requestOptions.httpsAgent;
+        if (agent) requestOptions.agent = agent;
+        return requestOptions;
     }
 
     /**

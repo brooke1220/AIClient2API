@@ -1,0 +1,351 @@
+{
+  "version": 1,
+  "jobId": "bf99e1d7-f816-4405-a9ea-308bdb5e4bba",
+  "sessionId": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+  "scopeKey": "bfe4522d0800fd16af89d81ade02b7e44d2308555e7ba9e7a9cbcdfab461ad77",
+  "revision": 43,
+  "createdAt": "2026-10-13T08:59:03.699Z",
+  "updatedAt": "2026-10-13T08:59:05.550Z",
+  "producerGraceExpiresAt": "2026-10-13T08:59:33.699Z",
+  "bestEffortDeadlineAt": "2026-10-13T09:00:24.699Z",
+  "producers": {
+    "core": {
+      "state": "sealed",
+      "intentKey": "ad3746b509ddbd88ab65c26cd487a995d2a6da6f1d61a4fd7dbfcbd5532a7cfc",
+      "payloadDigest": "ad3746b509ddbd88ab65c26cd487a995d2a6da6f1d61a4fd7dbfcbd5532a7cfc",
+      "sealedAt": "2026-10-13T08:59:03.728Z",
+      "sealedBy": "foreground"
+    },
+    "wiki": {
+      "state": "no-op",
+      "sealedAt": "2026-10-13T08:59:03.718Z",
+      "sealedBy": "wiki-producer"
+    }
+  },
+  "actions": {
+    "foreground-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "completed",
+      "attempts": 0,
+      "idempotencyKey": "71dd227c373e666c21a397931ba1839cd6660f32ea79ba05548ae4e0be4dbaef",
+      "payload": {
+        "transcriptPath": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+        "cwd": "/Users/pengboting/Desktop/AIClient2API",
+        "reason": "clear",
+        "input": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "transcript_path": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+          "cwd": "/Users/pengboting/Desktop/AIClient2API",
+          "prompt_id": "779237da-2c78-465d-bdaa-e9db54dd324d",
+          "hook_event_name": "SessionEnd",
+          "reason": "clear"
+        },
+        "metrics": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "ended_at": "2026-10-13T08:59:03.696Z",
+          "reason": "clear",
+          "agents_spawned": 0,
+          "agents_completed": 0,
+          "modes_used": []
+        },
+        "initialTeamNames": [],
+        "openClawEnabled": false,
+        "openClawRouting": {},
+        "foregroundResult": {
+          "removedTransientFiles": 2,
+          "completedAt": "2026-10-13T08:59:03.723Z"
+        }
+      },
+      "budgetMs": 9000,
+      "completedAt": "2026-10-13T08:59:03.728Z",
+      "lastOutcomeCode": "completed"
+    },
+    "wiki-capture": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "completed",
+      "attempts": 0,
+      "idempotencyKey": "1698112e3e0db8e1e6287c45a1c8beceab003c0cef4a5db85361e7f934b92618",
+      "payload": {
+        "transcriptPath": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+        "cwd": "/Users/pengboting/Desktop/AIClient2API",
+        "reason": "clear",
+        "input": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "transcript_path": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+          "cwd": "/Users/pengboting/Desktop/AIClient2API",
+          "prompt_id": "779237da-2c78-465d-bdaa-e9db54dd324d",
+          "hook_event_name": "SessionEnd",
+          "reason": "clear"
+        },
+        "metrics": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "ended_at": "2026-10-13T08:59:03.696Z",
+          "reason": "clear",
+          "agents_spawned": 0,
+          "agents_completed": 0,
+          "modes_used": []
+        },
+        "initialTeamNames": [],
+        "openClawEnabled": false,
+        "openClawRouting": {}
+      },
+      "budgetMs": 9000,
+      "completedAt": "2026-10-13T08:59:03.718Z"
+    },
+    "team-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "completed",
+      "attempts": 1,
+      "idempotencyKey": "b1af07f502d88d4fde5d60f5775e06188ad9aab3ca22219ba44aa13b0f551935",
+      "payload": {
+        "transcriptPath": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+        "cwd": "/Users/pengboting/Desktop/AIClient2API",
+        "reason": "clear",
+        "input": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "transcript_path": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+          "cwd": "/Users/pengboting/Desktop/AIClient2API",
+          "prompt_id": "779237da-2c78-465d-bdaa-e9db54dd324d",
+          "hook_event_name": "SessionEnd",
+          "reason": "clear"
+        },
+        "metrics": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "ended_at": "2026-10-13T08:59:03.696Z",
+          "reason": "clear",
+          "agents_spawned": 0,
+          "agents_completed": 0,
+          "modes_used": []
+        },
+        "initialTeamNames": [],
+        "openClawEnabled": false,
+        "openClawRouting": {}
+      },
+      "budgetMs": 9000,
+      "claimedAt": "2026-10-13T08:59:04.176Z",
+      "runner": {
+        "attempt": 1,
+        "runnerNonce": "019a95ca-3188-495b-a41a-52d4a77b5175",
+        "phase": "terminal",
+        "deadlineAt": "2026-10-13T08:59:14.129Z"
+      },
+      "lastOutcomeCode": "completed",
+      "completedAt": "2026-10-13T08:59:04.576Z"
+    },
+    "python-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "completed",
+      "attempts": 1,
+      "idempotencyKey": "95b217e58d2674f7d46f2feaa601d4e5d39a3620c572fee7ed2dc43243adfa11",
+      "payload": {
+        "transcriptPath": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+        "cwd": "/Users/pengboting/Desktop/AIClient2API",
+        "reason": "clear",
+        "input": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "transcript_path": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+          "cwd": "/Users/pengboting/Desktop/AIClient2API",
+          "prompt_id": "779237da-2c78-465d-bdaa-e9db54dd324d",
+          "hook_event_name": "SessionEnd",
+          "reason": "clear"
+        },
+        "metrics": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "ended_at": "2026-10-13T08:59:03.696Z",
+          "reason": "clear",
+          "agents_spawned": 0,
+          "agents_completed": 0,
+          "modes_used": []
+        },
+        "initialTeamNames": [],
+        "openClawEnabled": false,
+        "openClawRouting": {}
+      },
+      "budgetMs": 9000,
+      "claimedAt": "2026-10-13T08:59:04.593Z",
+      "runner": {
+        "attempt": 1,
+        "runnerNonce": "aaf0f648-cf4c-4776-aa66-e9e781d4a304",
+        "phase": "terminal",
+        "deadlineAt": "2026-10-13T08:59:14.129Z"
+      },
+      "lastOutcomeCode": "completed",
+      "completedAt": "2026-10-13T08:59:04.997Z"
+    },
+    "reply-cleanup": {
+      "class": "required",
+      "phase": "deferred-required",
+      "status": "completed",
+      "attempts": 1,
+      "idempotencyKey": "8612a751de52625c47416f2c9ae712351e0dc79184f29637d830bddb7b1b166f",
+      "payload": {
+        "transcriptPath": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+        "cwd": "/Users/pengboting/Desktop/AIClient2API",
+        "reason": "clear",
+        "input": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "transcript_path": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+          "cwd": "/Users/pengboting/Desktop/AIClient2API",
+          "prompt_id": "779237da-2c78-465d-bdaa-e9db54dd324d",
+          "hook_event_name": "SessionEnd",
+          "reason": "clear"
+        },
+        "metrics": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "ended_at": "2026-10-13T08:59:03.696Z",
+          "reason": "clear",
+          "agents_spawned": 0,
+          "agents_completed": 0,
+          "modes_used": []
+        },
+        "initialTeamNames": [],
+        "openClawEnabled": false,
+        "openClawRouting": {}
+      },
+      "budgetMs": 9000,
+      "claimedAt": "2026-10-13T08:59:05.011Z",
+      "runner": {
+        "attempt": 1,
+        "runnerNonce": "c86eb991-b54f-4898-b536-b89946c68716",
+        "phase": "terminal",
+        "deadlineAt": "2026-10-13T08:59:14.129Z"
+      },
+      "lastOutcomeCode": "completed",
+      "completedAt": "2026-10-13T08:59:05.157Z"
+    },
+    "callback": {
+      "class": "best-effort",
+      "phase": "deferred-best-effort",
+      "status": "completed",
+      "attempts": 1,
+      "idempotencyKey": "33a43d65fdc9ea6e1beec9fd58f2f1cd1f2d6ca12a8ff8a83ac8d28843c2e829",
+      "payload": {
+        "transcriptPath": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+        "cwd": "/Users/pengboting/Desktop/AIClient2API",
+        "reason": "clear",
+        "input": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "transcript_path": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+          "cwd": "/Users/pengboting/Desktop/AIClient2API",
+          "prompt_id": "779237da-2c78-465d-bdaa-e9db54dd324d",
+          "hook_event_name": "SessionEnd",
+          "reason": "clear"
+        },
+        "metrics": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "ended_at": "2026-10-13T08:59:03.696Z",
+          "reason": "clear",
+          "agents_spawned": 0,
+          "agents_completed": 0,
+          "modes_used": []
+        },
+        "initialTeamNames": [],
+        "openClawEnabled": false,
+        "openClawRouting": {}
+      },
+      "budgetMs": 2000,
+      "claimedAt": "2026-10-13T08:59:05.174Z",
+      "runner": {
+        "attempt": 1,
+        "runnerNonce": "d43ed11a-362a-428e-a475-caa7d1a71dcb",
+        "phase": "terminal",
+        "deadlineAt": "2026-10-13T08:59:14.129Z"
+      },
+      "lastOutcomeCode": "completed",
+      "completedAt": "2026-10-13T08:59:05.284Z"
+    },
+    "notification": {
+      "class": "best-effort",
+      "phase": "deferred-best-effort",
+      "status": "completed",
+      "attempts": 1,
+      "idempotencyKey": "16441c6839db40c2f507fd0d72efd1c3362f6e2a59ed6f9877c41b2275f74fda",
+      "payload": {
+        "transcriptPath": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+        "cwd": "/Users/pengboting/Desktop/AIClient2API",
+        "reason": "clear",
+        "input": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "transcript_path": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+          "cwd": "/Users/pengboting/Desktop/AIClient2API",
+          "prompt_id": "779237da-2c78-465d-bdaa-e9db54dd324d",
+          "hook_event_name": "SessionEnd",
+          "reason": "clear"
+        },
+        "metrics": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "ended_at": "2026-10-13T08:59:03.696Z",
+          "reason": "clear",
+          "agents_spawned": 0,
+          "agents_completed": 0,
+          "modes_used": []
+        },
+        "initialTeamNames": [],
+        "openClawEnabled": false,
+        "openClawRouting": {}
+      },
+      "budgetMs": 2000,
+      "claimedAt": "2026-10-13T08:59:05.299Z",
+      "runner": {
+        "attempt": 1,
+        "runnerNonce": "bf59fe09-9c0a-4c2f-b2cb-16cb966c4443",
+        "phase": "terminal",
+        "deadlineAt": "2026-10-13T08:59:14.129Z"
+      },
+      "lastOutcomeCode": "completed",
+      "completedAt": "2026-10-13T08:59:05.403Z"
+    },
+    "openclaw": {
+      "class": "best-effort",
+      "phase": "deferred-best-effort",
+      "status": "completed",
+      "attempts": 1,
+      "idempotencyKey": "6516ca3ee3f16bde445cef97863043b184050fa0877bf9a0c56b9e8c624f8349",
+      "payload": {
+        "transcriptPath": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+        "cwd": "/Users/pengboting/Desktop/AIClient2API",
+        "reason": "clear",
+        "input": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "transcript_path": "/Users/pengboting/.claude/projects/-Users-pengboting-Desktop-AIClient2API/2109cfae-7d8f-42b6-b9de-27ae24c8851d.jsonl",
+          "cwd": "/Users/pengboting/Desktop/AIClient2API",
+          "prompt_id": "779237da-2c78-465d-bdaa-e9db54dd324d",
+          "hook_event_name": "SessionEnd",
+          "reason": "clear"
+        },
+        "metrics": {
+          "session_id": "2109cfae-7d8f-42b6-b9de-27ae24c8851d",
+          "ended_at": "2026-10-13T08:59:03.696Z",
+          "reason": "clear",
+          "agents_spawned": 0,
+          "agents_completed": 0,
+          "modes_used": []
+        },
+        "initialTeamNames": [],
+        "openClawEnabled": false,
+        "openClawRouting": {}
+      },
+      "budgetMs": 2000,
+      "claimedAt": "2026-10-13T08:59:05.418Z",
+      "runner": {
+        "attempt": 1,
+        "runnerNonce": "214a630b-3b05-438e-a0a3-72b536c8f441",
+        "phase": "terminal",
+        "deadlineAt": "2026-10-13T08:59:14.129Z"
+      },
+      "lastOutcomeCode": "completed",
+      "completedAt": "2026-10-13T08:59:05.518Z"
+    }
+  },
+  "owner": null,
+  "phase": "complete",
+  "completion": {
+    "completedAt": "2026-10-13T08:59:05.533Z",
+    "terminalDigest": "dfaad7c5b099a5b903196181ce7756df04b9c5a1d339f3d93b61e3ede9dbcba1",
+    "terminalRevision": 42
+  }
+}

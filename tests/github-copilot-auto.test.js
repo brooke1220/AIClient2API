@@ -1,6 +1,7 @@
 jest.mock('../src/utils/proxy-utils.js', () => ({
     configureAxiosProxy: config => config,
     configureTLSSidecar: config => config,
+    resolveProxyUrlForProvider: () => null,
     isTLSSidecarEnabledForProvider: () => false
 }));
 jest.mock('../src/utils/logger.js', () => ({
@@ -59,6 +60,17 @@ describe('GitHub Copilot Auto routing', () => {
         });
         service.createSdkClient = () => client;
         return { service, client, session, isIdleEmitted: () => idleEmitted };
+    }
+
+    // Quota calls run on a per-proxy route instance, which only forwards
+    // createSdkClient to the parent, so stub the SDK client at that level.
+    function stubSdkClient(service, client) {
+        service.createSdkClient = () => ({
+            start: jest.fn().mockResolvedValue(undefined),
+            stop: jest.fn().mockResolvedValue(undefined),
+            forceStop: jest.fn().mockResolvedValue(undefined),
+            ...client
+        });
     }
 
     beforeEach(() => {
@@ -249,7 +261,7 @@ describe('GitHub Copilot Auto routing', () => {
                 }
             }
         });
-        service.getSdkClient = jest.fn().mockResolvedValue({
+        stubSdkClient(service, {
             rpc: { account: { getQuota } }
         });
 
@@ -273,7 +285,7 @@ describe('GitHub Copilot Auto routing', () => {
 
     test('skips zero-entitlement premium quota when chat quota is available', async () => {
         const { service } = createService();
-        service.getSdkClient = jest.fn().mockResolvedValue({
+        stubSdkClient(service, {
             rpc: {
                 account: {
                     getQuota: jest.fn().mockResolvedValue({
@@ -306,7 +318,7 @@ describe('GitHub Copilot Auto routing', () => {
 
     test('reports unlimited entitlement without a misleading percentage', async () => {
         const { service } = createService();
-        service.getSdkClient = jest.fn().mockResolvedValue({
+        stubSdkClient(service, {
             rpc: {
                 account: {
                     getQuota: jest.fn().mockResolvedValue({

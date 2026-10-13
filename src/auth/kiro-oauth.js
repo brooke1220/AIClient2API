@@ -86,7 +86,6 @@ async function fetchWithProxy(url, options = {}, providerType) {
         axiosConfig.httpAgent = proxyConfig.httpAgent;
         axiosConfig.httpsAgent = proxyConfig.httpsAgent;
         axiosConfig.proxy = false; // 禁用 axios 内置代理，使用我们的 agent
-        logger.info(`[OAuth] Using proxy for ${providerType}: ${CONFIG.PROXY_URL}`);
     }
 
     try {

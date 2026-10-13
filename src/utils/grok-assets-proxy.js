@@ -16,6 +16,10 @@ export async function handleGrokAssetsProxy(req, res, config, providerPoolManage
         const targetUrl = requestUrl.searchParams.get('url');
         let ssoToken = requestUrl.searchParams.get('sso');
         const uuid = requestUrl.searchParams.get('uuid');
+        const providerConfig = uuid && providerPoolManager
+            ? providerPoolManager.findProviderByUuid(uuid)
+            : null;
+        const requestConfig = providerConfig ? { ...config, ...providerConfig } : config;
 
         if (!targetUrl) {
             res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -25,7 +29,6 @@ export async function handleGrokAssetsProxy(req, res, config, providerPoolManage
 
         // 优先尝试从 uuid 换取 token，提高安全性
         if (!ssoToken && uuid && providerPoolManager) {
-            const providerConfig = providerPoolManager.findProviderByUuid(uuid);
             if (providerConfig) {
                 ssoToken = providerConfig.GROK_COOKIE_TOKEN;
                 logger.debug(`[Grok Proxy] Resolved SSO token from uuid: ${uuid}`);
@@ -67,7 +70,7 @@ export async function handleGrokAssetsProxy(req, res, config, providerPoolManage
         }
 
         const headers = {
-            'User-Agent': config.GROK_USER_AGENT || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+            'User-Agent': requestConfig.GROK_USER_AGENT || 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
             'Cookie': `sso=${ssoToken}; sso-rw=${ssoToken}`,
             'Referer': 'https://grok.com/',
             'Accept': '*/*'
@@ -83,7 +86,7 @@ export async function handleGrokAssetsProxy(req, res, config, providerPoolManage
         };
 
         // 配置代理
-        configureAxiosProxy(axiosConfig, config, MODEL_PROVIDER.GROK_WEB);
+        configureAxiosProxy(axiosConfig, requestConfig, MODEL_PROVIDER.GROK_WEB);
 
         logger.debug(`[Grok Proxy] Proxying request to: ${finalTargetUrl}`);
 

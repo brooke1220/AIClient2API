@@ -8,6 +8,7 @@ import { promisify } from 'util';
 import axios from 'axios';
 import { CONFIG } from '../core/config-manager.js';
 import { parseProxyUrl } from '../utils/proxy-utils.js';
+import { redactProxyUrl } from '../utils/node-proxy-config.js';
 import { getRequestBody } from '../utils/common.js';
 import { isValidVersionTag } from '../utils/version-tag.js';
 
@@ -79,7 +80,7 @@ function getUpdateProxyConfig() {
     
     const proxyConfig = parseProxyUrl(CONFIG.PROXY_URL);
     if (proxyConfig) {
-        logger.info(`[Update] Using ${proxyConfig.proxyType} proxy for update check: ${CONFIG.PROXY_URL}`);
+        logger.info(`[Update] Using ${proxyConfig.proxyType} proxy for update check: ${redactProxyUrl(CONFIG.PROXY_URL)}`);
     }
     return proxyConfig;
 }

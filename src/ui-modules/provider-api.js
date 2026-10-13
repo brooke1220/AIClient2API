@@ -9,12 +9,36 @@ import {
     usesManagedModelList
 } from '../providers/provider-models.js';
 import { generateUUID, createProviderConfig, formatSystemPath, detectProviderFromPath, addToUsedPaths, isPathUsed, pathsEqual } from '../utils/provider-utils.js';
-import { broadcastEvent } from './event-broadcast.js';
-import { getRegisteredProviders, getServiceAdapter, invalidateServiceAdapter, serviceInstances } from '../providers/adapter.js';
+import { broadcastEvent as emitEvent } from './event-broadcast.js';
+import { getRegisteredProviders, getServiceAdapter, invalidateServiceAdapter } from '../providers/adapter.js';
 import { withFileLock, atomicWriteFile } from '../utils/file-lock.js';
 import { normalizeProviderConfigFields } from '../utils/provider-config-normalizer.js';
 
+// The display marker deliberately contains a space: it cannot be saved as a
+// valid proxy URL if a client edits the address but leaves hidden credentials.
+function maskNodeProxyUrlForDisplay(value) {
+    if (value === undefined || value === null || value === '') return value;
+    try {
+        const url = new URL(value);
+        if (!url.username && !url.password) return value;
+        return `${url.protocol}//[credentials hidden]@${url.host}${url.pathname}${url.search}${url.hash}`;
+    } catch {
+        return '[invalid proxy URL]';
+    }
+}
 
+function omitNodeProxyUrls(data) {
+    if (Array.isArray(data)) return data.map(omitNodeProxyUrls);
+    if (!data || typeof data !== 'object') return data;
+    return Object.fromEntries(Object.entries(data)
+        .filter(([key]) => key !== 'NODE_PROXY_URL')
+        .map(([key, value]) => [key, omitNodeProxyUrls(value)]));
+}
+
+// Event consumers reload provider data; they do not need proxy addresses.
+function broadcastEvent(eventType, data) {
+    emitEvent(eventType, omitNodeProxyUrls(data));
+}
 
 // 文件级互斥锁：防止并发读写导致数据丢失
 // 安全净化：移除用户输入字段中的危险内容（script、事件处理器、javascript:协议等），
@@ -23,6 +47,9 @@ import { normalizeProviderConfigFields } from '../utils/provider-config-normaliz
 function sanitizeProviderData(provider, maskSensitive = false) {
     if (!provider || typeof provider !== 'object') return provider;
     const sanitized = { ...provider };
+    if (Object.prototype.hasOwnProperty.call(sanitized, 'NODE_PROXY_URL')) {
+        sanitized.NODE_PROXY_URL = maskNodeProxyUrlForDisplay(sanitized.NODE_PROXY_URL);
+    }
     
     // 1. 过滤敏感字段（API Keys, Tokens 等）
     if (maskSensitive) {
@@ -78,12 +105,22 @@ function sanitizeProviderPools(pools, maskSensitive = false) {
 /**
  * 过滤掉数据中的脱敏占位符，避免在保存时覆盖真实数据
  */
-function filterMaskedData(data) {
+function filterMaskedData(data, existingProvider = {}) {
     if (!data || typeof data !== 'object') return data;
     const result = { ...data };
     
     for (const key in result) {
         const val = result[key];
+        if (key === 'NODE_PROXY_URL') {
+            const existingValue = existingProvider.NODE_PROXY_URL;
+            const displayValue = maskNodeProxyUrlForDisplay(existingValue);
+            // Preserve unchanged display values from older or external clients.
+            // Never match arbitrary asterisks: they may be real credentials.
+            if (typeof val === 'string' && displayValue !== existingValue && val.trim() === displayValue) {
+                delete result[key];
+            }
+            continue;
+        }
         if (typeof val === 'string') {
             // 匹配 ******** 或 XXXX****XXXX 格式
             // 如果值包含 **** 且长度符合脱敏特征，则认为它是脱敏后的回传值，应该忽略
@@ -447,14 +484,12 @@ export async function handleDetectProviderModels(req, res, currentConfig, provid
         }
 
         const body = await getRequestBody(req);
-        const draftConfig = normalizeProviderConfigFields(filterMaskedData(body?.providerConfig || {}));
-
         const providerPools = loadProviderPools(currentConfig, providerPoolManager);
         const providers = providerPools[providerType] || [];
         const existingProvider = providers.find(provider => provider.uuid === providerUuid) || {};
+        const draftConfig = normalizeProviderConfigFields(filterMaskedData(body?.providerConfig || {}, existingProvider));
 
         const detectionUuid = `${providerUuid}-detect-models`;
-        const instanceKey = `${providerType}${detectionUuid}`;
         const tempConfig = {
             ...currentConfig,
             ...existingProvider,
@@ -466,7 +501,7 @@ export async function handleDetectProviderModels(req, res, currentConfig, provid
 
         let models = [];
         try {
-            delete serviceInstances[instanceKey];
+            invalidateServiceAdapter(providerType, detectionUuid);
             const serviceAdapter = getServiceAdapter(tempConfig);
             if (typeof serviceAdapter.listModels !== 'function') {
                 throw new Error(`Provider ${providerType} does not support model detection`);
@@ -475,7 +510,7 @@ export async function handleDetectProviderModels(req, res, currentConfig, provid
             const nativeModels = await serviceAdapter.listModels();
             models = extractModelIdsFromNativeList(nativeModels, providerType);
         } finally {
-            delete serviceInstances[instanceKey];
+            invalidateServiceAdapter(providerType, detectionUuid);
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -489,8 +524,8 @@ export async function handleDetectProviderModels(req, res, currentConfig, provid
         }));
         return true;
     } catch (error) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: error.message } }));
+        res.writeHead(error.code === 'INVALID_NODE_PROXY_URL' ? 400 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: error.message, ...(error.code === 'INVALID_NODE_PROXY_URL' && { code: error.code }) } }));
         return true;
     }
 }
@@ -572,7 +607,7 @@ async function _handleAddProvider(req, res, currentConfig, providerPoolManager, 
             action: 'add',
             filePath: filePath,
             providerType,
-            providerConfig: sanitizeProviderData(providerConfig),
+            providerConfig: sanitizeProviderData(filteredConfig),
             timestamp: new Date().toISOString()
         });
 
@@ -580,7 +615,7 @@ async function _handleAddProvider(req, res, currentConfig, providerPoolManager, 
         broadcastEvent('provider_update', {
             action: 'add',
             providerType,
-            providerConfig: sanitizeProviderData(providerConfig),
+            providerConfig: sanitizeProviderData(filteredConfig),
             timestamp: new Date().toISOString()
         });
 
@@ -588,13 +623,13 @@ async function _handleAddProvider(req, res, currentConfig, providerPoolManager, 
         res.end(JSON.stringify({
             success: true,
             message: 'Provider added successfully',
-            provider: sanitizeProviderData(providerConfig, true),
+            provider: sanitizeProviderData(filteredConfig, true),
             providerType
         }));
         return true;
     } catch (error) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: error.message } }));
+        res.writeHead(error.code === 'INVALID_NODE_PROXY_URL' ? 400 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: error.message, ...(error.code === 'INVALID_NODE_PROXY_URL' && { code: error.code }) } }));
         return true;
     }
 }
@@ -652,7 +687,7 @@ async function _handleUpdateProvider(req, res, currentConfig, providerPoolManage
         const existingProvider = providers[providerIndex];
         
         // 过滤掉传入配置中的脱敏占位符，避免覆盖真实数据
-        const filteredConfig = normalizeProviderConfigFields(filterMaskedData(providerConfig));
+        const filteredConfig = normalizeProviderConfigFields(filterMaskedData(providerConfig, existingProvider));
         if (usesManagedModelList(providerType)) {
             filteredConfig.supportedModels = normalizeModelIds(filteredConfig.supportedModels);
             filteredConfig.notSupportedModels = [];
@@ -698,8 +733,8 @@ async function _handleUpdateProvider(req, res, currentConfig, providerPoolManage
         }));
         return true;
     } catch (error) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { message: error.message } }));
+        res.writeHead(error.code === 'INVALID_NODE_PROXY_URL' ? 400 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: error.message, ...(error.code === 'INVALID_NODE_PROXY_URL' && { code: error.code }) } }));
         return true;
     }
 }
@@ -1042,6 +1077,9 @@ async function _handleDeleteUnhealthyProviders(req, res, currentConfig, provider
         // Save to file
         await atomicWriteFile(filePath, JSON.stringify(providerPools, null, 2), 'utf-8');
         logger.info(`[UI API] Deleted ${unhealthyProviders.length} unhealthy providers from ${providerType}`);
+        for (const provider of unhealthyProviders) {
+            invalidateServiceAdapter(providerType, provider.uuid);
+        }
 
         // Update provider pool manager if available
         if (providerPoolManager) {
@@ -1141,6 +1179,10 @@ async function _handleRefreshUnhealthyUuids(req, res, currentConfig, providerPoo
         // Save to file
         await atomicWriteFile(filePath, JSON.stringify(providerPools, null, 2), 'utf-8');
         logger.info(`[UI API] Refreshed UUIDs for ${refreshedProviders.length} unhealthy providers in ${providerType}`);
+        for (const provider of refreshedProviders) {
+            invalidateServiceAdapter(providerType, provider.oldUuid);
+            invalidateServiceAdapter(providerType, provider.newUuid);
+        }
 
         // Update provider pool manager if available
         if (providerPoolManager) {
@@ -1551,7 +1593,7 @@ export async function handleQuickLinkProvider(req, res, currentConfig, providerP
             message: message,
             successCount: successCount,
             failCount: failCount,
-            results: results
+            results: results.map(result => ({ ...result, ...(result.provider && { provider: sanitizeProviderData(result.provider, true) }) }))
         }));
         return true;
     } catch (error) {

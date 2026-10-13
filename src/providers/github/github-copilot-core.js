@@ -4,12 +4,23 @@ import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
-import { CopilotClient } from '@github/copilot-sdk';
+import { CopilotClient, RuntimeConnection } from '@github/copilot-sdk';
 import logger from '../../utils/logger.js';
-import { configureAxiosProxy, configureTLSSidecar, isTLSSidecarEnabledForProvider } from '../../utils/proxy-utils.js';
+import { configureTLSSidecar, resolveProxyUrlForProvider } from '../../utils/proxy-utils.js';
+import { buildSdkProxyEnv, createSdkProxyBridge } from '../../utils/sdk-proxy-bridge.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, getRetryAfterMs } from '../../utils/common.js';
 
 const COPILOT_AUTO_TIERS = new Set(['efficiency', 'balance', 'intelligence']);
+export const COPILOT_SDK_ROUTE_CAPACITY = 4;
+
+function sdkRouteCapacityError() {
+    const error = new Error('[GitHub Copilot] All SDK proxy route slots are busy. Retry shortly.');
+    error.code = 'COPILOT_SDK_ROUTE_CAPACITY';
+    error.status = error.statusCode = 503;
+    error.retryAfterMs = 1000;
+    error.skipErrorCount = true;
+    return error;
+}
 
 export function normalizeCopilotAutoTier(value, fallback = 'balance') {
     const tier = String(value || fallback).toLowerCase();
@@ -108,6 +119,21 @@ export class GitHubCopilotApiService {
 
         this.apiKey = config.GITHUB_COPILOT_API_KEY;
         this.sdkClientPromise = null;
+        this.sdkClient = null;
+        this.sdkProxyBridge = null;
+        this.sdkActiveOperations = 0;
+        this.retired = false;
+        this.sdkForceDisposed = false;
+        this.sdkDisposePromise = null;
+        this.sdkCleanupPromise = null;
+        this.sdkStopPromises = new WeakMap();
+        this.sdkRoutes = new Map();
+        this.sdkRouteSlots = new Set();
+        this.sdkRouteReservations = new Set();
+        this.sdkRouteSequence = 0;
+        this.sdkRouteProxyUrl = undefined;
+        this.isSdkRoute = false;
+        this.sdkRoutesDisposePromise = null;
         this.quotaCache = null;
         if (!this.apiKey) {
             logger.warn('[GitHub Copilot] No fine-grained personal access token found.');
@@ -124,84 +150,249 @@ export class GitHubCopilotApiService {
         this.axiosInstance = axios.create(axiosConfig);
     }
 
-    createSdkClient() {
+    createSdkClient(env) {
         const safeId = String(this.config.uuid || 'default').replace(/[^a-zA-Z0-9_-]/g, '_');
         return new CopilotClient({
             gitHubToken: this.apiKey,
             useLoggedInUser: false,
             mode: 'empty',
             baseDirectory: path.join(os.tmpdir(), 'aiclient2api-copilot-sdk', safeId),
-            logLevel: 'error'
+            logLevel: 'error',
+            ...(env ? { env, connection: RuntimeConnection.forStdio() } : {})
         });
     }
 
-    async getSdkClient() {
+    assertUsable() {
+        if (this.retired) throw new Error('[GitHub Copilot] This provider instance has been retired. Retry with the current provider configuration.');
+    }
+
+    createSdkRoute(proxyUrl) {
+        const route = new GitHubCopilotApiService({ ...this.config });
+        route.sdkRouteProxyUrl = proxyUrl;
+        route.isSdkRoute = true;
+        route.createSdkClient = env => this.createSdkClient(env);
+        this.sdkRoutes.set(proxyUrl, route);
+        this.sdkRouteSlots.add(route);
+        return route;
+    }
+
+    leaseSdkRoute(route) {
+        const finish = route.beginSdkOperation();
+        route.sdkLastUsed = ++this.sdkRouteSequence;
+        let released = false;
+        return {
+            route,
+            finish: () => {
+                if (released) return;
+                released = true;
+                route.sdkLastUsed = ++this.sdkRouteSequence;
+                finish();
+            }
+        };
+    }
+
+    async acquireSdkRoute() {
+        this.assertUsable();
+        const proxyUrl = resolveProxyUrlForProvider(this.config, this.config.MODEL_PROVIDER || MODEL_PROVIDER.GITHUB_COPILOT);
+        const existing = this.sdkRoutes.get(proxyUrl);
+        if (existing) return this.leaseSdkRoute(existing);
+        if (this.sdkRouteReservations.has(proxyUrl)) throw sdkRouteCapacityError();
+
+        if (this.sdkRouteSlots.size >= COPILOT_SDK_ROUTE_CAPACITY) {
+            const idle = [...this.sdkRoutes.values()]
+                .filter(route => route.sdkActiveOperations === 0)
+                .sort((first, second) => first.sdkLastUsed - second.sdkLastUsed)[0];
+            if (!idle) throw sdkRouteCapacityError();
+
+            // Keep the retiring process in the capacity count until both SDK
+            // and bridge have closed. Reserve the replacement URL before await.
+            this.sdkRouteReservations.add(proxyUrl);
+            this.sdkRoutes.delete(idle.sdkRouteProxyUrl);
+            try {
+                await idle.dispose();
+                this.sdkRouteSlots.delete(idle);
+                this.assertUsable();
+                return this.leaseSdkRoute(this.createSdkRoute(proxyUrl));
+            } finally {
+                this.sdkRouteReservations.delete(proxyUrl);
+            }
+        }
+        return this.leaseSdkRoute(this.createSdkRoute(proxyUrl));
+    }
+
+    async withSdkRoute(operation) {
+        const lease = await this.acquireSdkRoute();
+        try {
+            return await operation(lease.route);
+        } finally {
+            lease.finish();
+        }
+    }
+
+    beginSdkOperation() {
+        this.assertUsable();
+        this.sdkActiveOperations += 1;
+        return () => {
+            this.sdkActiveOperations -= 1;
+            this.maybeCleanupSdk();
+        };
+    }
+
+    stopSdkClient(client, force = false, startupSettled = false) {
+        if (!client) return Promise.resolve();
+        let pending = this.sdkStopPromises.get(client);
+        if (!pending) {
+            pending = {};
+            this.sdkStopPromises.set(client, pending);
+        }
+        // A startup may spawn its child after an earlier forceStop. Stop again
+        // once startup settles so that asynchronous spawn cannot leak a process.
+        const mode = force ? (startupSettled ? 'forceAfterStartup' : 'force') : 'graceful';
+        if (!pending[mode]) {
+            pending[mode] = Promise.resolve().then(async () => {
+                if (force || typeof client.stop !== 'function') await client.forceStop?.();
+                else {
+                    try {
+                        const errors = await client.stop();
+                        if (Array.isArray(errors) && errors.length) await this.stopSdkClient(client, true);
+                    } catch {
+                        await this.stopSdkClient(client, true);
+                    }
+                }
+            }).catch(() => {});
+        }
+        return pending[mode];
+    }
+
+    /** Retire immediately, then release the SDK and proxy when active operations drain. */
+    dispose({ force = false } = {}) {
+        this.retired = true;
+        this.sdkForceDisposed ||= force;
+        if (!this.isSdkRoute) {
+            const disposals = [...this.sdkRouteSlots].map(route => route.dispose({ force }));
+            if (!this.sdkRoutesDisposePromise) {
+                this.sdkRoutesDisposePromise = Promise.all(disposals).then(() => {
+                    this.sdkRoutes.clear();
+                    this.sdkRouteSlots.clear();
+                });
+            }
+            return this.sdkRoutesDisposePromise;
+        }
+        if (!this.sdkDisposePromise) {
+            this.sdkDisposePromise = new Promise(resolve => { this.resolveSdkDispose = resolve; });
+        }
+        if (force) {
+            void this.stopSdkClient(this.sdkClient, true);
+            void this.sdkProxyBridge?.close().catch(() => {});
+        }
+        this.maybeCleanupSdk();
+        return this.sdkDisposePromise;
+    }
+
+    maybeCleanupSdk() {
+        if (!this.retired || (!this.sdkForceDisposed && this.sdkActiveOperations > 0) || this.sdkCleanupPromise) return;
+        this.sdkCleanupPromise = (async () => {
+            try {
+                await this.sdkClientPromise;
+            } catch {}
+            await this.stopSdkClient(this.sdkClient, this.sdkForceDisposed);
+            await this.sdkProxyBridge?.close().catch(() => {});
+            this.sdkClient = null;
+            this.sdkProxyBridge = null;
+            this.quotaCache = null;
+        })().finally(() => this.resolveSdkDispose());
+    }
+
+    async getSdkClient(operationActive = false) {
+        if (!this.isSdkRoute) return this.withSdkRoute(route => route.getSdkClient(true));
+        if (!operationActive) this.assertUsable();
+        if (this.sdkForceDisposed) throw new Error('[GitHub Copilot] Provider has been shut down.');
         if (!this.apiKey) {
             throw new Error('[GitHub Copilot] No fine-grained personal access token configured. Add one as GITHUB_COPILOT_API_KEY with the Copilot Requests permission.');
         }
         if (!this.sdkClientPromise) {
-            const client = this.createSdkClient();
-            this.sdkClientPromise = client.start().then(() => client).catch(async (error) => {
-                this.sdkClientPromise = null;
+            this.sdkClientPromise = Promise.resolve().then(async () => {
+                let client;
+                let bridge;
                 try {
-                    await client.forceStop();
-                } catch {}
-                throw error;
+                    const proxyUrl = this.sdkRouteProxyUrl;
+                    if (proxyUrl) bridge = await createSdkProxyBridge(proxyUrl);
+                    this.sdkProxyBridge = bridge;
+                    if (this.sdkForceDisposed || (this.retired && this.sdkActiveOperations === 0)) this.assertUsable();
+                    client = this.createSdkClient(bridge ? buildSdkProxyEnv(bridge.url) : undefined);
+                    this.sdkClient = client;
+                    await client.start();
+                    if (this.sdkForceDisposed || (this.retired && this.sdkActiveOperations === 0)) this.assertUsable();
+                    return client;
+                } catch (error) {
+                    await this.stopSdkClient(client, true, true);
+                    await bridge?.close().catch(() => {});
+                    this.sdkClient = null;
+                    this.sdkProxyBridge = null;
+                    this.sdkClientPromise = null;
+                    throw error;
+                }
             });
         }
         return this.sdkClientPromise;
     }
 
-    async getQuota() {
-        const now = Date.now();
-        if (this.quotaCache && now - this.quotaCache.fetchedAt < 60000) {
-            return { ...this.quotaCache.data };
-        }
+    async getQuota(operationActive = false) {
+        if (!this.isSdkRoute) return this.withSdkRoute(route => route.getQuota(true));
+        const finish = operationActive ? () => {} : this.beginSdkOperation();
+        try {
+            const now = Date.now();
+            if (this.quotaCache && now - this.quotaCache.fetchedAt < 60000) {
+                return { ...this.quotaCache.data };
+            }
 
-        const client = await this.getSdkClient();
-        const result = await client.rpc.account.getQuota({ gitHubToken: this.apiKey });
-        const quotaSnapshots = result?.quotaSnapshots || {};
-        const quotaTypes = ['premium_interactions', 'chat', 'completions'];
-        const quotaType = quotaTypes.find((type) => {
-            const snapshot = quotaSnapshots[type];
-            return snapshot && (snapshot.isUnlimitedEntitlement === true || Number(snapshot.entitlementRequests) > 0);
-        }) || quotaTypes.find(type => quotaSnapshots[type]) || null;
-        if (!quotaType) {
-            const unavailable = {
-                available: false,
-                message: 'Copilot did not report a supported quota snapshot.'
+            const client = await this.getSdkClient(true);
+            const result = await client.rpc.account.getQuota({ gitHubToken: this.apiKey });
+            const quotaSnapshots = result?.quotaSnapshots || {};
+            const quotaTypes = ['premium_interactions', 'chat', 'completions'];
+            const quotaType = quotaTypes.find((type) => {
+                const snapshot = quotaSnapshots[type];
+                return snapshot && (snapshot.isUnlimitedEntitlement === true || Number(snapshot.entitlementRequests) > 0);
+            }) || quotaTypes.find(type => quotaSnapshots[type]) || null;
+            if (!quotaType) {
+                const unavailable = {
+                    available: false,
+                    message: 'Copilot did not report a supported quota snapshot.'
+                };
+                this.quotaCache = { fetchedAt: now, data: unavailable };
+                return { ...unavailable };
+            }
+
+            const snapshot = quotaSnapshots[quotaType];
+            const isUnlimited = snapshot.isUnlimitedEntitlement === true || snapshot.entitlementRequests === -1;
+            const remainingPercentage = Number(snapshot.remainingPercentage);
+            const quota = {
+                available: true,
+                quotaType,
+                usedRequests: Number(snapshot.usedRequests) || 0,
+                entitlementRequests: Number(snapshot.entitlementRequests),
+                remainingPercentage: isUnlimited || !Number.isFinite(remainingPercentage)
+                    ? null
+                    : Math.max(0, Math.min(100, remainingPercentage)),
+                usedPercentage: isUnlimited || !Number.isFinite(remainingPercentage)
+                    ? null
+                    : Math.max(0, Math.min(100, 100 - remainingPercentage)),
+                resetDate: snapshot.resetDate || null,
+                isUnlimited
             };
-            this.quotaCache = { fetchedAt: now, data: unavailable };
-            return { ...unavailable };
+            this.quotaCache = { fetchedAt: now, data: quota };
+            return { ...quota };
+        } finally {
+            finish();
         }
-
-        const snapshot = quotaSnapshots[quotaType];
-        const isUnlimited = snapshot.isUnlimitedEntitlement === true || snapshot.entitlementRequests === -1;
-        const remainingPercentage = Number(snapshot.remainingPercentage);
-        const quota = {
-            available: true,
-            quotaType,
-            usedRequests: Number(snapshot.usedRequests) || 0,
-            entitlementRequests: Number(snapshot.entitlementRequests),
-            remainingPercentage: isUnlimited || !Number.isFinite(remainingPercentage)
-                ? null
-                : Math.max(0, Math.min(100, remainingPercentage)),
-            usedPercentage: isUnlimited || !Number.isFinite(remainingPercentage)
-                ? null
-                : Math.max(0, Math.min(100, 100 - remainingPercentage)),
-            resetDate: snapshot.resetDate || null,
-            isUnlimited
-        };
-        this.quotaCache = { fetchedAt: now, data: quota };
-        return { ...quota };
     }
 
-    async createAutoSession(requestBody, autoTier, streaming = false) {
+    async createAutoSession(requestBody, autoTier, streaming = false, operationActive = false) {
         if (Array.isArray(requestBody.tools) && requestBody.tools.length > 0) {
             throw new Error('[GitHub Copilot] Auto mode via the Copilot SDK does not support OpenAI tool-call requests yet.');
         }
 
-        const client = await this.getSdkClient();
+        const client = await this.getSdkClient(operationActive);
         const { systemPrompt, prompt, attachments } = buildCopilotPrompt(requestBody);
         const session = await client.createSession({
             model: 'auto',
@@ -234,7 +425,9 @@ export class GitHubCopilotApiService {
         }
     }
 
-    async generateAutoContent(requestBody, requestId = null) {
+    async generateAutoContent(requestBody, requestId = null, operationActive = false) {
+        if (!this.isSdkRoute) return this.withSdkRoute(route => route.generateAutoContent(requestBody, requestId, true));
+        const finish = operationActive ? () => {} : this.beginSdkOperation();
         const startedAt = Date.now();
         let autoTier = 'invalid';
         let client;
@@ -248,7 +441,7 @@ export class GitHubCopilotApiService {
             );
             const context = this.getAutoRequestContext(requestId, autoTier);
             logger.info(`[GitHub Copilot SDK] Auto request started (${context})`);
-            ({ client, session, prompt, attachments } = await this.createAutoSession(requestBody, autoTier));
+            ({ client, session, prompt, attachments } = await this.createAutoSession(requestBody, autoTier, false, true));
             const response = await session.sendAndWait({ prompt, attachments });
             const outputTokens = response?.data?.outputTokens;
             logger.info(`[GitHub Copilot SDK] Auto request succeeded (${context}, durationMs=${Date.now() - startedAt}, outputTokens=${Number.isFinite(outputTokens) ? outputTokens : 'unknown'})`);
@@ -258,13 +451,25 @@ export class GitHubCopilotApiService {
             logger.error(`[GitHub Copilot SDK] Auto request failed (${context}, durationMs=${Date.now() - startedAt}): ${error.message}`);
             throw error;
         } finally {
-            if (client && session) {
-                await this.cleanupSdkSession(client, session);
+            try {
+                if (client && session) await this.cleanupSdkSession(client, session);
+            } finally {
+                finish();
             }
         }
     }
 
-    async *generateAutoContentStream(requestBody, requestId = null) {
+    async *generateAutoContentStream(requestBody, requestId = null, operationActive = false) {
+        if (!this.isSdkRoute) {
+            const lease = await this.acquireSdkRoute();
+            try {
+                yield* lease.route.generateAutoContentStream(requestBody, requestId, true);
+            } finally {
+                lease.finish();
+            }
+            return;
+        }
+        const finish = operationActive ? () => {} : this.beginSdkOperation();
         const startedAt = Date.now();
         let autoTier = 'invalid';
         let client;
@@ -283,7 +488,7 @@ export class GitHubCopilotApiService {
             );
             const context = this.getAutoRequestContext(requestId, autoTier);
             logger.info(`[GitHub Copilot SDK] Auto stream started (${context})`);
-            ({ client, session, prompt, attachments } = await this.createAutoSession(requestBody, autoTier, true));
+            ({ client, session, prompt, attachments } = await this.createAutoSession(requestBody, autoTier, true, true));
             const id = `chatcmpl-${randomUUID()}`;
             const created = Math.floor(Date.now() / 1000);
             deltaStream = new Readable({ objectMode: true, read() {} });
@@ -318,20 +523,18 @@ export class GitHubCopilotApiService {
             logger.error(`[GitHub Copilot SDK] Auto stream failed (${context}, durationMs=${Date.now() - startedAt}): ${error.message}`);
             throw error;
         } finally {
-            unsubscribe?.();
-            deltaStream?.destroy();
-            if (client && session) {
-                await this.cleanupSdkSession(client, session);
+            try {
+                unsubscribe?.();
+                deltaStream?.destroy();
+                if (client && session) await this.cleanupSdkSession(client, session);
+            } finally {
+                finish();
             }
         }
     }
 
     getAuthHeader() {
         return this.apiKey ? `Bearer ${this.apiKey}` : null;
-    }
-
-    _applySidecar(axiosConfig) {
-        return configureTLSSidecar(axiosConfig, this.config, this.config.MODEL_PROVIDER || MODEL_PROVIDER.GITHUB_COPILOT, this.baseUrl);
     }
 
     _applySidecar(axiosConfig) {
@@ -526,6 +729,7 @@ export class GitHubCopilotApiService {
     }
 
     async generateContent(model, requestBody) {
+        this.assertUsable();
         const requestId = requestBody._monitorRequestId || this.config._monitorRequestId || null;
         // Temporary storage for monitorRequestId
         if (requestBody._monitorRequestId) {
@@ -544,6 +748,7 @@ export class GitHubCopilotApiService {
     }
 
     async *generateContentStream(model, requestBody) {
+        this.assertUsable();
         const requestId = requestBody._monitorRequestId || this.config._monitorRequestId || null;
         // Temporary storage for monitorRequestId
         if (requestBody._monitorRequestId) {
@@ -563,6 +768,7 @@ export class GitHubCopilotApiService {
     }
 
     async listModels() {
+        this.assertUsable();
         return { data: [{ id: 'auto', name: 'Auto', object: 'model', owned_by: 'github-copilot' }] };
     }
 }

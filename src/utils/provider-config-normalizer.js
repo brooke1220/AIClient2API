@@ -1,3 +1,5 @@
+import { normalizeNodeProxyUrl } from './node-proxy-config.js';
+
 const PROVIDER_STRING_ARRAY_CONFIG_FIELDS = [
     'DEFAULT_MODEL_PROVIDERS',
     'PROXY_ENABLED_PROVIDERS',
@@ -74,6 +76,9 @@ export function normalizeProviderConfigFields(data) {
     if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
 
     const result = { ...data };
+    if (Object.prototype.hasOwnProperty.call(result, 'NODE_PROXY_URL')) {
+        result.NODE_PROXY_URL = normalizeNodeProxyUrl(result.NODE_PROXY_URL);
+    }
     for (const key of PROVIDER_STRING_ARRAY_CONFIG_FIELDS) {
         if (Object.prototype.hasOwnProperty.call(result, key)) {
             result[key] = normalizeStringArrayConfigValue(result[key]);

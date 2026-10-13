@@ -773,6 +773,10 @@ export class GitHubCopilotApiServiceAdapter extends ApiServiceAdapter {
         return this.githubCopilotApiService.getQuota();
     }
 
+    dispose(options) {
+        return this.githubCopilotApiService.dispose(options);
+    }
+
     async refreshToken() {
         // GitHub Copilot API keys are typically static and do not require refreshing
         return false;
@@ -809,6 +813,50 @@ registerAdapter(MODEL_PROVIDER.GITHUB_COPILOT, GitHubCopilotApiServiceAdapter);
 // 用于存储服务适配器单例的映射
 export const serviceInstances = {};
 
+// Keep retired instances reachable until their in-flight SDK operations finish,
+// so shutdown can also close clients retired by an earlier configuration reload.
+const retiringServiceInstances = new Map();
+let serviceAdaptersShuttingDown = false;
+
+function retireServiceAdapter(adapter, options = {}) {
+    if (typeof adapter?.dispose !== 'function') return Promise.resolve();
+    if (retiringServiceInstances.has(adapter) && !options.force) {
+        return retiringServiceInstances.get(adapter);
+    }
+
+    let disposal;
+    try {
+        disposal = adapter.dispose(options);
+    } catch (error) {
+        disposal = Promise.reject(error);
+    }
+    const completion = Promise.resolve(disposal)
+        .catch(() => logger.warn('[Adapter] Failed to dispose retired service adapter'))
+        .finally(() => {
+            if (retiringServiceInstances.get(adapter) === completion) {
+                retiringServiceInstances.delete(adapter);
+            }
+        });
+    retiringServiceInstances.set(adapter, completion);
+    return completion;
+}
+
+export function invalidateAllServiceAdapters() {
+    for (const key of Object.keys(serviceInstances)) {
+        const adapter = serviceInstances[key];
+        delete serviceInstances[key];
+        retireServiceAdapter(adapter);
+    }
+}
+
+export async function disposeServiceAdapters({ force = true, shutdown = false } = {}) {
+    if (shutdown) serviceAdaptersShuttingDown = true;
+    invalidateAllServiceAdapters();
+    await Promise.allSettled(
+        [...retiringServiceInstances.keys()].map(adapter => retireServiceAdapter(adapter, { force }))
+    );
+}
+
 export function getServiceInstanceKey(provider, uuid = null) {
     return uuid ? provider + uuid : provider;
 }
@@ -816,7 +864,9 @@ export function getServiceInstanceKey(provider, uuid = null) {
 export function invalidateServiceAdapter(provider, uuid = null) {
     const providerKey = getServiceInstanceKey(provider, uuid);
     if (serviceInstances[providerKey]) {
+        const adapter = serviceInstances[providerKey];
         delete serviceInstances[providerKey];
+        retireServiceAdapter(adapter);
         logger.info(`[Adapter] Invalidated service adapter, provider: ${provider}, uuid: ${uuid || 'default'}`);
         return true;
     }
@@ -845,6 +895,9 @@ export function isRegisteredProvider(provider) {
 
 // 服务适配器工厂
 export function getServiceAdapter(config) {
+    if (serviceAdaptersShuttingDown) {
+        throw new Error('Provider services are shutting down');
+    }
     const customNameDisplay = config.customName ? ` (${config.customName})` : '';
     logger.info(`[Adapter] getServiceAdapter, provider: ${config.MODEL_PROVIDER}, uuid: ${config.uuid}${customNameDisplay}`);
     const provider = config.MODEL_PROVIDER;

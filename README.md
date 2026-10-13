@@ -580,6 +580,7 @@ This project supports flexible proxy configuration, allowing you to configure a 
 
   In the "Configuration" page of the Web UI, you can visually configure all proxy options:
   - **Unified Proxy**: Fill in the proxy address in the "Proxy Settings" area and check the providers that need to use the proxy
+  - **Account Proxy**: Add or edit a node in "Provider Pool Management" and fill in its optional "Proxy URL". Accounts of the same provider can use different proxies
   - **Provider Endpoints**: In each provider's configuration area, directly modify the Base URL to a proxied endpoint
   - **Click "Save Configuration"**: Takes effect immediately without restarting the service
 
@@ -599,7 +600,20 @@ This project supports flexible proxy configuration, allowing you to configure a 
     ```
 
 
-3. **Provider-Specific Proxied Endpoints**: Some providers (like OpenAI, Claude) support configuring proxied API endpoints
+3. **Account Proxy**: Set `NODE_PROXY_URL` on a node in `configs/provider_pools.json`. HTTP, HTTPS and SOCKS5 are supported.
+
+   ```json
+   {
+     "claude-kiro-oauth": [
+       { "uuid": "account-1", "NODE_PROXY_URL": "http://127.0.0.1:7890" },
+       { "uuid": "account-2", "NODE_PROXY_URL": "socks5://127.0.0.1:1080" }
+     ]
+   }
+   ```
+
+   This example only shows proxy fields; keep each node's credentials and other settings. A node proxy takes priority and does not require selecting the provider in the global proxy settings. Omit the field, leave it blank, or set it to `null` to inherit the existing global settings, including provider selection. Clear and save the field to restore inheritance without restarting. Invalid node proxy URLs are rejected and never silently fall back to the global proxy or a direct connection.
+
+4. **Provider-Specific Proxied Endpoints**: Some providers (like OpenAI, Claude) support configuring proxied API endpoints
 
    - **Web UI Configuration**: In each provider's configuration area on the "Configuration" page, modify the corresponding Base URL
    - **Configuration File**: Configure in `configs/config.json`
@@ -621,7 +635,7 @@ This project supports flexible proxy configuration, allowing you to configure a 
 - **Flexible Switching**: Enable/disable proxy for specific providers at any time in the Web UI
 
 **Notes**:
-- Proxy configuration priority: Unified proxy configuration > Provider-specific endpoints > Direct connection
+- A node proxy takes priority; otherwise existing plugin bindings and global proxy rules apply. Base URL sets the request destination, while the proxy URL sets the network route.
 - Ensure the proxy service is stable and available, otherwise it may affect service quality
 - SOCKS5 proxy usually performs better than HTTP proxy
 

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -28,7 +30,7 @@ import (
 // Node.js 发请求到 http://127.0.0.1:<port>，
 // 通过以下自定义 Header 传递目标信息：
 //   X-Target-Url:   实际目标 URL（必填）
-//   X-Proxy-Url:    上游代理（可选，支持 http/socks5）
+//   X-Proxy-Url:    上游代理（可选，支持 http/https/socks5）
 //
 // 所有其他 Header 原样转发给目标服务器。
 // 响应（包括 SSE 流式）透传回 Node.js。
@@ -361,8 +363,8 @@ func dialUTLS(ctx context.Context, network, addr string, proxyURL string) (*utls
 
 func dialViaProxy(ctx context.Context, network, addr string, proxyURL string) (net.Conn, error) {
 	parsed, err := url.Parse(proxyURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid proxy url: %w", err)
+	if err != nil || parsed.Hostname() == "" {
+		return nil, fmt.Errorf("invalid proxy url")
 	}
 
 	switch strings.ToLower(parsed.Scheme) {
@@ -386,39 +388,82 @@ func dialViaProxy(ctx context.Context, network, addr string, proxyURL string) (n
 		return dialer.Dial(network, addr)
 
 	case "http", "https":
-		proxyConn, err := net.DialTimeout("tcp", parsed.Host, 15*time.Second)
-		if err != nil {
-			return nil, fmt.Errorf("connect to http proxy: %w", err)
-		}
-
-		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
-		if parsed.User != nil {
-			username := parsed.User.Username()
-			password, _ := parsed.User.Password()
-			cred := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
-			connectReq += fmt.Sprintf("Proxy-Authorization: Basic %s\r\n", cred)
-		}
-		connectReq += "\r\n"
-
-		if _, err = proxyConn.Write([]byte(connectReq)); err != nil {
-			proxyConn.Close()
-			return nil, fmt.Errorf("proxy CONNECT write: %w", err)
-		}
-
-		buf := make([]byte, 4096)
-		n, err := proxyConn.Read(buf)
-		if err != nil {
-			proxyConn.Close()
-			return nil, fmt.Errorf("proxy CONNECT read: %w", err)
-		}
-		if !strings.Contains(string(buf[:n]), "200") {
-			proxyConn.Close()
-			return nil, fmt.Errorf("proxy CONNECT rejected: %s", strings.TrimSpace(string(buf[:n])))
-		}
-
-		return proxyConn, nil
+		return dialHTTPProxy(ctx, addr, parsed, nil)
 
 	default:
 		return nil, fmt.Errorf("unsupported proxy scheme: %s", parsed.Scheme)
 	}
+}
+
+// Keep any tunnel bytes read together with the CONNECT response headers.
+type bufferedProxyConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (conn *bufferedProxyConn) Read(p []byte) (int, error) {
+	return conn.reader.Read(p)
+}
+
+func dialHTTPProxy(ctx context.Context, addr string, parsed *url.URL, tlsConfig *tls.Config) (net.Conn, error) {
+	connectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	port := parsed.Port()
+	if port == "" {
+		port = "80"
+		if strings.EqualFold(parsed.Scheme, "https") {
+			port = "443"
+		}
+	}
+	proxyAddr := net.JoinHostPort(parsed.Hostname(), port)
+	dialer := &net.Dialer{}
+	var conn net.Conn
+	var err error
+	if strings.EqualFold(parsed.Scheme, "https") {
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		} else {
+			tlsConfig = tlsConfig.Clone()
+		}
+		tlsConfig.ServerName = parsed.Hostname()
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsConfig}
+		conn, err = tlsDialer.DialContext(connectCtx, "tcp", proxyAddr)
+	} else {
+		conn, err = dialer.DialContext(connectCtx, "tcp", proxyAddr)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("connect to proxy: %w", err)
+	}
+	stopCancellation := context.AfterFunc(connectCtx, func() { conn.Close() })
+	defer stopCancellation()
+	deadline, _ := connectCtx.Deadline()
+	conn.SetDeadline(deadline)
+
+	connectReq := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Opaque: addr},
+		Host:   addr,
+		Header: make(http.Header),
+	}
+	if parsed.User != nil {
+		password, _ := parsed.User.Password()
+		credential := base64.StdEncoding.EncodeToString([]byte(parsed.User.Username() + ":" + password))
+		connectReq.Header.Set("Proxy-Authorization", "Basic "+credential)
+	}
+	if err = connectReq.Write(conn); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT write: %w", err)
+	}
+	reader := bufio.NewReader(conn)
+	response, err := http.ReadResponse(reader, connectReq)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("invalid proxy CONNECT response")
+	}
+	if response.StatusCode != http.StatusOK {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT rejected (status %d)", response.StatusCode)
+	}
+	conn.SetDeadline(time.Time{})
+	return &bufferedProxyConn{Conn: conn, reader: reader}, nil
 }

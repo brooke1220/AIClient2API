@@ -579,6 +579,7 @@ curl http://localhost:3000/claude-kiro-oauth/v1/chat/completions \
 
   在 Web UI 的"配置管理"页面中，可以可视化配置所有代理选项：
   - **统一代理**：在"代理设置"区域填入代理地址，勾选需要使用代理的提供商
+  - **账号独立代理**：在"提供商池管理"中新增或编辑节点，填写选填的"代理地址"；同一提供商下的多个账号可以分别设置
   - **提供商端点**：在各提供商配置区域，直接修改 Base URL 为已代理的端点
   - **点击"保存配置"**：即可生效，无需重启服务
 
@@ -598,7 +599,20 @@ curl http://localhost:3000/claude-kiro-oauth/v1/chat/completions \
     ```
 
 
-3. **提供商自带代理端点**：某些提供商（如 OpenAI、Claude）支持配置已代理的 API 端点
+3. **账号独立代理**：在 `configs/provider_pools.json` 的节点中设置 `NODE_PROXY_URL`，支持 HTTP、HTTPS 和 SOCKS5。
+
+   ```json
+   {
+     "claude-kiro-oauth": [
+       { "uuid": "account-1", "NODE_PROXY_URL": "http://127.0.0.1:7890" },
+       { "uuid": "account-2", "NODE_PROXY_URL": "socks5://127.0.0.1:1080" }
+     ]
+   }
+   ```
+
+   以上仅展示代理字段，请保留节点原有凭据和其他配置。填写后该账号优先使用独立代理，无需在全局勾选该提供商；省略、留空或设为 `null` 时继承原有全局设置（包括提供商勾选状态）。清空并保存即可恢复继承，无需重启。无效的独立代理地址会被拒绝，不会自动回退到全局代理或直连。
+
+4. **提供商自带代理端点**：某些提供商（如 OpenAI、Claude）支持配置已代理的 API 端点
 
    - **Web UI 配置**：在"配置管理"页面的各提供商配置区域，修改对应的 Base URL
    - **配置文件**：在 `configs/config.json` 中配置
@@ -620,7 +634,7 @@ curl http://localhost:3000/claude-kiro-oauth/v1/chat/completions \
 - **灵活切换**：可以随时在 Web UI 中启用/禁用特定提供商的代理
 
 **注意事项**：
-- 代理配置优先级：统一代理配置 > 提供商自带端点 > 直接连接
+- 节点独立代理优先；未填写时沿用原有插件绑定及全局代理规则。Base URL 决定请求目标，代理地址决定网络出口。
 - 确保代理服务稳定可用，否则可能影响服务质量
 - SOCKS5 代理通常比 HTTP 代理性能更好
 

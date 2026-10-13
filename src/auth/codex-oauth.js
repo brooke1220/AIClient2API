@@ -93,6 +93,7 @@ class CodexAuth {
         if (proxyConfig) {
             axiosConfig.httpAgent = proxyConfig.httpAgent;
             axiosConfig.httpsAgent = proxyConfig.httpsAgent;
+            axiosConfig.proxy = false;
             logger.info('[Codex Auth] Proxy enabled for OAuth requests');
         }
         

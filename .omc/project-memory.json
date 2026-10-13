@@ -1,0 +1,246 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1791881003109,
+  "projectRoot": "/Users/pengboting/Desktop/AIClient2API",
+  "techStack": {
+    "languages": [
+      {
+        "name": "JavaScript/TypeScript",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "package.json"
+        ]
+      }
+    ],
+    "frameworks": [
+      {
+        "name": "jest",
+        "version": "29.7.0",
+        "category": "testing"
+      }
+    ],
+    "packageManager": "pnpm",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pnpm test",
+    "lintCommand": null,
+    "devCommand": "pnpm start",
+    "scripts": {
+      "start": "node src/core/master.js",
+      "start:standalone": "node src/services/api-server.js",
+      "start:dev": "node src/core/master.js --dev",
+      "test": "jest",
+      "test:watch": "jest --watch",
+      "test:coverage": "jest --coverage",
+      "test:verbose": "jest --verbose",
+      "test:silent": "jest --silent",
+      "test:unit": "node run-tests.js --unit",
+      "test:integration": "node run-tests.js --integration",
+      "test:summary": "node test-summary.js",
+      "help": "node src/scripts/help.js",
+      "example:api": "node src/scripts/example-api.js"
+    }
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "src",
+      "static",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "configs": {
+      "path": "configs",
+      "purpose": null,
+      "fileCount": 8,
+      "lastAccessed": 1791881003074,
+      "keyFiles": [
+        "api-potluck-data.json.example",
+        "api-potluck-keys.json.example",
+        "config.json.example",
+        "custom_models.json.example",
+        "market.json"
+      ]
+    },
+    "docker": {
+      "path": "docker",
+      "purpose": null,
+      "fileCount": 4,
+      "lastAccessed": 1791881003074,
+      "keyFiles": [
+        "VERSION",
+        "docker-compose.build.yml",
+        "docker-compose.dev.yml",
+        "docker-compose.yml"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 5,
+      "lastAccessed": 1791881003079,
+      "keyFiles": [
+        "OPENCLAW_CONFIG_GUIDE-JA.md",
+        "OPENCLAW_CONFIG_GUIDE-ZH.md",
+        "OPENCLAW_CONFIG_GUIDE.md",
+        "OPENCODE_CONFIG_EXAMPLE.md",
+        "PROVIDER_ADAPTER_GUIDE.md"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 0,
+      "lastAccessed": 1791881003080,
+      "keyFiles": []
+    },
+    "static": {
+      "path": "static",
+      "purpose": "Static files",
+      "fileCount": 24,
+      "lastAccessed": 1791881003080,
+      "keyFiles": [
+        "aicodemirror.jpg",
+        "apikey.fun.png",
+        "atlascloud.png",
+        "axisnow.jpg",
+        "coffee.png"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 10,
+      "lastAccessed": 1791881003081,
+      "keyFiles": [
+        "adapter-disposal.test.js",
+        "antigravity-models.test.js",
+        "api-integration.test.js",
+        "auth-password.test.js",
+        "codex-cache-identity.test.js"
+      ]
+    },
+    "tls-sidecar": {
+      "path": "tls-sidecar",
+      "purpose": null,
+      "fileCount": 3,
+      "lastAccessed": 1791881003081,
+      "keyFiles": [
+        "go.mod",
+        "main.go"
+      ]
+    },
+    "src/scripts": {
+      "path": "src/scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 2,
+      "lastAccessed": 1791881003082,
+      "keyFiles": [
+        "example-api.js",
+        "help.js"
+      ]
+    },
+    "static/app": {
+      "path": "static/app",
+      "purpose": "Application code",
+      "fileCount": 29,
+      "lastAccessed": 1791881003083,
+      "keyFiles": [
+        "I18N_GUIDE.md",
+        "access-manager.js",
+        "app.js"
+      ]
+    },
+    "static/components": {
+      "path": "static/components",
+      "purpose": "UI components",
+      "fileCount": 29,
+      "lastAccessed": 1791881003083,
+      "keyFiles": [
+        "header.css",
+        "header.html",
+        "section-access.css"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "tests/github-copilot-auto.test.js",
+      "accessCount": 5,
+      "lastAccessed": 1791884032445,
+      "type": "file"
+    },
+    {
+      "path": "src/utils/proxy-utils.js",
+      "accessCount": 4,
+      "lastAccessed": 1791883814491,
+      "type": "file"
+    },
+    {
+      "path": "static/app/i18n.js",
+      "accessCount": 4,
+      "lastAccessed": 1791883845588,
+      "type": "file"
+    },
+    {
+      "path": "tests/node-proxy-routing.test.js",
+      "accessCount": 4,
+      "lastAccessed": 1791883921409,
+      "type": "file"
+    },
+    {
+      "path": "tests/copilot-proxy.test.js",
+      "accessCount": 3,
+      "lastAccessed": 1791883874511,
+      "type": "file"
+    },
+    {
+      "path": "src/providers/github/github-copilot-core.js",
+      "accessCount": 2,
+      "lastAccessed": 1791883681165,
+      "type": "file"
+    },
+    {
+      "path": "tests/provider-node-proxy-api.test.js",
+      "accessCount": 1,
+      "lastAccessed": 1791883455993,
+      "type": "file"
+    },
+    {
+      "path": "tests/provider-node-proxy-paths.test.js",
+      "accessCount": 1,
+      "lastAccessed": 1791883460216,
+      "type": "file"
+    },
+    {
+      "path": "tests/node-proxy-config.test.js",
+      "accessCount": 1,
+      "lastAccessed": 1791883460819,
+      "type": "file"
+    },
+    {
+      "path": "src/ui-modules/provider-api.js",
+      "accessCount": 1,
+      "lastAccessed": 1791883476679,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

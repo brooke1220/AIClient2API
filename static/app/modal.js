@@ -139,6 +139,9 @@ function collectDraftProviderConfig(providerDetail, providerType, uuid) {
         let value = input.value;
         if (key === 'concurrencyLimit' || key === 'queueLimit') {
             value = parseInt(value || '0', 10);
+        } else if (key === 'NODE_PROXY_URL') {
+            if (value.trim() === (input.dataset.configValue || '').trim()) return;
+            value = value.trim() || null;
         }
         providerConfig[key] = value;
     });
@@ -1141,6 +1144,23 @@ function renderProviderConfig(provider) {
         }
     });
     html += '</div>';
+
+    const nodeProxyValue = escapeHtml(provider.NODE_PROXY_URL || '').replace(/"/g, '&quot;');
+    html += `
+        <div class="form-grid full-width">
+            <div class="config-item">
+                <label>${t('modal.provider.nodeProxyUrl')} ${t('config.optional')}</label>
+                <input type="text"
+                       value="${nodeProxyValue}"
+                       readonly
+                       data-config-key="NODE_PROXY_URL"
+                       data-config-value="${nodeProxyValue}"
+                       placeholder="${t('config.proxy.urlPlaceholder')}">
+                <small class="form-text">${t('modal.provider.nodeProxyUrlHint')}</small>
+                ${provider.NODE_PROXY_URL?.includes('[credentials hidden]') ? `<small class="form-text">${t('modal.provider.nodeProxyCredentialsHint')}</small>` : ''}
+            </div>
+        </div>
+    `;
     
     // 渲染其他配置字段，每行2列
     const otherFields = fieldOrder.filter(key => !baseFields.includes(key));
@@ -1319,7 +1339,7 @@ function getFieldOrder(provider) {
         'isHealthy', 'lastUsed', 'usageCount', 'errorCount', 'lastErrorTime',
         'uuid', 'isDisabled', 'lastHealthCheckTime', 'lastHealthCheckModel', 'lastErrorMessage',
         'notSupportedModels', 'supportedModels', 'refreshCount', 'needsRefresh', '_lastSelectionSeq',
-        'lastRefreshTime', 'lastSuccessTime'
+        'lastRefreshTime', 'lastSuccessTime', 'NODE_PROXY_URL'
     ];
     
     // 尝试从当前模态框上下文中获取提供商类型
@@ -1720,6 +1740,13 @@ function showAddProviderForm(providerType) {
                 <input type="number" id="newQueueLimit" placeholder="${t('modal.provider.unlimitedPlaceholder')}" data-i18n-placeholder="modal.provider.unlimitedPlaceholder">
             </div>
         </div>
+        <div class="form-grid full-width">
+            <div class="form-group">
+                <label><span data-i18n="modal.provider.nodeProxyUrl">${t('modal.provider.nodeProxyUrl')}</span> <span class="optional-mark" data-i18n="config.optional">${t('config.optional')}</span></label>
+                <input type="text" id="newNodeProxyUrl" placeholder="${t('config.proxy.urlPlaceholder')}" data-i18n-placeholder="config.proxy.urlPlaceholder">
+                <small class="form-text" data-i18n="modal.provider.nodeProxyUrlHint">${t('modal.provider.nodeProxyUrlHint')}</small>
+            </div>
+        </div>
         <div id="dynamicConfigFields">
             <!-- 动态配置字段将在这里显示 -->
         </div>
@@ -1902,7 +1929,8 @@ async function addProvider(providerType) {
         checkModelName: checkModelName || '', // 允许为空
         checkHealth,
         concurrencyLimit,
-        queueLimit
+        queueLimit,
+        NODE_PROXY_URL: document.getElementById('newNodeProxyUrl')?.value.trim() || null
     };
     
     // 根据提供商类型动态收集配置字段（自动匹配 utils.js 中的定义）

@@ -10,6 +10,7 @@ import { discoverPlugins, getPluginManager } from '../core/plugin-manager.js';
 import { getTLSSidecar } from '../utils/tls-sidecar.js';
 import { HEALTH_CHECK } from '../utils/constants.js';
 import { initializeAdminPassword } from '../ui-modules/auth.js';
+import { disposeServiceAdapters } from '../providers/adapter.js';
 
 /**
  * @license
@@ -127,6 +128,7 @@ const IS_WORKER_PROCESS = process.env.IS_WORKER_PROCESS === 'true';
 
 // 存储服务器实例，用于优雅关闭
 let serverInstance = null;
+let isShuttingDown = false;
 
 /**
  * 发送消息给主进程
@@ -181,7 +183,26 @@ function setupWorkerCommunication() {
  * 优雅关闭服务器
  */
 async function gracefulShutdown() {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
     logger.info('[Server] Initiating graceful shutdown...');
+
+    // Bound the entire shutdown, including SDK startup/cleanup, rather than
+    // starting the timeout only after all external resources have stopped.
+    const shutdownTimeout = setTimeout(() => {
+        logger.info('[Server] Shutdown timeout, forcing exit...');
+        process.exit(1);
+    }, 10000);
+    shutdownTimeout.unref();
+    const serverClosed = serverInstance
+        ? new Promise(resolve => serverInstance.close(resolve))
+        : Promise.resolve();
+
+    try {
+        await disposeServiceAdapters({ force: true, shutdown: true });
+    } catch {
+        logger.warn('[Server] Could not close all provider clients');
+    }
 
     // 停止所有插件
     try {
@@ -198,20 +219,9 @@ async function gracefulShutdown() {
         await getTLSSidecar().stop();
     } catch { /* ignore */ }
 
-    if (serverInstance) {
-        serverInstance.close(() => {
-            logger.info('[Server] HTTP server closed');
-            process.exit(0);
-        });
-
-        // 设置超时，防止无限等待
-        setTimeout(() => {
-            logger.info('[Server] Shutdown timeout, forcing exit...');
-            process.exit(1);
-        }, 10000);
-    } else {
-        process.exit(0);
-    }
+    await serverClosed;
+    logger.info('[Server] HTTP server closed');
+    process.exit(0);
 }
 
 /**

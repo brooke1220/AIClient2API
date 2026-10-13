@@ -10,9 +10,38 @@ import { HttpProxyAgent } from 'http-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { getTLSSidecar } from './tls-sidecar.js';
 import { NETWORK } from './constants.js';
+import { normalizeNodeProxyUrl, redactProxyUrl } from './node-proxy-config.js';
 
 // 代理 Agent 缓存，避免重复创建 Agent 导致连接池失效和内存泄漏
+// Map 的插入顺序即 LRU 顺序：命中时移到末尾，超出上限时淘汰最久未用的条目
+export const PROXY_AGENT_CACHE_LIMIT = 128;
 const agentCache = new Map();
+
+// Evicted agents may still be held by cached clients (e.g. OAuth2Client) or
+// in-flight requests. Only close idle keep-alive sockets: active requests finish
+// normally, and an agent that is used again simply opens a new connection.
+function closeIdleAgentSockets(proxyConfig) {
+    for (const agent of new Set([proxyConfig.httpAgent, proxyConfig.httpsAgent])) {
+        for (const sockets of Object.values(agent?.freeSockets || {})) {
+            for (const socket of sockets) socket.destroy();
+        }
+    }
+}
+
+function cacheProxyAgents(key, proxyConfig) {
+    agentCache.set(key, proxyConfig);
+    while (agentCache.size > PROXY_AGENT_CACHE_LIMIT) {
+        const [oldestKey, oldest] = agentCache.entries().next().value;
+        agentCache.delete(oldestKey);
+        closeIdleAgentSockets(oldest);
+    }
+}
+
+/** Test helper: drop all cached agents and close their idle sockets. */
+export function clearProxyAgentCache() {
+    for (const proxyConfig of agentCache.values()) closeIdleAgentSockets(proxyConfig);
+    agentCache.clear();
+}
 
 // 用于存储全局通配符代理获取器，解决启动初始化时无请求上下文的问题
 let wildcardProxyResolver = null;
@@ -33,15 +62,15 @@ export function registerWildcardProxyResolver(resolver) {
  * @param {string} providerType - 提供商类型
  * @returns {string|null} 绑定的代理 URL
  */
-export function getNodeProxyUrlFromBinding(config, providerType) {
+export function getNodeProxyUrlFromBinding(config = {}, providerType) {
     // 优先从线程级上下文获取（解决提供商实例缓存 config 导致获取不到最新插件方法的问题）
     const contextIpNodeProxy = requestContext.get('ipNodeProxy');
     if (typeof contextIpNodeProxy?.getProxyUrl === 'function') {
         try {
-            return contextIpNodeProxy.getProxyUrl(providerType, config.uuid);
+            return contextIpNodeProxy.getProxyUrl(providerType, config?.uuid);
         } catch (error) {
             const nodeName = config?.customName || config?.uuid || 'unknown';
-            logger.error(`[Proxy] Error calling ipNodeProxy.getProxyUrl from context for ${providerType}/${nodeName}:`, error.message);
+            logger.error(`[Proxy] Error resolving IP proxy binding for ${providerType}/${nodeName}`);
         }
     }
 
@@ -51,13 +80,13 @@ export function getNodeProxyUrlFromBinding(config, providerType) {
             return config.ipNodeProxy.getProxyUrl(providerType, config.uuid);
         } catch (error) {
             const nodeName = config?.customName || config?.uuid || 'unknown';
-            logger.error(`[Proxy] Error calling ipNodeProxy.getProxyUrl from config for ${providerType}/${nodeName}:`, error.message);
+            logger.error(`[Proxy] Error resolving configured IP proxy binding for ${providerType}/${nodeName}`);
         }
     }
 
     // 最后的兜底：如果没有上下文（如项目启动初始化），使用全局通配符 '*'
     if (typeof wildcardProxyResolver === 'function') {
-        return wildcardProxyResolver(providerType, config.uuid);
+        return wildcardProxyResolver(providerType, config?.uuid);
     }
 
     return null;
@@ -79,9 +108,12 @@ export function parseProxyUrl(proxyUrl) {
         return null;
     }
 
-    // 检查缓存
-    if (agentCache.has(trimmedUrl)) {
-        return agentCache.get(trimmedUrl);
+    // 检查缓存（命中时刷新 LRU 位置）
+    const cached = agentCache.get(trimmedUrl);
+    if (cached) {
+        agentCache.delete(trimmedUrl);
+        agentCache.set(trimmedUrl, cached);
+        return cached;
     }
 
     try {
@@ -119,11 +151,11 @@ export function parseProxyUrl(proxyUrl) {
 
         // 存入缓存
         if (result) {
-            agentCache.set(trimmedUrl, result);
+            cacheProxyAgents(trimmedUrl, result);
         }
         return result;
     } catch (error) {
-        logger.error(`[Proxy] Failed to parse proxy URL: ${error.message}`);
+        logger.error('[Proxy] Failed to parse proxy URL');
         return null;
     }
 }
@@ -135,26 +167,27 @@ export function parseProxyUrl(proxyUrl) {
  * @returns {boolean} 是否启用代理
  */
 export function isProxyEnabledForProvider(config, providerType) {
-    if (getNodeProxyUrlFromBinding(config, providerType)) {
-        return true;
+    return Boolean(resolveProxyUrlForProvider(config, providerType));
+}
+
+/** Resolve one account's proxy without changing the shared global config. */
+export function resolveProxyUrlForProvider(config = {}, providerType, options = {}) {
+    const nodeProxyUrl = normalizeNodeProxyUrl(config?.NODE_PROXY_URL);
+    if (nodeProxyUrl) return nodeProxyUrl;
+
+    const boundProxyUrl = getNodeProxyUrlFromBinding(config, providerType);
+    if (boundProxyUrl) return boundProxyUrl;
+
+    // Preserve the existing Sidecar-specific upstream fallback.
+    if (options.forSidecar) {
+        return config?.TLS_SIDECAR_PROXY_URL || config?.PROXY_URL || null;
     }
 
-    if (!config || !config.PROXY_URL || !config.PROXY_ENABLED_PROVIDERS) {
-        return false;
-    }
-
-    const enabledProviders = config.PROXY_ENABLED_PROVIDERS;
-    if (!Array.isArray(enabledProviders)) {
-        return false;
-    }
-
-    // 1. 尝试精确匹配
-    if (enabledProviders.includes(providerType)) {
-        return true;
-    }
-
-    // 2. 尝试前缀匹配 (例如 openai-custom-prod 继承 openai-custom 的配置)
-    return enabledProviders.some(p => providerType.startsWith(p + '-'));
+    const enabledProviders = config?.PROXY_ENABLED_PROVIDERS;
+    if (!config?.PROXY_URL || !Array.isArray(enabledProviders)) return null;
+    const enabled = enabledProviders.some(p => typeof p === 'string' &&
+        (p === providerType || providerType?.startsWith(p + '-')));
+    return enabled ? config.PROXY_URL : null;
 }
 
 /**
@@ -164,23 +197,17 @@ export function isProxyEnabledForProvider(config, providerType) {
  * @returns {Object|null} 代理配置对象或 null
  */
 export function getProxyConfigForProvider(config, providerType) {
-    if (!isProxyEnabledForProvider(config, providerType)) {
-        return null;
-    }
-
-    const boundProxyUrl = getNodeProxyUrlFromBinding(config, providerType);
-    const proxyUrl = boundProxyUrl || config.PROXY_URL;
+    const proxyUrl = resolveProxyUrlForProvider(config, providerType);
+    if (!proxyUrl) return null;
     const proxyConfig = parseProxyUrl(proxyUrl);
+    if (!proxyConfig && normalizeNodeProxyUrl(config?.NODE_PROXY_URL)) {
+        throw new Error('Unable to configure the node proxy');
+    }
     if (proxyConfig) {
         const nodeName = config?.customName || config?.uuid;
         const nodeDisplay = nodeName ? `${providerType}/${nodeName}` : providerType;
         
-        // 优先从上下文中获取 clientIp
-        const contextIpNodeProxy = requestContext.get('ipNodeProxy');
-        const clientIp = contextIpNodeProxy?.clientIp || config.ipNodeProxy?.clientIp || 'unknown';
-        
-        const source = boundProxyUrl ? `${nodeDisplay} (IP binding ${clientIp})` : nodeDisplay;
-        logger.info(`[Proxy] Using ${proxyConfig.proxyType} proxy for ${source}: ${proxyUrl}`);
+        logger.info(`[Proxy] Using ${proxyConfig.proxyType} proxy for ${nodeDisplay}: ${redactProxyUrl(proxyUrl)}`);
     }
 
     return proxyConfig;
@@ -247,9 +274,7 @@ export function isTLSSidecarEnabledForProvider(config, providerType) {
 export function configureTLSSidecar(axiosConfig, config, providerType, defaultBaseUrl = null) {
     const sidecar = getTLSSidecar();
     if (sidecar.isReady() && isTLSSidecarEnabledForProvider(config, providerType)) {
-        // 优先使用 IP 绑定的代理，其次使用 Sidecar 专用的代理，最后使用全局代理
-        const boundProxyUrl = getNodeProxyUrlFromBinding(config, providerType);
-        const proxyUrl = boundProxyUrl || config.TLS_SIDECAR_PROXY_URL || config.PROXY_URL || null;
+        const proxyUrl = resolveProxyUrlForProvider(config, providerType, { forSidecar: true });
         
         // 处理相对路径
         if (axiosConfig.url && !axiosConfig.url.startsWith('http')) {
@@ -263,12 +288,7 @@ export function configureTLSSidecar(axiosConfig, config, providerType, defaultBa
         const nodeName = config?.customName || config?.uuid;
         const nodeDisplay = nodeName ? `${providerType}/${nodeName}` : providerType;
         
-        // 优先从上下文中获取 clientIp
-        const contextIpNodeProxy = requestContext.get('ipNodeProxy');
-        const clientIp = contextIpNodeProxy?.clientIp || config.ipNodeProxy?.clientIp || 'unknown';
-        
-        const source = boundProxyUrl ? `${nodeDisplay} (IP binding ${clientIp})` : nodeDisplay;
-        logger.info(`[TLS Sidecar] Using sidecar for ${source}${proxyUrl ? ` (proxy: ${proxyUrl})` : ''}`);
+        logger.info(`[TLS Sidecar] Using sidecar for ${nodeDisplay}${proxyUrl ? ` (proxy: ${redactProxyUrl(proxyUrl)})` : ''}`);
         
         sidecar.wrapAxiosConfig(axiosConfig, proxyUrl);
     }else{

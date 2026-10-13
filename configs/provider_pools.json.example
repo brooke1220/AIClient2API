@@ -161,6 +161,7 @@
   "claude-kiro-oauth": [
     {
       "customName": "Kiro OAuth节点1",
+      "NODE_PROXY_URL": "http://127.0.0.1:7890",
       "KIRO_OAUTH_CREDS_FILE_PATH": "./kiro_creds1.json",
       "uuid": "2c69d0ac-b86f-43d8-9d17-0d300afc5cfd",
       "checkModelName": null,
@@ -174,6 +175,7 @@
     },
     {
       "customName": "Kiro OAuth节点2",
+      "NODE_PROXY_URL": "socks5://127.0.0.1:1080",
       "KIRO_OAUTH_CREDS_FILE_PATH": "./kiro_creds2.json",
       "uuid": "7482abe6-8083-4288-bb7d-d8ecb7c461e2",
       "checkModelName": null,
