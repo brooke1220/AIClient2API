@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"npx jest tests/node-proxy-config.test.js tests/node-proxy-routing.test.js tests/provider-node-proxy-api.test.js tests/provider-node-proxy-paths.test.js tests/copilot-proxy.test.js tests/ad...",
-  "error": "Exit code 1\nPASS tests/node-proxy-routing.test.js\nPASS tests/copilot-proxy.test.js\nPASS tests/provider-node-proxy-api.test.js\nPASS tests/provider-node-proxy-paths.test.js\nPASS tests/oauth-proxy-logging.test.js\nPASS tests/adapter-disposal.test.js\nPASS tests/node-proxy-config.test.js\nTests:       110 passed, 110 total\n(eval):1: == not found",
-  "timestamp": "2026-10-13T09:32:27.206Z",
-  "retry_count": 1
-}
