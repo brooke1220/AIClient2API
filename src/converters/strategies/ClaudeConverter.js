@@ -17,23 +17,6 @@ import {
     OPENAI_DEFAULT_TOP_P
 } from '../utils.js';
 import {MODEL_PROTOCOL_PREFIX} from '../../utils/common.js';
-import {
-    finishToolCall,
-    generateContentPartAdded,
-    generateContentPartDone,
-    generateFunctionCallArgsDelta,
-    generateFunctionCallArgsDone,
-    generateFunctionCallOutputItemDone,
-    generateOutputItemAdded,
-    generateOutputItemDone,
-    generateOutputTextDelta,
-    generateOutputTextDone,
-    generateResponseCompleted,
-    generateResponseCreated,
-    generateResponseInProgress,
-    startToolCall,
-    streamStateManager
-} from '../../providers/openai/openai-responses-core.mjs';
 
 /**
  * Claude转换器类
@@ -48,9 +31,37 @@ function sanitizeToolId(id) {
     return String(id).replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
+// Anthropic separates uncached input, cache reads, and cache writes. OpenAI
+// reports their sum as total input, with cache reads as a subset of that sum.
+function getClaudeTokenUsage(usage) {
+    const count = value => {
+        const number = Number(value);
+        return Number.isFinite(number) && number > 0 ? Math.floor(number) : 0;
+    };
+    const cachedTokens = count(usage?.cache_read_input_tokens);
+    return {
+        inputTokens: count(usage?.input_tokens) + cachedTokens + count(usage?.cache_creation_input_tokens),
+        outputTokens: count(usage?.output_tokens),
+        cachedTokens
+    };
+}
+
 export class ClaudeConverter extends BaseConverter {
     constructor() {
         super('claude');
+        this.openAIStreamStates = new Map();
+        this.openAIResponsesStreamStates = new Map();
+    }
+
+    // Called by the common handler on completion, disconnect, failure, or EOF.
+    releaseOpenAIStreamState(requestId = null) {
+        const key = requestId || 'default';
+        this.openAIStreamStates.delete(key);
+        this.openAIResponsesStreamStates.delete(key);
+    }
+
+    openAIStreamStateCount() {
+        return this.openAIStreamStates.size + this.openAIResponsesStreamStates.size;
     }
 
     /**
@@ -97,7 +108,7 @@ export class ClaudeConverter extends BaseConverter {
     convertStreamChunk(chunk, targetProtocol, model, requestId) {
         switch (targetProtocol) {
             case MODEL_PROTOCOL_PREFIX.OPENAI:
-                return this.toOpenAIStreamChunk(chunk, model);
+                return this.toOpenAIStreamChunk(chunk, model, requestId);
             case MODEL_PROTOCOL_PREFIX.GEMINI:
                 return this.toGeminiStreamChunk(chunk, model);
             case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
@@ -350,6 +361,7 @@ export class ClaudeConverter extends BaseConverter {
      * Claude响应 -> OpenAI响应
      */
     toOpenAIResponse(claudeResponse, model) {
+        const { inputTokens, outputTokens, cachedTokens } = getClaudeTokenUsage(claudeResponse?.usage);
         if (!claudeResponse || !claudeResponse.content || claudeResponse.content.length === 0) {
             return {
                 id: `chatcmpl-${uuidv4()}`,
@@ -365,12 +377,12 @@ export class ClaudeConverter extends BaseConverter {
                     finish_reason: "stop",
                 }],
                 usage: {
-                    prompt_tokens: claudeResponse.usage?.input_tokens || 0,
-                    completion_tokens: claudeResponse.usage?.output_tokens || 0,
-                    total_tokens: (claudeResponse.usage?.input_tokens || 0) + (claudeResponse.usage?.output_tokens || 0),
-                    cached_tokens: claudeResponse.usage?.cache_read_input_tokens || 0,
+                    prompt_tokens: inputTokens,
+                    completion_tokens: outputTokens,
+                    total_tokens: inputTokens + outputTokens,
+                    cached_tokens: cachedTokens,
                     prompt_tokens_details: {
-                        cached_tokens: claudeResponse.usage?.cache_read_input_tokens || 0
+                        cached_tokens: cachedTokens
                     }
                 },
             };
@@ -453,12 +465,12 @@ export class ClaudeConverter extends BaseConverter {
                 finish_reason: finishReason,
             }],
             usage: {
-                prompt_tokens: claudeResponse.usage?.input_tokens || 0,
-                completion_tokens: claudeResponse.usage?.output_tokens || 0,
-                total_tokens: (claudeResponse.usage?.input_tokens || 0) + (claudeResponse.usage?.output_tokens || 0),
-                cached_tokens: claudeResponse.usage?.cache_read_input_tokens || 0,
+                prompt_tokens: inputTokens,
+                completion_tokens: outputTokens,
+                total_tokens: inputTokens + outputTokens,
+                cached_tokens: cachedTokens,
                 prompt_tokens_details: {
-                    cached_tokens: claudeResponse.usage?.cache_read_input_tokens || 0
+                    cached_tokens: cachedTokens
                 }
             },
         };
@@ -467,20 +479,41 @@ export class ClaudeConverter extends BaseConverter {
     /**
      * Claude流式响应 -> OpenAI流式响应
      */
-    toOpenAIStreamChunk(claudeChunk, model) {
+    toOpenAIStreamChunk(claudeChunk, model, requestId = null) {
         if (!claudeChunk) return null;
+        const stateKey = requestId || 'default';
+        if (claudeChunk.type === 'message_stop') {
+            this.openAIStreamStates.delete(stateKey);
+            return null;
+        }
+        if (typeof claudeChunk !== 'string' && ![
+            'message_start', 'content_block_start', 'content_block_delta',
+            'content_block_stop', 'message_delta'
+        ].includes(claudeChunk.type)) return null;
 
-        // 处理 Claude 流式事件
-        const chunkId = `chatcmpl-${uuidv4()}`;
-        const timestamp = Math.floor(Date.now() / 1000);
+        if (claudeChunk.type === 'message_start' || !this.openAIStreamStates.has(stateKey)) {
+            this.openAIStreamStates.set(stateKey, {
+                chunkId: `chatcmpl-${uuidv4()}`,
+                created: Math.floor(Date.now() / 1000),
+                model: model || claudeChunk.message?.model || 'unknown',
+                toolIndexes: new Map(),
+                toolArguments: new Map(),
+                finishSent: false,
+                usage: { ...claudeChunk.message?.usage }
+            });
+        }
+        const state = this.openAIStreamStates.get(stateKey);
+        const chunkId = state.chunkId;
+        const timestamp = state.created;
 
         // message_start 事件
         if (claudeChunk.type === 'message_start') {
+            const { inputTokens, cachedTokens } = getClaudeTokenUsage(state.usage);
             return {
                 id: chunkId,
                 object: "chat.completion.chunk",
                 created: timestamp,
-                model: model,
+                model: state.model,
                 system_fingerprint: "",
                 choices: [{
                     index: 0,
@@ -491,10 +524,11 @@ export class ClaudeConverter extends BaseConverter {
                     finish_reason: null
                 }],
                 usage: {
-                    prompt_tokens: claudeChunk.message?.usage?.input_tokens || 0,
+                    prompt_tokens: inputTokens,
                     completion_tokens: 0,
-                    total_tokens: claudeChunk.message?.usage?.input_tokens || 0,
-                    cached_tokens: claudeChunk.message?.usage?.cache_read_input_tokens || 0
+                    total_tokens: inputTokens,
+                    cached_tokens: cachedTokens,
+                    prompt_tokens_details: { cached_tokens: cachedTokens }
                 }
             };
         }
@@ -505,22 +539,33 @@ export class ClaudeConverter extends BaseConverter {
             
             // 处理 tool_use 类型
             if (contentBlock && contentBlock.type === 'tool_use') {
+                const blockIndex = claudeChunk.index ?? 0;
+                if (!state.toolIndexes.has(blockIndex)) {
+                    state.toolIndexes.set(blockIndex, state.toolIndexes.size);
+                }
+                // Empty input is the placeholder for streamed arguments, not
+                // a '{}' prefix to append to subsequent JSON fragments.
+                const initialArguments = typeof contentBlock.input === 'string'
+                    ? contentBlock.input
+                    : contentBlock.input && Object.keys(contentBlock.input).length > 0
+                        ? JSON.stringify(contentBlock.input) : '';
+                state.toolArguments.set(blockIndex, { initialInput: contentBlock.input, arguments: initialArguments });
                 return {
                     id: chunkId,
                     object: "chat.completion.chunk",
                     created: timestamp,
-                    model: model,
+                    model: state.model,
                     system_fingerprint: "",
                     choices: [{
                         index: 0,
                         delta: {
                             tool_calls: [{
-                                index: claudeChunk.index || 0,
+                                index: state.toolIndexes.get(claudeChunk.index ?? 0),
                                 id: contentBlock.id,
                                 type: "function",
                                 function: {
                                     name: contentBlock.name,
-                                    arguments: ""
+                                    arguments: initialArguments
                                 }
                             }]
                         },
@@ -534,13 +579,13 @@ export class ClaudeConverter extends BaseConverter {
                 id: chunkId,
                 object: "chat.completion.chunk",
                 created: timestamp,
-                model: model,
+                model: state.model,
                 system_fingerprint: "",
                 choices: [{
                     index: 0,
-                    delta: {
-                        content: ""
-                    },
+                    delta: contentBlock?.type === 'thinking'
+                        ? { reasoning_content: contentBlock.thinking ?? '' }
+                        : { content: contentBlock?.text ?? '' },
                     finish_reason: null
                 }]
             };
@@ -556,7 +601,7 @@ export class ClaudeConverter extends BaseConverter {
                     id: chunkId,
                     object: "chat.completion.chunk",
                     created: timestamp,
-                    model: model,
+                    model: state.model,
                     system_fingerprint: "",
                     choices: [{
                         index: 0,
@@ -574,7 +619,7 @@ export class ClaudeConverter extends BaseConverter {
                     id: chunkId,
                     object: "chat.completion.chunk",
                     created: timestamp,
-                    model: model,
+                    model: state.model,
                     system_fingerprint: "",
                     choices: [{
                         index: 0,
@@ -588,17 +633,22 @@ export class ClaudeConverter extends BaseConverter {
 
             // 处理 input_json_delta (tool arguments)
             if (delta && delta.type === 'input_json_delta') {
+                const blockIndex = claudeChunk.index ?? 0;
+                const toolIndex = state.toolIndexes.get(blockIndex);
+                // Never attribute an unannounced block's arguments to tool 0.
+                if (toolIndex === undefined) return null;
+                state.toolArguments.get(blockIndex).arguments += delta.partial_json || '';
                 return {
                     id: chunkId,
                     object: "chat.completion.chunk",
                     created: timestamp,
-                    model: model,
+                    model: state.model,
                     system_fingerprint: "",
                     choices: [{
                         index: 0,
                         delta: {
                             tool_calls: [{
-                                index: claudeChunk.index || 0,
+                                index: toolIndex,
                                 function: {
                                     arguments: delta.partial_json || ""
                                 }
@@ -610,17 +660,25 @@ export class ClaudeConverter extends BaseConverter {
             }
         }
 
-        // content_block_stop 事件
+        // A native block boundary does not end the OpenAI assistant message.
         if (claudeChunk.type === 'content_block_stop') {
+            const blockIndex = claudeChunk.index ?? 0;
+            const tool = state.toolArguments.get(blockIndex);
+            if (!tool || tool.arguments) return null;
+            tool.arguments = typeof tool.initialInput === 'string'
+                ? tool.initialInput || '{}' : JSON.stringify(tool.initialInput ?? {});
             return {
                 id: chunkId,
-                object: "chat.completion.chunk",
+                object: 'chat.completion.chunk',
                 created: timestamp,
-                model: model,
-                system_fingerprint: "",
+                model: state.model,
+                system_fingerprint: '',
                 choices: [{
                     index: 0,
-                    delta: {},
+                    delta: { tool_calls: [{
+                        index: state.toolIndexes.get(blockIndex),
+                        function: { arguments: tool.arguments }
+                    }] },
                     finish_reason: null
                 }]
             };
@@ -629,16 +687,19 @@ export class ClaudeConverter extends BaseConverter {
         // message_delta 事件
         if (claudeChunk.type === 'message_delta') {
             const stopReason = claudeChunk.delta?.stop_reason;
-            const finishReason = stopReason === 'end_turn' ? 'stop' :
+            let finishReason = stopReason === 'end_turn' || stopReason === 'stop_sequence' ? 'stop' :
                                 stopReason === 'max_tokens' ? 'length' :
                                 stopReason === 'tool_use' ? 'tool_calls' :
-                                stopReason || 'stop';
+                                stopReason || null;
+            // Preserve later usage-only metadata, but never terminate twice.
+            if (state.finishSent) finishReason = null;
+            if (finishReason) state.finishSent = true;
 
             const chunk = {
                 id: chunkId,
                 object: "chat.completion.chunk",
                 created: timestamp,
-                model: model,
+                model: state.model,
                 system_fingerprint: "",
                 choices: [{
                     index: 0,
@@ -647,37 +708,21 @@ export class ClaudeConverter extends BaseConverter {
                 }]
             };
 
-            if(claudeChunk.usage){
+            if (claudeChunk.usage) {
+                Object.assign(state.usage, claudeChunk.usage);
+                const { inputTokens, outputTokens, cachedTokens } = getClaudeTokenUsage(state.usage);
                 chunk.usage = {
-                    prompt_tokens: claudeChunk.usage.input_tokens || 0,
-                    completion_tokens: claudeChunk.usage.output_tokens || 0,
-                    total_tokens: (claudeChunk.usage.input_tokens || 0) + (claudeChunk.usage.output_tokens || 0),
-                    cached_tokens: claudeChunk.usage.cache_read_input_tokens || 0,
+                    prompt_tokens: inputTokens,
+                    completion_tokens: outputTokens,
+                    total_tokens: inputTokens + outputTokens,
+                    cached_tokens: cachedTokens,
                     prompt_tokens_details: {
-                        cached_tokens: claudeChunk.usage.cache_read_input_tokens || 0
+                        cached_tokens: cachedTokens
                     }
                 };
             }
 
             return chunk;
-        }
-
-        // message_stop 事件
-        if (claudeChunk.type === 'message_stop') {
-            return null;
-            // const chunk = {
-            //     id: chunkId,
-            //     object: "chat.completion.chunk",
-            //     created: timestamp,
-            //     model: model,
-            //     system_fingerprint: "",
-            //     choices: [{
-            //         index: 0,
-            //         delta: {},
-            //         finish_reason: 'stop'
-            //     }]
-            // };
-            // return chunk;
         }
 
         // 兼容旧格式：如果是字符串，直接作为文本内容
@@ -686,7 +731,7 @@ export class ClaudeConverter extends BaseConverter {
                 id: chunkId,
                 object: "chat.completion.chunk",
                 created: timestamp,
-                model: model,
+                model: state.model,
                 system_fingerprint: "",
                 choices: [{
                     index: 0,
@@ -1786,48 +1831,91 @@ export class ClaudeConverter extends BaseConverter {
         return responseId ? `msg_${responseId}_${index}` : `msg_${uuidv4().replace(/-/g, '')}`;
     }
 
-    _resetOpenAIResponsesStreamState(state, claudeMessage, model) {
-        const responseId = claudeMessage?.id || state.id;
-        state.id = responseId;
-        state.msgId = this._buildResponsesMessageItemId(responseId, 0);
-        state.fullText = '';
-        state.sequenceNumber = 0;
-        state.model = model || claudeMessage?.model || state.model;
-        state.status = 'in_progress';
-        state.startTime = Math.floor(Date.now() / 1000);
-        state.toolCalls = [];
-        state.currentToolCall = null;
-        state.savedUsage = null;
-        state.reasoningId = `rs_${responseId}_0`;
-        state.reasoningStarted = false;
-        state.reasoningText = '';
+    _createOpenAIResponsesStreamState(message, model) {
+        const template = this.toOpenAIResponsesResponse({
+            id: message?.id,
+            model: model || message?.model || 'unknown',
+            content: []
+        }, model || message?.model || 'unknown');
+        return {
+            template: { ...template, instructions: null, completed_at: null, output: [], usage: null, status: 'in_progress' },
+            sequenceNumber: 0,
+            items: [],
+            blocks: new Map(),
+            currentText: null,
+            currentReasoning: null,
+            usage: { ...message?.usage },
+            stopReason: null
+        };
     }
 
-    _ensureOpenAIResponsesReasoningStarted(state, outputIndex, events) {
-        if (state.reasoningStarted) {
-            return;
+    _snapshotOpenAIResponsesItem(entry) {
+        const item = { ...entry.item };
+        if (item.content) item.content = item.content.map(part => ({ ...part }));
+        if (item.summary) item.summary = item.summary.map(part => ({ ...part }));
+        return item;
+    }
+
+    _addOpenAIResponsesItem(state, item, emit) {
+        const entry = { index: state.items.length, item: { ...item, status: 'in_progress' }, done: false };
+        state.items.push(entry);
+        emit({ type: 'response.output_item.added', output_index: entry.index, item: this._snapshotOpenAIResponsesItem(entry) });
+        return entry;
+    }
+
+    _finishOpenAIResponsesItem(state, entry, emit) {
+        if (!entry || entry.done) return;
+        const address = { item_id: entry.item.id, output_index: entry.index };
+        if (entry.item.type === 'message') {
+            const part = entry.item.content[0];
+            emit({ type: 'response.output_text.done', ...address, content_index: 0, text: part.text, logprobs: [] });
+            emit({ type: 'response.content_part.done', ...address, content_index: 0, part: { ...part } });
+        } else if (entry.item.type === 'reasoning') {
+            const part = entry.item.summary[0];
+            emit({ type: 'response.reasoning_summary_text.done', ...address, summary_index: 0, text: part.text });
+            emit({ type: 'response.reasoning_summary_part.done', ...address, summary_index: 0, part: { ...part } });
+        } else if (entry.item.type === 'function_call') {
+            // Some upstreams provide complete initial input without JSON deltas.
+            if (!entry.item.arguments) {
+                entry.item.arguments = entry.initialArguments || '{}';
+                emit({ type: 'response.function_call_arguments.delta', ...address, delta: entry.item.arguments });
+            }
+            emit({ type: 'response.function_call_arguments.done', ...address, arguments: entry.item.arguments, name: entry.item.name });
         }
-        events.push({
-            type: "response.output_item.added",
-            output_index: outputIndex,
-            item: {
-                id: state.reasoningId,
-                type: "reasoning",
-                status: "in_progress",
-                summary: []
-            }
-        });
-        events.push({
-            type: "response.reasoning_summary_part.added",
-            item_id: state.reasoningId,
-            output_index: outputIndex,
-            summary_index: 0,
-            part: {
-                type: "summary_text",
-                text: ""
-            }
-        });
-        state.reasoningStarted = true;
+        entry.item.status = state.stopReason === 'max_tokens' ? 'incomplete' : 'completed';
+        entry.done = true;
+        emit({ type: 'response.output_item.done', output_index: entry.index, item: this._snapshotOpenAIResponsesItem(entry) });
+        if (state.currentText === entry) state.currentText = null;
+        if (state.currentReasoning === entry) state.currentReasoning = null;
+    }
+
+    _ensureOpenAIResponsesText(state, emit) {
+        this._finishOpenAIResponsesItem(state, state.currentReasoning, emit);
+        if (!state.currentText) {
+            const index = state.items.length;
+            state.currentText = this._addOpenAIResponsesItem(state, {
+                id: this._buildResponsesMessageItemId(state.template.id, index),
+                type: 'message', role: 'assistant', content: []
+            }, emit);
+            const part = { type: 'output_text', text: '', annotations: [], logprobs: [] };
+            state.currentText.item.content.push(part);
+            emit({ type: 'response.content_part.added', item_id: state.currentText.item.id, output_index: index, content_index: 0, part: { ...part } });
+        }
+        return state.currentText;
+    }
+
+    _ensureOpenAIResponsesReasoning(state, emit) {
+        this._finishOpenAIResponsesItem(state, state.currentText, emit);
+        if (!state.currentReasoning) {
+            const index = state.items.length;
+            state.currentReasoning = this._addOpenAIResponsesItem(state, {
+                id: `rs_${state.template.id}_${index}`, type: 'reasoning', summary: []
+            }, emit);
+            const part = { type: 'summary_text', text: '' };
+            state.currentReasoning.item.summary.push(part);
+            emit({ type: 'response.reasoning_summary_part.added', item_id: state.currentReasoning.item.id, output_index: index, summary_index: 0, part: { ...part } });
+        }
+        return state.currentReasoning;
     }
 
     /**
@@ -1961,6 +2049,7 @@ export class ClaudeConverter extends BaseConverter {
      * Claude响应 -> OpenAI Responses响应
      */
     toOpenAIResponsesResponse(claudeResponse, model) {
+        const { inputTokens, outputTokens, cachedTokens } = getClaudeTokenUsage(claudeResponse.usage);
         const output = [];
         const messageContent = [];
         const reasoningSummary = [];
@@ -2051,15 +2140,15 @@ export class ClaudeConverter extends BaseConverter {
             top_p: 1,
             truncation: "disabled",
             usage: {
-                input_tokens: claudeResponse.usage?.input_tokens || 0,
+                input_tokens: inputTokens,
                 input_tokens_details: {
-                    cached_tokens: claudeResponse.usage?.cache_read_input_tokens || 0
+                    cached_tokens: cachedTokens
                 },
-                output_tokens: claudeResponse.usage?.output_tokens || 0,
+                output_tokens: outputTokens,
                 output_tokens_details: {
                     reasoning_tokens: 0
                 },
-                total_tokens: (claudeResponse.usage?.input_tokens || 0) + (claudeResponse.usage?.output_tokens || 0)
+                total_tokens: inputTokens + outputTokens
             },
             user: null
         };
@@ -2069,164 +2158,112 @@ export class ClaudeConverter extends BaseConverter {
      * Claude流式响应 -> OpenAI Responses流式响应
      */
     toOpenAIResponsesStreamChunk(claudeChunk, model, requestId = null) {
-        if (!claudeChunk) return [];
+        if (!claudeChunk || ![
+            'message_start', 'content_block_start', 'content_block_delta',
+            'content_block_stop', 'message_delta', 'message_stop'
+        ].includes(claudeChunk.type)) return [];
 
         const stateKey = requestId || 'default';
+        // A duplicate stop must not fabricate a new, empty response.
+        if (claudeChunk.type === 'message_stop' && !this.openAIResponsesStreamStates.has(stateKey)) return [];
+        const isNew = claudeChunk.type === 'message_start' || !this.openAIResponsesStreamStates.has(stateKey);
+        if (isNew) {
+            this.openAIResponsesStreamStates.set(stateKey, this._createOpenAIResponsesStreamState(claudeChunk.message, model));
+        }
+        const state = this.openAIResponsesStreamStates.get(stateKey);
         const events = [];
-
-        // message_start 事件 - 流开始
-        if (claudeChunk.type === 'message_start') {
-            const state = streamStateManager.getOrCreateState(stateKey);
-            this._resetOpenAIResponsesStreamState(state, claudeChunk.message, model);
-            events.push(
-                generateResponseCreated(stateKey, model || claudeChunk.message?.model || 'unknown'),
-                generateResponseInProgress(stateKey),
-                generateOutputItemAdded(stateKey),
-                generateContentPartAdded(stateKey)
-            );
+        const emit = event => events.push({ ...event, sequence_number: state.sequenceNumber++ });
+        if (isNew) {
+            emit({ type: 'response.created', response: { ...state.template } });
+            emit({ type: 'response.in_progress', response: { ...state.template } });
         }
 
-        // content_block_start 事件
+        const blockIndex = claudeChunk.index ?? 0;
+        const appendText = (descriptor, value) => {
+            if (!value || descriptor.entry?.done) return;
+            descriptor.entry ||= this._ensureOpenAIResponsesText(state, emit);
+            const entry = descriptor.entry;
+            entry.item.content[0].text += value;
+            emit({ type: 'response.output_text.delta', item_id: entry.item.id, output_index: entry.index, content_index: 0, delta: value, logprobs: [] });
+        };
+        const appendReasoning = (descriptor, value) => {
+            if (!value || descriptor.entry?.done) return;
+            descriptor.entry ||= this._ensureOpenAIResponsesReasoning(state, emit);
+            const entry = descriptor.entry;
+            entry.item.summary[0].text += value;
+            emit({ type: 'response.reasoning_summary_text.delta', item_id: entry.item.id, output_index: entry.index, summary_index: 0, delta: value });
+        };
+
         if (claudeChunk.type === 'content_block_start') {
-            const contentBlock = claudeChunk.content_block;
-            
-            // 对于 tool_use 类型，添加工具调用项
-            if (contentBlock && contentBlock.type === 'tool_use') {
-                startToolCall(stateKey, contentBlock.id, contentBlock.name);
-                events.push({
-                    item: {
-                        id: contentBlock.id,
-                        call_id: contentBlock.id,
-                        type: "function_call",
-                        name: contentBlock.name,
-                        arguments: "",
-                        status: "in_progress"
-                    },
-                    output_index: claudeChunk.index || 0,
-                    sequence_number: 2,
-                    type: "response.output_item.added"
-                });
+            const content = claudeChunk.content_block || {};
+            const descriptor = { type: content.type, entry: null };
+            state.blocks.set(blockIndex, descriptor);
+            if (content.type === 'text') {
+                appendText(descriptor, content.text);
+            } else if (content.type === 'thinking') {
+                appendReasoning(descriptor, content.thinking);
+            } else if (content.type === 'tool_use') {
+                this._finishOpenAIResponsesItem(state, state.currentText, emit);
+                this._finishOpenAIResponsesItem(state, state.currentReasoning, emit);
+                descriptor.entry = this._addOpenAIResponsesItem(state, {
+                    id: `fc_${state.template.id}_${state.items.length}`,
+                    type: 'function_call', call_id: content.id,
+                    name: content.name, arguments: ''
+                }, emit);
+                descriptor.entry.initialArguments = typeof content.input === 'string'
+                    ? content.input : JSON.stringify(content.input || {});
             }
-        }
-
-        // content_block_delta 事件
-        if (claudeChunk.type === 'content_block_delta') {
-            const delta = claudeChunk.delta;
-            
-            // 处理文本增量
-            if (delta && delta.type === 'text_delta') {
-                events.push(generateOutputTextDelta(stateKey, delta.text || ""));
+        } else if (claudeChunk.type === 'content_block_delta') {
+            const delta = claudeChunk.delta || {};
+            let descriptor = state.blocks.get(blockIndex);
+            // Retain compatibility with callers that pass only text deltas.
+            if (!descriptor && ['text_delta', 'thinking_delta'].includes(delta.type)) {
+                descriptor = { type: delta.type === 'text_delta' ? 'text' : 'thinking', entry: null };
+                state.blocks.set(blockIndex, descriptor);
             }
-            // 处理推理内容增量
-            else if (delta && delta.type === 'thinking_delta') {
-                const state = streamStateManager.getOrCreateState(stateKey);
-                const outputIndex = claudeChunk.index || 0;
-                this._ensureOpenAIResponsesReasoningStarted(state, outputIndex, events);
-                state.reasoningText += delta.thinking || "";
-                events.push({
-                    delta: delta.thinking || "",
-                    item_id: state.reasoningId,
-                    output_index: outputIndex,
-                    sequence_number: 3,
-                    summary_index: 0,
-                    type: "response.reasoning_summary_text.delta"
-                });
+            if (delta.type === 'text_delta' && descriptor?.type === 'text') {
+                appendText(descriptor, delta.text);
+            } else if (delta.type === 'thinking_delta' && descriptor?.type === 'thinking') {
+                appendReasoning(descriptor, delta.thinking);
+            } else if (delta.type === 'input_json_delta' && descriptor?.entry?.item.type === 'function_call' && !descriptor.entry.done) {
+                const entry = descriptor.entry;
+                const fragment = delta.partial_json || '';
+                entry.item.arguments += fragment;
+                emit({ type: 'response.function_call_arguments.delta', item_id: entry.item.id, output_index: entry.index, delta: fragment });
             }
-            // 处理工具调用参数增量
-            else if (delta && delta.type === 'input_json_delta') {
-                const state = streamStateManager.getOrCreateState(stateKey);
-                const itemId = state.currentToolCall ? state.currentToolCall.id : 'unknown';
-                events.push(generateFunctionCallArgsDelta(
-                    stateKey, itemId, claudeChunk.index || 0, delta.partial_json || ""
-                ));
+        } else if (claudeChunk.type === 'content_block_stop') {
+            const descriptor = state.blocks.get(blockIndex);
+            // Adjacent native text blocks are fragments of one assistant item.
+            // Only real reasoning/tool boundaries (or message_stop) close it.
+            if (descriptor && descriptor.type !== 'text') {
+                this._finishOpenAIResponsesItem(state, descriptor.entry, emit);
             }
-        }
-
-        // content_block_stop 事件
-        if (claudeChunk.type === 'content_block_stop') {
-            const state = streamStateManager.getOrCreateState(stateKey);
-            if (state.currentToolCall) {
-                const itemId = state.currentToolCall.id;
-                const outputIdx = claudeChunk.index || 0;
-                events.push(generateFunctionCallArgsDone(stateKey, itemId, outputIdx));
-                const finished = finishToolCall(stateKey);
-                if (finished) {
-                    events.push(generateFunctionCallOutputItemDone(stateKey, finished, outputIdx));
+        } else if (claudeChunk.type === 'message_delta') {
+            Object.assign(state.usage, claudeChunk.usage);
+            state.stopReason = claudeChunk.delta?.stop_reason || state.stopReason;
+        } else if (claudeChunk.type === 'message_stop') {
+            for (const entry of state.items) this._finishOpenAIResponsesItem(state, entry, emit);
+            const incomplete = state.stopReason === 'max_tokens';
+            const { inputTokens, outputTokens, cachedTokens } = getClaudeTokenUsage(state.usage);
+            emit({
+                type: incomplete ? 'response.incomplete' : 'response.completed',
+                response: {
+                    ...state.template,
+                    status: incomplete ? 'incomplete' : 'completed',
+                    incomplete_details: incomplete ? { reason: 'max_output_tokens' } : null,
+                    completed_at: incomplete ? null : Math.floor(Date.now() / 1000),
+                    output: state.items.map(entry => this._snapshotOpenAIResponsesItem(entry)),
+                    usage: {
+                        input_tokens: inputTokens,
+                        input_tokens_details: { cached_tokens: cachedTokens },
+                        output_tokens: outputTokens,
+                        output_tokens_details: { reasoning_tokens: 0 },
+                        total_tokens: inputTokens + outputTokens
+                    }
                 }
-            }
+            });
+            this.openAIResponsesStreamStates.delete(stateKey);
         }
-
-        // message_delta 事件 - 保存 usage 供 message_stop 使用
-        if (claudeChunk.type === 'message_delta') {
-            if (claudeChunk.usage) {
-                const state = streamStateManager.getOrCreateState(stateKey);
-                state.savedUsage = {
-                    input_tokens: claudeChunk.usage.input_tokens || 0,
-                    input_tokens_details: { cached_tokens: claudeChunk.usage.cache_read_input_tokens || 0 },
-                    output_tokens: claudeChunk.usage.output_tokens || 0,
-                    output_tokens_details: { reasoning_tokens: 0 },
-                    total_tokens: (claudeChunk.usage.input_tokens || 0) + (claudeChunk.usage.output_tokens || 0)
-                };
-            }
-        }
-
-        // message_stop 事件
-        if (claudeChunk.type === 'message_stop') {
-            const state = streamStateManager.getOrCreateState(stateKey);
-            const savedUsage = state.savedUsage || null;
-            if (state.reasoningStarted) {
-                events.push({
-                    type: "response.reasoning_summary_text.done",
-                    item_id: state.reasoningId,
-                    output_index: 0,
-                    summary_index: 0,
-                    text: state.reasoningText
-                });
-                events.push({
-                    type: "response.reasoning_summary_part.done",
-                    item_id: state.reasoningId,
-                    output_index: 0,
-                    summary_index: 0,
-                    part: {
-                        type: "summary_text",
-                        text: state.reasoningText
-                    }
-                });
-                events.push({
-                    type: "response.output_item.done",
-                    output_index: 0,
-                    item: {
-                        id: state.reasoningId,
-                        type: "reasoning",
-                        status: "completed",
-                        summary: [{
-                            type: "summary_text",
-                            text: state.reasoningText
-                        }]
-                    }
-                });
-            }
-            events.push(
-                generateOutputTextDone(stateKey),
-                generateContentPartDone(stateKey),
-                generateOutputItemDone(stateKey)
-            );
-            const completedEvent = generateResponseCompleted(stateKey, savedUsage);
-            if (state.reasoningStarted) {
-                completedEvent.response.output.unshift({
-                    id: state.reasoningId,
-                    type: "reasoning",
-                    status: "completed",
-                    summary: [{
-                        type: "summary_text",
-                        text: state.reasoningText
-                    }]
-                });
-            }
-            events.push(completedEvent);
-            streamStateManager.cleanup(stateKey);
-        }
-
         return events;
     }
 

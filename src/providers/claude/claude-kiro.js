@@ -1,3 +1,8 @@
+import { KiroModelCache } from './kiro-model-cache.js';
+import { buildKiroInferenceConfig, guardKiroPayload, validateKiroGenerationRequest } from './kiro-request-guards.js';
+import { decodeKiroFrames, kiroIntegrityError, normalizeKiroStopReason } from './kiro-event-stream.js';
+import { KiroToolAssembler } from './kiro-tool-assembler.js';
+import { KiroBracketToolParser } from './kiro-bracket-tools.js';
 import { atomicWriteFile } from '../../utils/file-lock.js';
 import axios from 'axios';
 import logger from '../../utils/logger.js';
@@ -8,6 +13,8 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import * as http from 'http';
 import * as https from 'https';
+import { performance } from 'node:perf_hooks';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { getProviderModels } from '../provider-models.js';
 import { 
     countTextTokens as countTextTokensUtil, 
@@ -16,7 +23,7 @@ import {
     processContent as processContentUtil,
     getContentText as getContentTextUtil
 } from '../../utils/token-utils.js';
-import { configureAxiosProxy, configureTLSSidecar, isTLSSidecarEnabledForProvider } from '../../utils/proxy-utils.js';
+import { configureAxiosProxy, configureTLSSidecar, isTLSSidecarEnabledForProvider, resolveProxyUrlForProvider } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog, getNormalizedErrorResponseText, buildHttpErrorReason, normalizeProviderErrorMessage, createEmptyUpstreamResponseError } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
 import { buildKiroAdditionalModelRequestFields } from './kiro-effort.js';
@@ -160,33 +167,40 @@ function getKiroRequestMinIntervalMs(config) {
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
-async function acquireKiroRequestSlot(config) {
+// Stop waiting promptly without cancelling shared initialization/auth work.
+async function waitForKiroOperation(operation, signal) {
+    if (!signal) return await operation;
+
+    let onAbort;
+    try {
+        return await new Promise((resolve, reject) => {
+            onAbort = () => reject(signal.reason);
+            signal.addEventListener('abort', onAbort, { once: true });
+            Promise.resolve(operation).then(resolve, reject);
+            if (signal.aborted) onAbort();
+        });
+    } finally {
+        signal.removeEventListener('abort', onAbort);
+    }
+}
+
+async function waitForKiroRequestSlot(config, signal) {
+    signal?.throwIfAborted();
     const minIntervalMs = getKiroRequestMinIntervalMs(config);
-    if (minIntervalMs <= 0) {
-        return () => {};
-    }
+    if (minIntervalMs <= 0) return;
 
-    let releaseCurrent;
-    const previous = kiroThrottleQueue.catch(() => {});
-    kiroThrottleQueue = previous.then(() => new Promise(resolve => {
-        releaseCurrent = resolve;
-    }));
-
-    await previous;
-
-    const elapsedMs = Date.now() - kiroLastRequestStartedAt;
-    const waitMs = Math.max(0, minIntervalMs - elapsedMs);
-    if (waitMs > 0) {
-        await new Promise(resolve => setTimeout(resolve, waitMs));
-    }
-    kiroLastRequestStartedAt = Date.now();
-
-    let released = false;
-    return () => {
-        if (released) return;
-        released = true;
-        releaseCurrent();
-    };
+    // Serialize start-time reservations, not the lifetime of responses. A stream
+    // or retry must never hold this queue while waiting for another reservation.
+    const reservation = kiroThrottleQueue.then(async () => {
+        signal?.throwIfAborted();
+        const waitMs = Math.max(0, minIntervalMs - (Date.now() - kiroLastRequestStartedAt));
+        if (waitMs > 0) await sleep(waitMs, undefined, { signal });
+        signal?.throwIfAborted();
+        kiroLastRequestStartedAt = Date.now();
+    });
+    // Failed/cancelled reservations must not poison subsequent requests.
+    kiroThrottleQueue = reservation.catch(() => {});
+    await waitForKiroOperation(reservation, signal);
 }
 
 function normalizeKiroToolInput(input) {
@@ -258,7 +272,8 @@ function getContextTokensForModel(model, config = {}, fallbackModel = null) {
         return configuredModelContextLength;
     }
 
-    return MODEL_CONTEXT_TOKENS[model] || MODEL_CONTEXT_TOKENS[fallbackModel] || KIRO_CONSTANTS.TOTAL_CONTEXT_TOKENS;
+    return (Object.hasOwn(MODEL_CONTEXT_TOKENS, model) ? MODEL_CONTEXT_TOKENS[model] : null) ||
+        (Object.hasOwn(MODEL_CONTEXT_TOKENS, fallbackModel) ? MODEL_CONTEXT_TOKENS[fallbackModel] : null) || KIRO_CONSTANTS.TOTAL_CONTEXT_TOKENS;
 }
 // 从 provider-models.js 获取支持的模型列表
 const KIRO_MODELS = getProviderModels(MODEL_PROVIDER.KIRO_API);
@@ -290,7 +305,7 @@ const MODEL_MAPPING = Object.fromEntries(
 );
 
 function resolveKiroModel(model, config = {}) {
-    if (MODEL_MAPPING[model]) {
+    if (Object.hasOwn(MODEL_MAPPING, model)) {
         return MODEL_MAPPING[model];
     }
 
@@ -637,11 +652,12 @@ function createKiroEmptyResponseError() {
     return createEmptyUpstreamResponseError('Kiro');
 }
 
-async function getKiroErrorResponsePreview(error, maxLength = 500) {
+async function getKiroErrorResponsePreview(error, maxLength = 500, options = {}) {
     try {
-        const responseText = await getNormalizedErrorResponseText(error);
+        const responseText = await getNormalizedErrorResponseText(error, options);
         return String(responseText || '').substring(0, maxLength);
     } catch (previewError) {
+        options.signal?.throwIfAborted();
         // 错误日志绝不能覆盖真正的请求异常；无法格式化时只记录摘要失败。
         logger.warn(`[Kiro] Failed to format error response body: ${previewError?.message || 'unknown error'}`);
         return '';
@@ -690,6 +706,15 @@ export class KiroApiService {
  
     async initialize() {
         if (this.isInitialized) return;
+        if (this._initializationPromise) return await this._initializationPromise;
+        const operation = this._initialize();
+        this._initializationPromise = operation;
+        try { await operation; }
+        finally { if (this._initializationPromise === operation) this._initializationPromise = null; }
+    }
+
+    async _initialize() {
+        if (this.isInitialized) return;
         logger.info('[Kiro] Initializing Kiro API Service...');
         // 注意：V2 读写分离架构下，初始化不再执行同步认证/刷新逻辑
         // 仅执行基础的凭证加载
@@ -706,6 +731,10 @@ export class KiroApiService {
 
         const axiosConfig = {
             timeout: KIRO_CONSTANTS.AXIOS_TIMEOUT,
+            // Node >= 20 global agents reuse connections; proxy/sidecar routing
+            // can still override them per request without creating account pools.
+            httpAgent: http.globalAgent,
+            httpsAgent: https.globalAgent,
             headers: {
                 'Content-Type': KIRO_CONSTANTS.CONTENT_TYPE_JSON,
                 'Accept': KIRO_CONSTANTS.ACCEPT_JSON,
@@ -714,7 +743,6 @@ export class KiroApiService {
                 'x-amz-target': 'AmazonCodeWhispererStreamingService.GenerateAssistantResponse',
                 'x-amz-user-agent': 'aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/linux lang/rust/1.92.0 m/F app/AmazonQ-For-CLI',
                 'user-agent': 'aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/linux lang/rust/1.92.0 md/appVersion-2.10.0 app/AmazonQ-For-CLI',
-                'Connection': 'close'
             },
         };
         
@@ -731,23 +759,25 @@ export class KiroApiService {
     }
 
     async _requestWithBuilderEndpointRouting(axiosConfig, requestData) {
-        const routeToCodeWhisperer = shouldRouteBuilderToCodeWhisperer({
-            authMethod: this.authMethod,
-            profileArn: this.profileArn,
-            requestUrl: axiosConfig.url
-        });
-        if (!routeToCodeWhisperer) {
-            return await this.axiosInstance.request(axiosConfig);
+        let routedConfig = { ...axiosConfig, headers: { ...axiosConfig.headers } };
+        if (shouldRouteBuilderToCodeWhisperer({ authMethod: this.authMethod, profileArn: this.profileArn, requestUrl: axiosConfig.url })) {
+            const data = { ...requestData };
+            delete data.profileArn;
+            routedConfig = { ...routedConfig, url: this.codewhispererBaseUrl, data };
+            logger.info('[Kiro] Routing profileless Builder ID request through CodeWhisperer.');
         }
-
-        const routedData = { ...requestData };
-        delete routedData.profileArn;
-        const routedConfig = {
-            ...axiosConfig,
-            url: this.codewhispererBaseUrl,
-            data: routedData
-        };
-        logger.info('[Kiro] Routing profileless Builder ID request through CodeWhisperer.');
+        const apiKey = this.accessToken?.startsWith('ksk_') || this.apiKey && this.accessToken === this.apiKey;
+        if (apiKey && (this.config.KIRO_API_KEY_RUNTIME_ENABLED === true || this.config.KIRO_API_KEY_BASE_URL)) {
+            const data = { ...requestData, conversationState: { ...requestData.conversationState } };
+            delete data.profileArn;
+            data.conversationState.currentMessage = { ...data.conversationState.currentMessage,
+                userInputMessage: { ...data.conversationState.currentMessage?.userInputMessage, origin: 'CLI' } };
+            routedConfig = { ...routedConfig, url: this.config.KIRO_API_KEY_BASE_URL || `https://runtime.${this.region || 'us-east-1'}.kiro.dev/`, data };
+            routedConfig.headers['Content-Type'] = 'application/x-amz-json-1.0';
+            routedConfig.headers['TokenType'] = 'API_KEY';
+            routedConfig.headers['x-amzn-codewhisperer-optout'] = 'false';
+        }
+        this._applySidecar(routedConfig);
         return await this.axiosInstance.request(routedConfig);
     }
 
@@ -945,7 +975,6 @@ async _discoverProfileArn() {
             'amz-sdk-request': 'attempt=1; max=1',
             'x-amz-user-agent': `aws-sdk-js/1.0.34 KiroIDE-${kiroVersion}-${machineId}`,
             'user-agent': `aws-sdk-js/1.0.34 ua/2.1 os/${osName} lang/js md/nodejs#${nodeVersion} api/codewhisperer#1.0.34 m/E KiroIDE-${kiroVersion}-${machineId}`,
-            'Connection': 'close'
         }
     };
     this._applySidecar(axiosConfig);
@@ -1322,7 +1351,7 @@ async saveCredentialsToFile(filePath, newData) {
      * Build CodeWhisperer request from OpenAI messages
      */
 
-    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, outputConfig = null, reasoningEffort = null) {
+    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, outputConfig = null, reasoningEffort = null, generationParams = {}) {
         const conversationId = uuidv4();
         
         // 内置的 systemPrompt 前缀
@@ -1847,7 +1876,11 @@ async saveCredentialsToFile(filePath, newData) {
             request.profileArn = requestProfileArn;
         }
 
-        Object.defineProperty(request, '_kiroToolNameMaps', {
+        const inference = buildKiroInferenceConfig(generationParams, this.config.KIRO_ENABLE_INFERENCE_CONFIG !== false);
+        if (inference) request.inferenceConfig = inference;
+        const guarded = guardKiroPayload(request, this.config);
+
+        Object.defineProperty(guarded, '_kiroToolNameMaps', {
             value: toolNameMaps,
             enumerable: false
         });
@@ -1860,7 +1893,7 @@ async saveCredentialsToFile(filePath, newData) {
                 if (pluginManager) {
                     await pluginManager.executeHook('onInternalRequestConverted', {
                         requestId: this.config._monitorRequestId,
-                        internalRequest: request,
+                        internalRequest: guarded,
                         converterName: 'buildCodewhispererRequest'
                     });
                 }
@@ -1870,7 +1903,7 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         // fs.writeFile('claude-kiro-request'+Date.now()+'.json', JSON.stringify(request));
-        return request;
+        return guarded;
     }
 
     parseEventStreamChunk(rawData, toolNameMaps = null) {
@@ -1999,7 +2032,7 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.output_config, body.reasoning_effort);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.output_config, body.reasoning_effort, body);
 
         try {
             const token = this.accessToken; // Use the already initialized token
@@ -2022,14 +2055,8 @@ async saveCredentialsToFile(filePath, newData) {
                 data: requestData,
                 headers
             };
-            this._applySidecar(axiosConfig);
-            const releaseThrottle = await acquireKiroRequestSlot(this.config);
-            let response;
-            try {
-                response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData);
-            } finally {
-                releaseThrottle();
-            }
+            await waitForKiroRequestSlot(this.config);
+            const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData);
             response._kiroToolNameMaps = requestData._kiroToolNameMaps;
             return response;
         } catch (error) {
@@ -2153,9 +2180,10 @@ async saveCredentialsToFile(filePath, newData) {
         return tokenRelated && refreshableAuthState;
     }
 
-    async _handleForbiddenCredentialError(error, context) {
-        const responseText = await getNormalizedErrorResponseText(error);
-        await this._applyForbiddenCredentialState(error, context, responseText);
+    async _handleForbiddenCredentialError(error, context, options = {}) {
+        const responseText = await getNormalizedErrorResponseText(error, options);
+        options.signal?.throwIfAborted();
+        await this._applyForbiddenCredentialState(error, context, responseText, options);
     }
 
     _buildForbiddenReason(context, responseText, tokenRelated = false) {
@@ -2180,7 +2208,7 @@ async saveCredentialsToFile(filePath, newData) {
         } : error;
     }
 
-    async _applyForbiddenCredentialState(error, context, responseText) {
+    async _applyForbiddenCredentialState(error, context, responseText, options = {}) {
         const responseSnippet = responseText ? responseText.substring(0, 500) : '';
         if (responseSnippet) {
             logger.warn(`[Kiro] 403 response body (${context}): ${responseSnippet}`);
@@ -2188,7 +2216,9 @@ async saveCredentialsToFile(filePath, newData) {
 
         const normalizedError = this._buildNormalizedForbiddenError(error, responseText);
 
-        if (await this._isRefreshableForbidden(normalizedError)) {
+        const refreshable = await this._isRefreshableForbidden(normalizedError);
+        options.signal?.throwIfAborted();
+        if (refreshable) {
             const reason = this._buildForbiddenReason(context, responseText, true);
             logger.info(`[Kiro] Received token-related 403 in ${context}. Marking credential as needs refresh.`);
             this._markCredentialNeedRefresh(reason, error);
@@ -2316,16 +2346,19 @@ async saveCredentialsToFile(filePath, newData) {
      * @throws {Error} 抛出带有切换凭证标记的错误
      * @private
      */
-    async _handle402Error(error, context = 'unknown') {
+    async _handle402Error(error, context = 'unknown', options = {}) {
+        const { signal } = options;
         logger.info(`[Kiro] Received 402 (Quota Exceeded) in ${context}. Verifying usage limits...`);
         const { reason: verifiedReason } = await normalizeProviderErrorMessage(error, {
+            ...options,
             status: 402,
             context,
             suffix: 'quota exceeded'
         });
         try {
             // Verify usage limits to confirm quota exhaustion
-            const usageLimits = await this.getUsageLimits();
+            const usageLimits = await this.getUsageLimits({ signal });
+            signal?.throwIfAborted();
             // 真实响应字段为 usageBreakdownList[].currentUsage / usageLimit
             const breakdown = usageLimits?.usageBreakdownList?.[0];
             logger.info(`[Kiro] Quota confirmed exhausted: ${breakdown?.currentUsage}/${breakdown?.usageLimit}`);
@@ -2333,10 +2366,12 @@ async saveCredentialsToFile(filePath, newData) {
             const nextMonth = this._getNextMonthFirstDay();
             this._markCredentialUnhealthyWithRecovery(verifiedReason, error, nextMonth);
         } catch (usageError) {
+            signal?.throwIfAborted();
             logger.warn('[Kiro] Failed to verify usage limits:', usageError.message);
             // If we can't verify, still mark as unhealthy with recovery time
             const nextMonth = this._getNextMonthFirstDay();
             const { reason: fallbackReason } = await normalizeProviderErrorMessage(error, {
+                ...options,
                 status: 402,
                 context,
                 suffix: 'quota exceeded (unverified)'
@@ -2404,47 +2439,33 @@ async saveCredentialsToFile(filePath, newData) {
         return { responseText: fullResponseText, toolCalls: uniqueToolCalls };
     }
 
-    async generateContent(model, requestBody) {
-        if (!this.isInitialized) await this.initialize();
-
-        // 临时存储 monitorRequestId
-        if (requestBody._monitorRequestId) {
-            this.config._monitorRequestId = requestBody._monitorRequestId;
-            delete requestBody._monitorRequestId;
-        }
-        if (requestBody._requestBaseUrl) {
-            delete requestBody._requestBaseUrl;
-        }
-        
-        await this._prepareAccessTokenForRequest('generateContent');
-        
-        const finalModel = resolveKiroModel(model, this.config);
-        logger.info(`[Kiro] Calling generateContent with model: ${finalModel}`);
-        
-        // Estimate input tokens before making the API call
-        const inputTokens = this.estimateInputTokens(requestBody);
-        
-        const response = await this.callApi('', finalModel, requestBody);
-
-        try {
-            const { responseText, toolCalls } = this._processApiResponse(response);
-
-            if (responseText === '' && toolCalls.length === 0) {
-                logger.warn('[Kiro] Empty response detected in generateContent (no text/tool calls received from upstream); signalling for retry.');
-                throw createKiroEmptyResponseError();
+    async generateContent(model, requestBody, options = {}) {
+        let message;
+        const blocks = new Map();
+        for await (const event of this.generateContentStream(model, requestBody, options)) {
+            if (event.type === 'message_start') message = { ...event.message,
+                stop_reason: event.message.stop_reason ?? null, stop_sequence: event.message.stop_sequence ?? null, content: [] };
+            else if (event.type === 'content_block_start') blocks.set(event.index, { ...event.content_block });
+            else if (event.type === 'content_block_delta') {
+                const block = blocks.get(event.index);
+                if (event.delta.type === 'text_delta') block.text = (block.text || '') + event.delta.text;
+                else if (event.delta.type === 'thinking_delta') block.thinking = (block.thinking || '') + event.delta.thinking;
+                else if (event.delta.type === 'input_json_delta') block._arguments = (block._arguments || '') + event.delta.partial_json;
+            } else if (event.type === 'message_delta') {
+                if (Object.hasOwn(event.delta, 'stop_reason')) message.stop_reason = event.delta.stop_reason;
+                if (Object.hasOwn(event.delta, 'stop_sequence')) message.stop_sequence = event.delta.stop_sequence;
+                message.usage = { ...message.usage, ...event.usage };
             }
-
-            const thinkingType = requestBody?.thinking?.type;
-            const thinkingRequested = typeof thinkingType === 'string' &&
-                (thinkingType.toLowerCase() === 'enabled' || thinkingType.toLowerCase() === 'adaptive');
-            const contentForClaude = thinkingRequested
-                ? this._toClaudeContentBlocksFromKiroText(responseText)
-                : responseText;
-            return this.buildClaudeResponse(contentForClaude, false, 'assistant', model, toolCalls, inputTokens);
-        } catch (error) {
-            logger.error('[Kiro] Error in generateContent:', error);
-            throw error;
         }
+        if (!message) throw createKiroEmptyResponseError();
+        message.content = [...blocks.values()].map(block => {
+            if (block.type === 'tool_use') {
+                block.input = JSON.parse(block._arguments || '{}');
+                delete block._arguments;
+            }
+            return block;
+        });
+        return message;
     }
 
     /**
@@ -2455,138 +2476,41 @@ async saveCredentialsToFile(filePath, newData) {
      * 输入 buffer 为 Buffer；返回 { events, remaining:Buffer }，events 格式与旧解析器一致。
      */
     parseAwsEventStreamBuffer(buffer) {
+        const { frames, remaining } = decodeKiroFrames(buffer, this.config?.KIRO_MAX_FRAME_BYTES);
         const events = [];
-        let offset = 0;
-
-        while (true) {
-            // 不足一个 prelude(12B)
-            if (buffer.length - offset < 12) break;
-
-            const totalLen = buffer.readUInt32BE(offset);
-            const headersLen = buffer.readUInt32BE(offset + 4);
-
-            // 帧头合法性检查：非法则丢一字节重新同步（容错）
-            if (totalLen < 16 || totalLen > 16 * 1024 * 1024 ||
-                headersLen > totalLen - 16) {
-                offset += 1;
-                continue;
+        for (const { headers, data } of frames) {
+            const type = headers[':event-type'];
+            for (const field of ['content', 'text', 'name', 'toolUseId']) {
+                if (data[field] !== undefined && typeof data[field] !== 'string') throw kiroIntegrityError(`invalid ${field} field`);
             }
-
-            // 整帧未到齐，等下一个 chunk（处理分片）
-            if (buffer.length - offset < totalLen) break;
-
-            const frameStart = offset;
-            const headersStart = frameStart + 12;
-            const payloadStart = headersStart + headersLen;
-            const payloadEnd = frameStart + totalLen - 4; // 末4字节是 msg CRC
-
-            // 从帧头读取权威的 :event-type（type-based 分发的依据）
-            const eventType = this._readEventTypeHeader(buffer, headersStart, headersLen);
-            const payloadStr = buffer.slice(payloadStart, payloadEnd).toString('utf8');
-            offset += totalLen; // 消费这一帧
-
-            let parsed;
-            try {
-                parsed = JSON.parse(payloadStr);
-            } catch (e) {
-                // payload 非法 JSON（理论上不应发生），跳过该帧
-                logger.warn('[Kiro] Frame payload not valid JSON, skipped: ' + payloadStr.slice(0, 120));
-                continue;
+            if (type === 'metadataEvent' || Object.hasOwn(data, 'stopReason') || Object.hasOwn(data, 'stop_reason')) {
+                events.push({ type: 'metadata', data });
             }
-
-            // 事件分类：优先按上游声明的 :event-type 分发（type-based）。
-            switch (eventType) {
-                case 'assistantResponseEvent':
-                    if (parsed.content !== undefined && !parsed.followupPrompt) {
-                        events.push({ type: 'content', data: parsed.content });
-                    }
-                    break;
-                case 'reasoningContentEvent':
-                    // 思考流，payload 为 {"text":"..."}
-                    if (parsed.text !== undefined) {
-                        events.push({ type: 'reasoning', data: parsed.text });
-                    }
-                    break;
-                case 'toolUseEvent':
-                    // 工具调用：同一个 event-type 下含开始/续传/结束三种，按 payload 字段区分
-                    if (parsed.name && parsed.toolUseId) {
-                        events.push({
-                            type: 'toolUse',
-                            data: {
-                                name: parsed.name,
-                                toolUseId: parsed.toolUseId,
-                                input: normalizeKiroToolInput(parsed.input),
-                                stop: parsed.stop || false
-                            }
-                        });
-                    } else if (parsed.input !== undefined && !parsed.name) {
-                        events.push({
-                            type: 'toolUseInput',
-                            data: {
-                                toolUseId: parsed.toolUseId,
-                                input: normalizeKiroToolInput(parsed.input)
-                            }
-                        });
-                    } else if (parsed.stop !== undefined) {
-                        events.push({ type: 'toolUseStop', data: { stop: parsed.stop } });
-                    }
-                    break;
-                default:
-                    // 无 event-type 头或未知类型：回退到基于 payload 字段的判断（兼容性兵底）。
-                    if (parsed.contextUsagePercentage !== undefined) {
-                        events.push({ type: 'contextUsage', data: { contextUsagePercentage: parsed.contextUsagePercentage } });
-                    } else if (parsed.content !== undefined && !parsed.followupPrompt) {
-                        events.push({ type: 'content', data: parsed.content });
-                    } else if (parsed.text !== undefined) {
-                        events.push({ type: 'reasoning', data: parsed.text });
-                    } else if (parsed.name && parsed.toolUseId) {
-                        events.push({ type: 'toolUse', data: { name: parsed.name, toolUseId: parsed.toolUseId, input: normalizeKiroToolInput(parsed.input), stop: parsed.stop || false } });
-                    } else if (parsed.input !== undefined && !parsed.name) {
-                        events.push({ type: 'toolUseInput', data: { toolUseId: parsed.toolUseId, input: normalizeKiroToolInput(parsed.input) } });
-                    } else if (parsed.stop !== undefined) {
-                        events.push({ type: 'toolUseStop', data: { stop: parsed.stop } });
-                    }
-                    // {"signature":...} 签名事件、metering 等无内容意义的类型：静默忽略
-                    break;
+            if (data.usage && typeof data.usage === 'object') events.push({ type: 'usage', data: data.usage });
+            if (type === 'toolUseEvent' || data.toolUseId || data.name && data.input !== undefined) {
+                const toolUseId = data.toolUseId || data.toolUseID || data.tool_use_id;
+                if (data.name) events.push({ type: 'toolUse', data: { ...data, toolUseId } });
+                else if (data.input !== undefined) events.push({ type: 'toolUseInput', data: { ...data, toolUseId } });
+                else if (data.stop !== undefined) events.push({ type: 'toolUseStop', data: { ...data, toolUseId } });
+            } else if (data.contextUsagePercentage !== undefined) {
+                events.push({ type: 'contextUsage', data });
+            } else if (type === 'reasoningContentEvent' || data.text !== undefined) {
+                events.push({ type: 'reasoning', data: data.text });
+            } else if (data.content !== undefined && !data.followupPrompt) {
+                events.push({ type: 'content', data: data.content });
             }
         }
-
-        return { events, remaining: buffer.slice(offset) };
-    }
-
-    /**
-     * 从 AWS Event Stream 帧的 headers 区读取 :event-type 的值。
-     * header 格式: [1B nameLen][name][1B valueType][...]，string 类型(7) 为 [2B valueLen][value]。
-     * 解析失败或无此头时返回 null（调用方会回退到 payload 字段判断）。
-     */
-    _readEventTypeHeader(buffer, start, headersLen) {
-        try {
-            let p = start;
-            const end = start + headersLen;
-            while (p < end) {
-                const nameLen = buffer.readUInt8(p); p += 1;
-                const name = buffer.slice(p, p + nameLen).toString('utf8'); p += nameLen;
-                const valueType = buffer.readUInt8(p); p += 1;
-                if (valueType === 7) {
-                    // string: [2B len][value]
-                    const valueLen = buffer.readUInt16BE(p); p += 2;
-                    const value = buffer.slice(p, p + valueLen).toString('utf8'); p += valueLen;
-                    if (name === ':event-type') return value;
-                } else {
-                    // 遇到非 string 类型的头（kiro 帧头均为 string），为安全起见中断
-                    break;
-                }
-            }
-        } catch (e) { /* 解析失败回退 */ }
-        return null;
+        return { events, remaining };
     }
 
 
     /**
      * 真正的流式 API 调用 - 使用 responseType: 'stream'
      */
-    async * streamApiReal(method, model, body, isRetry = false, retryCount = 0) {
-        if (!this.isInitialized) await this.initialize();
+    async * streamApiReal(method, model, body, isRetry = false, retryCount = 0, options = {}) {
+        const { signal } = options;
+        signal?.throwIfAborted();
+        if (!this.isInitialized) await waitForKiroOperation(this.initialize(), signal);
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
 
@@ -2604,7 +2528,8 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.output_config, body.reasoning_effort);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.output_config, body.reasoning_effort, body);
+        signal?.throwIfAborted();
         const toolNameMaps = requestData._kiroToolNameMaps;
 
         const token = this.accessToken;
@@ -2622,27 +2547,66 @@ async saveCredentialsToFile(filePath, newData) {
         const requestUrl = model.startsWith('amazonq') ? this.amazonQUrl : this.baseUrl;
 
         let stream = null;
-        let releaseThrottle = () => {};
+        const onAbort = () => {
+            if (stream && typeof stream.destroy === 'function') stream.destroy();
+        };
         // catch 需要根据该状态判断能否安全地从头重试，因此必须与 try/catch 同级。
         // 一旦产出过内容，流中途断线就不能重发（会导致内容重复/错位）。
         let hasYieldedContent = false;
+        const transport = new AbortController();
+        const forwardAbort = () => transport.abort(signal.reason);
+        let firstTimer, idleTimer, totalTimer, timeoutError;
+        let meaningfulEventSeen = false;
+        const timeoutMs = (key, fallback) => {
+            const value = Number(this.config[key] ?? fallback);
+            return Number.isFinite(value) && value >= 0 ? value : fallback;
+        };
+        const expire = kind => {
+            timeoutError = kiroIntegrityError(`${kind} timeout`);
+            timeoutError.status = 504;
+            transport.abort(timeoutError);
+            if (stream && !stream.destroyed) stream.destroy(timeoutError);
+        };
+        const armIdle = () => {
+            clearTimeout(idleTimer);
+            const ms = timeoutMs('KIRO_STREAM_IDLE_TIMEOUT_MS', 120000);
+            if (meaningfulEventSeen && ms > 0) idleTimer = setTimeout(() => expire('stream idle'), ms);
+        };
+        const clearTimers = () => { clearTimeout(firstTimer); clearTimeout(idleTimer); clearTimeout(totalTimer); };
+
         try {
             const axiosConfig = {
                 method: 'post',
                 url: requestUrl,
                 data: requestData,
                 headers,
-                responseType: 'stream'
+                responseType: 'stream',
+                // Application deadlines own this attempt, including pauses for
+                // downstream backpressure. Do not inherit Axios's socket timer.
+                timeout: 0,
+                signal: transport.signal
             };
-            this._applySidecar(axiosConfig);
-            releaseThrottle = await acquireKiroRequestSlot(this.config);
+            const queuedAt = performance.now();
+            await waitForKiroRequestSlot(this.config, signal);
+            signal?.addEventListener('abort', forwardAbort, { once: true });
+            if (signal?.aborted) forwardAbort();
+            const firstMs = timeoutMs('KIRO_FIRST_EVENT_TIMEOUT_MS', 30000);
+            const totalMs = timeoutMs('KIRO_STREAM_TOTAL_TIMEOUT_MS', 0);
+            if (firstMs > 0) firstTimer = setTimeout(() => expire('first meaningful event'), firstMs);
+            if (totalMs > 0) totalTimer = setTimeout(() => expire('stream total'), totalMs);
+            const upstreamStartedAt = performance.now();
             const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData);
 
             stream = response.data;
+            signal?.addEventListener('abort', onAbort, { once: true });
+            signal?.throwIfAborted();
+            logger.info(`[Kiro Stream] Upstream headers: ${Math.round(performance.now() - upstreamStartedAt)}ms; queue: ${Math.round(upstreamStartedAt - queuedAt)}ms`);
+            let firstEventLogged = false;
             let buffer = Buffer.alloc(0);
-            let lastContentEvent = null;  // 用于检测连续重复的 content 事件
+
 
             for await (const chunk of stream) {
+                if (meaningfulEventSeen) armIdle();
                 const chunkBuf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
                 buffer = buffer.length === 0 ? chunkBuf : Buffer.concat([buffer, chunkBuf]);
                 
@@ -2650,43 +2614,78 @@ async saveCredentialsToFile(filePath, newData) {
                 const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
                 buffer = remaining;
                 
-                // yield 所有事件，但过滤连续完全相同的 content 事件（Kiro API 有时会重复发送）
+                // Preserve every valid delta; matching text is not proof of a replay.
                 for (const event of events) {
+                    signal?.throwIfAborted();
+                    if (((event.type === 'content' || event.type === 'reasoning') && event.data) || (event.type === 'toolUse' && event.data.name !== KIRO_PLACEHOLDER_TOOL_NAME)) {
+                        meaningfulEventSeen = true;
+                        clearTimeout(firstTimer);
+                    }
+                    if (!firstEventLogged && (
+                        (event.type === 'content' && event.data) ||
+                        (event.type === 'reasoning' && event.data) ||
+                        event.type === 'toolUse'
+                    )) {
+                        firstEventLogged = true;
+                        logger.info(`[Kiro Stream] First upstream ${event.type} event: ${Math.round(performance.now() - upstreamStartedAt)}ms`);
+                    }
                     if (event.type === 'content' && event.data) {
-                        // 检查是否与上一个 content 事件完全相同
-                        if (lastContentEvent === event.data) {
-                            // 跳过重复的内容
-                            continue;
-                        }
-                        lastContentEvent = event.data;
                         hasYieldedContent = true;
+                        clearTimeout(idleTimer);
                         yield { type: 'content', content: event.data };
+                        armIdle();
                     } else if (event.type === 'reasoning') {
                         hasYieldedContent = true;
+                        clearTimeout(idleTimer);
                         yield { type: 'reasoning', reasoning: event.data };
+                        armIdle();
                     } else if (event.type === 'toolUse') {
                         hasYieldedContent = true;
                         const toolUse = {
                             ...event.data,
                             name: toolNameMaps?.fromKiroName ? toolNameMaps.fromKiroName(event.data?.name) : event.data?.name
                         };
+                        clearTimeout(idleTimer);
                         yield { type: 'toolUse', toolUse };
+                        armIdle();
                     } else if (event.type === 'toolUseInput') {
                         hasYieldedContent = true;
-                        yield { type: 'toolUseInput', input: event.data.input };
+                        clearTimeout(idleTimer);
+                        yield { type: 'toolUseInput', toolUseId: event.data.toolUseId, input: event.data.input, stop: event.data.stop };
+                        armIdle();
                     } else if (event.type === 'toolUseStop') {
-                        yield { type: 'toolUseStop', stop: event.data.stop };
+                        clearTimeout(idleTimer);
+                        yield { type: 'toolUseStop', toolUseId: event.data.toolUseId, stop: event.data.stop };
+                        armIdle();
+                    } else if (['metadata', 'usage'].includes(event.type)) {
+                        clearTimeout(idleTimer);
+                        yield { type: event.type, data: event.data };
+                        armIdle();
                     } else if (event.type === 'contextUsage') {
+                        clearTimeout(idleTimer);
                         yield { type: 'contextUsage', contextUsagePercentage: event.data.contextUsagePercentage };
+                        armIdle();
                     }
                 }
             }
+            if (buffer.length) throw kiroIntegrityError('truncated trailing event frame');
         } catch (error) {
+            clearTimers();
+            if (!signal?.aborted && timeoutError) error = timeoutError;
             // 确保出错时关闭流
             if (stream && typeof stream.destroy === 'function') {
                 stream.destroy();
+            } else if (typeof error.response?.data?.destroy === 'function') {
+                // Axios has already rejected this non-2xx response and removed
+                // its signal listener. Keep the error body in our lifecycle too.
+                stream = error.response.data;
+                signal?.addEventListener('abort', onAbort, { once: true });
             }
             
+            // Cancellation is not an upstream failure and must never retry or
+            // switch credentials, even if destroying a socket reports a reset.
+            if (signal?.aborted) throw error;
+
             const status = error.response?.status;
             const errorCode = error.code;
             const errorMessage = error.message || '';
@@ -2698,6 +2697,7 @@ async saveCredentialsToFile(filePath, newData) {
             if (status === 401 && !isRetry) {
                 logger.info('[Kiro] Received 401 in stream. Triggering background refresh via PoolManager...');
                 await normalizeProviderErrorMessage(error, {
+                    signal,
                     status: 401,
                     context: 'stream',
                     suffix: 'triggering auto-refresh'
@@ -2719,13 +2719,13 @@ async saveCredentialsToFile(filePath, newData) {
             
             // Handle 402 (Payment Required / Quota Exceeded) - verify usage and mark as unhealthy with recovery time
             if (status === 402 && !isRetry) {
-                await this._handle402Error(error, 'stream');
+                await this._handle402Error(error, 'stream', { signal });
             }
 
             // Handle 403 (Forbidden). Most Kiro 403s are account/policy/quota/profile issues,
             // not expired access tokens, so do not blindly refresh.
             if (status === 403 && !isRetry) {
-                await this._handleForbiddenCredentialError(error, 'stream');
+                await this._handleForbiddenCredentialError(error, 'stream', { signal });
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
@@ -2735,8 +2735,8 @@ async saveCredentialsToFile(filePath, newData) {
             // Handle 429 (Too Many Requests) - wait baseDelay then switch credential
             if (status === 429) {
                 logger.info(`[Kiro] Received 429 (Too Many Requests) in stream. Waiting ${baseDelay}ms before switching credential...`);
-                await normalizeProviderErrorMessage(error, { status: 429, context: 'stream' });
-                await new Promise(resolve => setTimeout(resolve, baseDelay));
+                await normalizeProviderErrorMessage(error, { status: 429, context: 'stream', signal });
+                await sleep(baseDelay, undefined, { signal });
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
@@ -2746,8 +2746,8 @@ async saveCredentialsToFile(filePath, newData) {
             // Handle 5xx server errors - wait baseDelay then switch credential
             if (status >= 500 && status < 600) {
                 logger.info(`[Kiro] Received ${status} server error in stream. Waiting ${baseDelay}ms before switching credential...`);
-                await normalizeProviderErrorMessage(error, { status, context: 'stream' });
-                await new Promise(resolve => setTimeout(resolve, baseDelay));
+                await normalizeProviderErrorMessage(error, { status, context: 'stream', signal });
+                await sleep(baseDelay, undefined, { signal });
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
@@ -2761,8 +2761,8 @@ async saveCredentialsToFile(filePath, newData) {
                 const delay = baseDelay * Math.pow(2, retryCount);
                 const errorIdentifier = errorCode || errorMessage.substring(0, 50);
                 logger.info(`[Kiro] Network error (${errorIdentifier}) in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
+                await sleep(delay, undefined, { signal });
+                yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1, options);
                 return;
             }
             if (isNetworkError && hasYieldedContent) {
@@ -2770,7 +2770,7 @@ async saveCredentialsToFile(filePath, newData) {
             }
 
             if (error.response && error.response.data) {
-                const responseBodyPreview = await getKiroErrorResponsePreview(error);
+                const responseBodyPreview = await getKiroErrorResponsePreview(error, 500, { signal });
                 if (responseBodyPreview) {
                     logger.error('[Kiro] Stream error response body:', responseBodyPreview);
                 }
@@ -2778,7 +2778,10 @@ async saveCredentialsToFile(filePath, newData) {
             logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`,  error.message);
             throw error;
         } finally {
-            releaseThrottle();
+            clearTimers();
+            signal?.removeEventListener('abort', forwardAbort);
+            transport.abort();
+            signal?.removeEventListener('abort', onAbort);
             // 确保流被关闭，释放资源
             if (stream && typeof stream.destroy === 'function') {
                 stream.destroy();
@@ -2802,8 +2805,14 @@ async saveCredentialsToFile(filePath, newData) {
     // 它会缓存这里第一次产出的 message_start，直到确认收到过至少一个有意义的事件
     // （文本/工具调用/思考）才真正转发给调用方。这样即使这里在流结束前检测到
     // 完全空的响应并抛错，调用方也从未收到过任何数据，可以安全地整体重试。
-    async * _generateContentStreamRaw(model, requestBody) {
-        if (!this.isInitialized) await this.initialize();
+    async * _generateContentStreamRaw(model, requestBody, options = {}) {
+        const streamStartedAt = performance.now();
+        const { signal } = options;
+        signal?.throwIfAborted();
+        validateKiroGenerationRequest(model, requestBody);
+        buildKiroInferenceConfig(requestBody, this.config.KIRO_ENABLE_INFERENCE_CONFIG !== false);
+        if (!this.isInitialized) await waitForKiroOperation(this.initialize(), signal);
+        signal?.throwIfAborted();
 
         // 临时存储 monitorRequestId
         if (requestBody._monitorRequestId) {
@@ -2814,9 +2823,17 @@ async saveCredentialsToFile(filePath, newData) {
             delete requestBody._requestBaseUrl;
         }
         
-        await this._prepareAccessTokenForRequest('generateContentStream');
+        await waitForKiroOperation(this._prepareAccessTokenForRequest('generateContentStream'), signal);
+        signal?.throwIfAborted();
         
         const finalModel = resolveKiroModel(model, this.config);
+        const capabilities = this.config.KIRO_DYNAMIC_MODELS === true ? await this.listModels({ signal }) : null;
+        const modelInfo = capabilities?.models.find(item => item.name === finalModel || item.name === model);
+        const outputLimit = modelInfo?.tokenLimits?.maxOutputTokens;
+        if (Number.isFinite(outputLimit) && requestBody.max_tokens > outputLimit) {
+            const error = new Error('max_tokens exceeds the discovered model output limit');
+            error.status = 400; error.response = { status: 400 }; error.skipErrorCount = true; throw error;
+        }
         logger.info(`[Kiro] Calling generateContentStream with model: ${finalModel} (real streaming)`);
 
         let inputTokens = 0;
@@ -2840,8 +2857,21 @@ async saveCredentialsToFile(filePath, newData) {
             stripThinkingLeadingNewline: false,
             stripTextLeadingNewlinesAfterThinking: false,
             hasVisibleText: false,
+            hasTextOutput: false,
             hasThinkingContent: false,
         };
+        const textForTokenCount = [];
+        const toolCalls = [];
+        const toolAssembler = new KiroToolAssembler(this.config.KIRO_MAX_TOOL_ARGUMENT_BYTES, this.config.KIRO_MAX_TOOL_CALLS);
+        const toolNameMaps = buildKiroToolNameMaps(requestBody.tools);
+        const requestedTools = new Set(Array.isArray(requestBody.tools) ? requestBody.tools.map(tool => tool?.name).filter(Boolean) : []);
+        const bracketParser = new KiroBracketToolParser(name => name === KIRO_PLACEHOLDER_TOOL_NAME ||
+            requestedTools.has(toolNameMaps.fromKiroName(name)), () => toolAssembler.maxBytes - toolAssembler.bytes);
+        const nativeToolSignatures = new Set();
+        const legacyToolSignatures = new Set();
+        const unmatchedLegacyTools = new Set();
+        const toolSignature = (name, input) => crypto.createHash('sha256')
+            .update(name).update('\0').update(JSON.stringify(input)).digest('hex');
 
         const ensureBlockStart = (blockType) => {
             if (blockType === 'thinking') {
@@ -2876,9 +2906,13 @@ async saveCredentialsToFile(filePath, newData) {
             return [{ type: "content_block_stop", index }];
         };
 
-        const createTextDeltaEvents = (text) => {
+        const createPlainTextDeltaEvents = (text) => {
             if (!text) return [];
+            streamState.hasTextOutput = true;
             if (!isWhitespaceOnly(text)) {
+                if (!streamState.hasVisibleText) {
+                    logger.info(`[Kiro Stream] First visible text: ${Math.round(performance.now() - streamStartedAt)}ms; prior thinking: ${streamState.hasThinkingContent}`);
+                }
                 streamState.hasVisibleText = true;
             }
             const events = [];
@@ -2887,6 +2921,7 @@ async saveCredentialsToFile(filePath, newData) {
             events.push(...ensureBlockStart('text'));
             // 将转义的换行符转换为真实换行符，确保流式输出显示正常
             const decodedText = text.replace(/(?<!\\)\\n/g, '\n');
+            textForTokenCount.push(decodedText);
             events.push({
                 type: "content_block_delta",
                 index: streamState.textBlockIndex,
@@ -2896,15 +2931,15 @@ async saveCredentialsToFile(filePath, newData) {
         };
 
         const createThinkingDeltaEvents = (thinking) => {
-            if (thinking) {
-                streamState.hasThinkingContent = true;
-            }
+            if (!thinking) return [];
+            streamState.hasThinkingContent = true;
             const events = [];
             // 兼容内联 <thinking> 出现在正文后的情况，保证任一时刻只有一个内容块打开。
             events.push(...stopBlock(streamState.textBlockIndex));
             events.push(...ensureBlockStart('thinking'));
             // 将转义的换行符转换为真实换行符
             const decodedThinking = thinking.replace(/(?<!\\)\\n/g, '\n');
+            textForTokenCount.push(decodedThinking);
             events.push({
                 type: "content_block_delta",
                 index: streamState.thinkingBlockIndex,
@@ -2919,14 +2954,91 @@ async saveCredentialsToFile(filePath, newData) {
             }
         }
 
+        const emitCompletedTools = (completed) => {
+            const events = [];
+            for (const call of completed) {
+                const signature = toolSignature(call.name, call.input);
+                if (call.legacy) {
+                    if (nativeToolSignatures.has(signature) || legacyToolSignatures.has(signature)) continue;
+                    legacyToolSignatures.add(signature);
+                    unmatchedLegacyTools.add(signature);
+                } else {
+                    nativeToolSignatures.add(signature);
+                    // Suppress only the alternate representation, never two
+                    // separate native IDs that legitimately share arguments.
+                    if (unmatchedLegacyTools.delete(signature)) continue;
+                }
+                events.push(...stopBlock(streamState.textBlockIndex), ...stopBlock(streamState.thinkingBlockIndex));
+                const index = streamState.nextBlockIndex++;
+                events.push({ type: 'content_block_start', index, content_block: { type: 'tool_use', id: call.toolUseId, name: call.name, input: {} } });
+                events.push({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: call.arguments } });
+                events.push({ type: 'content_block_stop', index });
+                toolCalls.push(call);
+            }
+            return events;
+        };
+
+        const emitLegacyParts = parts => {
+            const events = [];
+            for (const part of parts) {
+                if (part.type === 'text') events.push(...createPlainTextDeltaEvents(part.text));
+                else {
+                    const name = toolNameMaps.fromKiroName(part.name);
+                    if (name === KIRO_PLACEHOLDER_TOOL_NAME) continue;
+                    const signature = toolSignature(name, part.input);
+                    if (nativeToolSignatures.has(signature) || legacyToolSignatures.has(signature)) continue;
+                    events.push(...emitCompletedTools(toolAssembler.feed({ name, input: part.arguments, stop: true }, { legacy: true })));
+                }
+            }
+            return events;
+        };
+        const createTextDeltaEvents = text => {
+            const events = [];
+            // Account each validated call before decoding the next one in the
+            // same wire delta; a frame cannot stage tools beyond the budget.
+            bracketParser.feed(text, part => events.push(...emitLegacyParts([part])));
+            return events;
+        };
+
+        // A change of content kind is a hard boundary: tag/escape lookahead
+        // belongs before the following reasoning/tool block, never after it.
+        const flushPendingContent = () => {
+            const events = [];
+            let buffered = streamState.buffer;
+            streamState.buffer = '';
+            if (streamState.inThinking) {
+                if (streamState.stripThinkingLeadingNewline) {
+                    if (buffered.startsWith('\r\n')) buffered = buffered.slice(2);
+                    else if (buffered.startsWith('\n')) buffered = buffered.slice(1);
+                }
+                const end = findRealThinkingEndTagAtBufferEnd(buffered);
+                if (end !== -1) buffered = buffered.slice(0, end);
+                events.push(...createThinkingDeltaEvents(buffered), ...stopBlock(streamState.thinkingBlockIndex));
+                streamState.inThinking = false;
+                streamState.thinkingExtracted = true;
+                streamState.stripThinkingLeadingNewline = false;
+            } else {
+                buffered = `${streamState.pendingTextBeforeThinking}${buffered}`;
+                if (streamState.stripTextLeadingNewlinesAfterThinking) {
+                    if (buffered.startsWith('\r\n\r\n')) buffered = buffered.slice(4);
+                    else if (buffered.startsWith('\n\n')) buffered = buffered.slice(2);
+                }
+                if (buffered) events.push(...createTextDeltaEvents(buffered));
+            }
+            streamState.pendingTextBeforeThinking = '';
+            streamState.stripTextLeadingNewlinesAfterThinking = false;
+            events.push(...emitLegacyParts(bracketParser.finish()));
+            return events;
+        };
+
         try {
-            let totalContent = '';
             let outputTokens = 0;
-            const toolCalls = [];
-            let currentToolCall = null; // 用于累积结构化工具调用
-            const toolUseBlockIndexes = new Map(); // toolUseId -> content block index
+            let upstreamStopReason = null;
+            let upstreamStopSequence = null;
+            let upstreamUsage = {};
             // 记录被忽略的占位工具调用 id（详见 KIRO_PLACEHOLDER_TOOL_NAME 说明）
             const ignoredToolUseIds = new Set();
+            let ignoredLegacyTool = false;
 
             const estimatedInputTokens = this.estimateInputTokens(requestBody);
 
@@ -2938,6 +3050,8 @@ async saveCredentialsToFile(filePath, newData) {
                     type: "message",
                     role: "assistant",
                     model: model,
+                    stop_reason: null,
+                    stop_sequence: null,
                     usage: {
                         input_tokens: estimatedInputTokens,
                         output_tokens: 0,
@@ -2949,19 +3063,17 @@ async saveCredentialsToFile(filePath, newData) {
             };
 
             // 2. 流式接收并发送每个 content_block_delta
-            for await (const event of this.streamApiReal('', finalModel, requestBody)) {
+            for await (const event of this.streamApiReal('', finalModel, requestBody, false, 0, options)) {
                 if (event.type === 'contextUsage' && event.contextUsagePercentage) {
                     // 捕获上下文使用百分比（包含输入和输出的总使用量）
                     contextUsagePercentage = event.contextUsagePercentage;
                 } else if (event.type === 'reasoning' && event.reasoning) {
                     // 原生 reasoning 流（reasoningContentEvent）：直接走 thinking 输出通道，
                     // 不经过 <thinking> 标签扫描（新模型的思考不再内联在 content 标签里）。
-                    totalContent += event.reasoning;
+                    yield* pushEvents(flushPendingContent());
                     yield* pushEvents(createThinkingDeltaEvents(event.reasoning));
                     continue;
                 } else if (event.type === 'content' && event.content) {
-                    totalContent += event.content;
-
                     if (!thinkingRequested) {
                         streamState.buffer += event.content;
                         // 确保不切断转义序列 \\n（如果以 \ 结尾，可能后面跟着 n）
@@ -3042,7 +3154,6 @@ async saveCredentialsToFile(filePath, newData) {
                                 streamState.thinkingExtracted = true;
                                 streamState.stripThinkingLeadingNewline = false;
 
-                                events.push(...createThinkingDeltaEvents(""));
                                 events.push(...stopBlock(streamState.thinkingBlockIndex));
 
                                 // Strip '\n\n' after the end tag once we switch back to text (may arrive in next chunk).
@@ -3073,216 +3184,41 @@ async saveCredentialsToFile(filePath, newData) {
                     }
 
                     yield* pushEvents(events);
-                } else if (event.type === 'toolUse') {
-                    const tc = event.toolUse;
-
-                    // 占位工具 no_tool_available 被"调用"：整条丢弃，不生成任何 tool_use 内容块，
-                    // 也不计入 totalContent，避免把这个空操作工具调用转发给客户端导致本轮无实质输出。
-                    if (tc.name === KIRO_PLACEHOLDER_TOOL_NAME || (tc.toolUseId && ignoredToolUseIds.has(tc.toolUseId))) {
-                        if (tc.toolUseId && !ignoredToolUseIds.has(tc.toolUseId)) {
-                            logger.warn(`[Kiro] Model attempted to call placeholder tool '${KIRO_PLACEHOLDER_TOOL_NAME}'; dropping it (no real tools were available for this request).`);
-                            ignoredToolUseIds.add(tc.toolUseId);
-                        }
+                } else if (['toolUse', 'toolUseInput', 'toolUseStop'].includes(event.type)) {
+                    const tc = event.type === 'toolUse' ? event.toolUse : { toolUseId: event.toolUseId, input: event.input, stop: event.stop };
+                    if (tc.name === KIRO_PLACEHOLDER_TOOL_NAME || ignoredToolUseIds.has(tc.toolUseId)) {
+                        if (tc.toolUseId) ignoredToolUseIds.add(tc.toolUseId);
+                        else ignoredLegacyTool = true;
                         continue;
                     }
-
-                    const toolEvents = [];
-
-                    // 统计工具调用的内容到 totalContent（用于 token 计算）
-                    if (tc.name) totalContent += tc.name;
-                    if (tc.input) totalContent += tc.input;
-
-                    // 工具调用事件（包含 name 和 toolUseId）
-                    if (tc.name && tc.toolUseId) {
-                        // 工具块开始前关闭当前文本/思考块，避免 Anthropic 内容块重叠。
-                        toolEvents.push(...stopBlock(streamState.textBlockIndex));
-                        toolEvents.push(...stopBlock(streamState.thinkingBlockIndex));
-
-                        // 同一工具调用续传
-                        if (currentToolCall && currentToolCall.toolUseId === tc.toolUseId) {
-                            currentToolCall.input += tc.input || '';
-                        } else {
-                            // 切换到新的工具调用前，先收尾旧调用
-                            if (currentToolCall) {
-                                const prevBlockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                                let parsedInput = currentToolCall.input;
-                                try {
-                                    parsedInput = JSON.parse(currentToolCall.input);
-                                } catch (e) {
-                                    // input 不是有效 JSON，保持原样
-                                }
-                                toolCalls.push({
-                                    toolUseId: currentToolCall.toolUseId,
-                                    name: currentToolCall.name,
-                                    input: parsedInput
-                                });
-                                if (prevBlockIndex != null) {
-                                    toolEvents.push({ type: "content_block_stop", index: prevBlockIndex });
-                                    toolUseBlockIndexes.delete(currentToolCall.toolUseId);
-                                }
-                            }
-
-                            const blockIndex = streamState.nextBlockIndex++;
-                            toolUseBlockIndexes.set(tc.toolUseId, blockIndex);
-                            toolEvents.push({
-                                type: "content_block_start",
-                                index: blockIndex,
-                                content_block: {
-                                    type: "tool_use",
-                                    id: tc.toolUseId || `tool_${uuidv4()}`,
-                                    name: tc.name,
-                                    input: {}
-                                }
-                            });
-
-                            currentToolCall = {
-                                toolUseId: tc.toolUseId,
-                                name: tc.name,
-                                input: ''
-                            };
-                            currentToolCall.input += tc.input || '';
-                        }
-
-                        // 实时向前端推送工具参数增量
-                        if (tc.input) {
-                            const blockIndex = toolUseBlockIndexes.get(tc.toolUseId);
-                            if (blockIndex != null) {
-                                toolEvents.push({
-                                    type: "content_block_delta",
-                                    index: blockIndex,
-                                    delta: {
-                                        type: "input_json_delta",
-                                        partial_json: tc.input
-                                    }
-                                });
-                            }
-                        }
-
-                        // 如果这个事件包含 stop，立即结束当前工具块
-                        if (tc.stop && currentToolCall) {
-                            let parsedInput = currentToolCall.input;
-                            try {
-                                parsedInput = JSON.parse(currentToolCall.input);
-                            } catch (e) {
-                                // input 不是有效 JSON，保持原样
-                            }
-                            toolCalls.push({
-                                toolUseId: currentToolCall.toolUseId,
-                                name: currentToolCall.name,
-                                input: parsedInput
-                            });
-
-                            const blockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                            if (blockIndex != null) {
-                                toolEvents.push({ type: "content_block_stop", index: blockIndex });
-                                toolUseBlockIndexes.delete(currentToolCall.toolUseId);
-                            }
-                            currentToolCall = null;
-                        }
+                    if (!tc.name && !tc.toolUseId && ignoredLegacyTool) {
+                        if (tc.stop) ignoredLegacyTool = false;
+                        continue;
                     }
-
-                    if (toolEvents.length > 0) {
-                        yield* pushEvents(toolEvents);
+                    if (tc.name) ignoredLegacyTool = false;
+                    const completed = toolAssembler.feed(tc);
+                    bracketParser.checkBudget();
+                    if (tc.name || completed.length) yield* pushEvents(flushPendingContent());
+                    yield* pushEvents(emitCompletedTools(completed));
+                } else if (event.type === 'metadata') {
+                    const reason = event.data.stopReason ?? event.data.stop_reason;
+                    if (reason !== undefined && reason !== null && (typeof reason !== 'string' || !normalizeKiroStopReason(reason))) throw kiroIntegrityError('unsupported upstream stop reason');
+                    upstreamStopReason = normalizeKiroStopReason(reason) || upstreamStopReason;
+                    const sequence = Object.hasOwn(event.data, 'stopSequence') ? event.data.stopSequence : event.data.stop_sequence;
+                    if (sequence !== undefined) {
+                        if (sequence !== null && typeof sequence !== 'string') throw kiroIntegrityError('invalid upstream stop sequence');
+                        upstreamStopSequence = sequence;
                     }
-                } else if (event.type === 'toolUseInput') {
-                    // 工具调用的 input 续传事件
-                    const inputDelta = normalizeKiroToolInput(event.input);
-                    // 统计 input 内容到 totalContent（用于 token 计算）
-                    if (inputDelta) {
-                        totalContent += inputDelta;
-                    }
-                    if (currentToolCall) {
-                        currentToolCall.input += inputDelta;
-                        const blockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                        if (blockIndex != null && inputDelta) {
-                            yield* pushEvents([{
-                                type: "content_block_delta",
-                                index: blockIndex,
-                                delta: {
-                                    type: "input_json_delta",
-                                    partial_json: inputDelta
-                                }
-                            }]);
-                        }
-                    }
-                } else if (event.type === 'toolUseStop') {
-                    // 工具调用结束事件
-                    if (currentToolCall && event.stop) {
-                        let parsedInput = currentToolCall.input;
-                        try {
-                            parsedInput = JSON.parse(currentToolCall.input);
-                        } catch (e) {
-                            // input 不是有效 JSON，保持原样
-                        }
-                        toolCalls.push({
-                            toolUseId: currentToolCall.toolUseId,
-                            name: currentToolCall.name,
-                            input: parsedInput
-                        });
-
-                        const blockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                        if (blockIndex != null) {
-                            yield* pushEvents([{ type: "content_block_stop", index: blockIndex }]);
-                            toolUseBlockIndexes.delete(currentToolCall.toolUseId);
-                        }
-                        currentToolCall = null;
-                    }
+                    upstreamUsage = { ...upstreamUsage, ...event.data.usage, ...event.data };
+                } else if (event.type === 'usage') {
+                    upstreamUsage = { ...upstreamUsage, ...event.data };
                 }
             }
-            
-            // 处理未完成的工具调用（如果流提前结束）
-            if (currentToolCall) {
-                let parsedInput = currentToolCall.input;
-                try {
-                    parsedInput = JSON.parse(currentToolCall.input);
-                } catch (e) {}
-                toolCalls.push({
-                    toolUseId: currentToolCall.toolUseId,
-                    name: currentToolCall.name,
-                    input: parsedInput
-                });
-                const blockIndex = toolUseBlockIndexes.get(currentToolCall.toolUseId);
-                if (blockIndex != null) {
-                    yield* pushEvents([{ type: "content_block_stop", index: blockIndex }]);
-                    toolUseBlockIndexes.delete(currentToolCall.toolUseId);
-                }
-                currentToolCall = null;
+            if (this.config.KIRO_REQUIRE_STOP_REASON === true && !upstreamStopReason) {
+                throw kiroIntegrityError('missing upstream stop reason');
             }
-
-            if (thinkingRequested && (streamState.inThinking || streamState.buffer || streamState.pendingTextBeforeThinking)) {
-                if (streamState.inThinking) {
-                    logger.warn('[Kiro] Incomplete thinking tag at stream end');
-                    // Strip a single leading newline after `<thinking>` if we haven't yet.
-                    if (streamState.stripThinkingLeadingNewline) {
-                        if (streamState.buffer.startsWith('\r\n')) streamState.buffer = streamState.buffer.slice(2);
-                        else if (streamState.buffer.startsWith('\n')) streamState.buffer = streamState.buffer.slice(1);
-                        streamState.stripThinkingLeadingNewline = false;
-                    }
-                    yield* pushEvents(createThinkingDeltaEvents(streamState.buffer));
-                    streamState.buffer = '';
-                    yield* pushEvents(createThinkingDeltaEvents(""));
-                    yield* pushEvents(stopBlock(streamState.thinkingBlockIndex));
-                } else if (!streamState.thinkingExtracted) {
-                    const remaining = `${streamState.pendingTextBeforeThinking}${streamState.buffer}`;
-                    streamState.pendingTextBeforeThinking = '';
-                    if (remaining) yield* pushEvents(createTextDeltaEvents(remaining));
-                    streamState.buffer = '';
-                } else {
-                    let remaining = streamState.buffer;
-                    streamState.buffer = '';
-                    if (streamState.stripTextLeadingNewlinesAfterThinking) {
-                        if (remaining.startsWith('\r\n\r\n')) remaining = remaining.slice(4);
-                        else if (remaining.startsWith('\n\n')) remaining = remaining.slice(2);
-                        streamState.stripTextLeadingNewlinesAfterThinking = false;
-                    }
-                    if (remaining) yield* pushEvents(createTextDeltaEvents(remaining));
-                    streamState.buffer = '';
-                }
-            } else if (!thinkingRequested && streamState.buffer) {
-                // 处理非思考模式下剩余的缓冲区数据
-                yield* pushEvents(createTextDeltaEvents(streamState.buffer));
-                streamState.buffer = '';
-            }
+            yield* pushEvents(flushPendingContent());
+            yield* pushEvents(emitCompletedTools(toolAssembler.finish()));
 
             // 原生 reasoningContentEvent 没有 </thinking> 标签；流尾必须显式关闭其 thinking 块。
             // 若接下来需要为纯思考响应补最小文本块，也要先完成这个 stop。
@@ -3293,41 +3229,22 @@ async saveCredentialsToFile(filePath, newData) {
                 !streamState.hasVisibleText &&
                 toolCalls.length === 0;
             if (emittedOnlyThinking) {
-                logger.warn('[Kiro Stream] Thinking-only response received; emitting minimal text block and max_tokens stop_reason');
+                logger.warn('[Kiro Stream] Thinking-only response received; emitting minimal text and preserving upstream stop reason (max_tokens fallback)');
                 yield* pushEvents(createTextDeltaEvents(' '));
             }
 
             // 真正的空响应：没有文本、没有工具调用、也没有思考内容——Kiro 上游静默地什么都没生成。
             // 不再伪造一次成功的 end_turn，而是抛出可重试的错误，交给上层的凭证切换重试逻辑处理。
-            if (totalContent === '' && toolCalls.length === 0 && !emittedOnlyThinking) {
+            if (!streamState.hasTextOutput && !streamState.hasThinkingContent && toolCalls.length === 0) {
                 logger.warn('[Kiro Stream] Empty response detected (no content/toolUse/thinking events received from upstream); signalling for retry.');
                 throw createKiroEmptyResponseError();
             }
 
             yield* pushEvents(stopBlock(streamState.textBlockIndex));
 
-            // 检查文本内容中的 bracket 格式工具调用
-            const bracketToolCalls = parseBracketToolCalls(totalContent);
-            if (bracketToolCalls && bracketToolCalls.length > 0) {
-                for (const btc of bracketToolCalls) {
-                    toolCalls.push({
-                        toolUseId: btc.id || `tool_${uuidv4()}`,
-                        name: btc.function.name,
-                        input: JSON.parse(btc.function.arguments || '{}')
-                    });
-                }
-            }
-
-            // 3. 工具调用在流中实时发送，这里不再批量补发
-
-            // 计算 output tokens
-            const contentBlocksForCount = thinkingRequested
-                ? this._toClaudeContentBlocksFromKiroText(totalContent)
-                : [{ type: "text", text: totalContent }];
-            const plainForCount = contentBlocksForCount
-                .map(b => (b.type === 'thinking' ? (b.thinking ?? '') : (b.text ?? '')))
-                .join('');
-            outputTokens = this.countTextTokens(plainForCount);
+            // Count only emitted text/thinking and validated tool arguments,
+            // not legacy wire wrappers or duplicate representations.
+            outputTokens = this.countTextTokens(textForTokenCount.join(''));
 
             for (const tc of toolCalls) {
                 outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
@@ -3338,7 +3255,8 @@ async saveCredentialsToFile(filePath, newData) {
             // 总 token = TOTAL_CONTEXT_TOKENS * contextUsagePercentage / 100
             // input token = 总 token - output token
             if (contextUsagePercentage !== null && contextUsagePercentage > 0) {
-                const contextTokens = getContextTokensForModel(model, this.config, finalModel);
+                const configuredContext = normalizeContextLength(findCustomModelConfigForModel(model, this.config)?.contextLength);
+                const contextTokens = configuredContext || normalizeContextLength(modelInfo?.tokenLimits?.maxInputTokens) || getContextTokensForModel(model, this.config, finalModel);
                 const totalTokens = Math.round(contextTokens * contextUsagePercentage / 100);
                 inputTokens = Math.max(0, totalTokens - outputTokens);
                 logger.info(`[Kiro] Token calculation from contextUsagePercentage: total=${totalTokens}, output=${outputTokens}, input=${inputTokens}`);
@@ -3347,10 +3265,16 @@ async saveCredentialsToFile(filePath, newData) {
                 inputTokens = estimatedInputTokens;
             }
 
+            const actualInput = upstreamUsage.inputTokens ?? upstreamUsage.input_tokens;
+            const actualOutput = upstreamUsage.outputTokens ?? upstreamUsage.output_tokens;
+            if (Number.isFinite(actualInput) && actualInput >= 0) inputTokens = actualInput;
+            if (Number.isFinite(actualOutput) && actualOutput >= 0) outputTokens = actualOutput;
+
             // 4. 发送 message_delta 事件
             yield {
                 type: "message_delta",
-                delta: { stop_reason: toolCalls.length > 0 ? "tool_use" : (emittedOnlyThinking ? "max_tokens" : "end_turn") },
+                delta: { stop_reason: upstreamStopReason || (toolCalls.length > 0 ? "tool_use" : (emittedOnlyThinking ? "max_tokens" : "end_turn")),
+                    stop_sequence: upstreamStopSequence },
                 usage: {
                     input_tokens: inputTokens,
                     output_tokens: outputTokens,
@@ -3363,7 +3287,7 @@ async saveCredentialsToFile(filePath, newData) {
             yield { type: "message_stop" };
 
         } catch (error) {
-            if (!error.isEmptyUpstreamResponse) {
+            if (!signal?.aborted && !error.isEmptyUpstreamResponse) {
                 logger.error('[Kiro] Error in streaming generation:', error?.stack || error?.message || String(error));
             }
             throw error;
@@ -3380,27 +3304,32 @@ async saveCredentialsToFile(filePath, newData) {
     //   isEmptyUpstreamResponse 错误而不产出第二个事件；此时 message_start 从未被
     //   转发给调用方，调用方（handleStreamRequest）尚未向客户端写入任何数据，
     //   可以安全地整体重试（不会出现同一个 SSE 响应里出现两个 message_start）。
-    async * generateContentStream(model, requestBody) {
-        const rawGenerator = this._generateContentStreamRaw(model, requestBody);
+    async * generateContentStream(model, requestBody, options = {}) {
+        const rawGenerator = this._generateContentStreamRaw(model, requestBody, options);
 
-        const first = await rawGenerator.next();
-        if (first.done) {
-            return;
-        }
+        try {
+            const first = await rawGenerator.next();
+            if (first.done) return;
 
-        // first.value 预期是 message_start；先缓存，等确认有后续真实事件再一起放行。
-        const pendingMessageStart = first.value;
-        let flushedMessageStart = false;
+            // Keep empty-response retries safe: do not forward message_start
+            // until the raw generator produces a meaningful content event.
+            const pendingMessageStart = first.value;
+            let flushedMessageStart = false;
 
-        while (true) {
-            const { value, done } = await rawGenerator.next();
-            if (done) break;
+            while (true) {
+                const { value, done } = await rawGenerator.next();
+                if (done) break;
 
-            if (!flushedMessageStart) {
-                yield pendingMessageStart;
-                flushedMessageStart = true;
+                if (!flushedMessageStart) {
+                    yield pendingMessageStart;
+                    flushedMessageStart = true;
+                }
+                yield value;
             }
-            yield value;
+        } finally {
+            // Manual next() calls do not forward return() automatically.
+            // Close the inner iterator on client cancellation and early exits.
+            await rawGenerator.return();
         }
     }
 
@@ -3628,12 +3557,84 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * List available models
      */
-    async listModels() {
-        const models = KIRO_MODELS.map(id => ({
-            name: id
-        }));
-        
-        return { models: models };
+    async listModels(options = {}) {
+        const fallback = { models: KIRO_MODELS.map(name => ({ name })) };
+        if (this.config.KIRO_DYNAMIC_MODELS !== true) return fallback;
+        const excluded = Array.isArray(this.config.notSupportedModels) ? this.config.notSupportedModels : [];
+        const blocked = new Set(excluded.flatMap(name => [name, Object.hasOwn(MODEL_MAPPING, name) ? MODEL_MAPPING[name] : name]));
+        const allowedModels = value => ({ models: value.models.filter(item => !blocked.has(item.name)) });
+        fallback.models = allowedModels(fallback).models;
+        const { signal } = options;
+        signal?.throwIfAborted();
+        if (!this.isInitialized) await waitForKiroOperation(this.initialize(), signal);
+        await waitForKiroOperation(this._prepareAccessTokenForRequest('listModels'), signal);
+        const apiKey = this.accessToken?.startsWith('ksk_') || this.apiKey && this.accessToken === this.apiKey;
+        // CLI model-list contracts differ. Require a verified configured endpoint.
+        if (apiKey && !this.config.KIRO_MODELS_URL) return fallback;
+        let url;
+        try {
+            url = new URL(this.config.KIRO_MODELS_URL || '/ListAvailableModels', this.codewhispererBaseUrl || this.baseUrl);
+            if (!['http:', 'https:'].includes(url.protocol)) return fallback;
+        } catch {
+            logger.warn('[Kiro Models] Invalid discovery URL; retaining configured model list');
+            return fallback;
+        }
+        url.searchParams.set('origin', 'AI_EDITOR');
+        url.searchParams.set('maxResults', '50');
+        if (this.profileArn) url.searchParams.set('profileArn', this.profileArn);
+        const accessToken = this.accessToken;
+        const key = crypto.createHash('sha256').update(JSON.stringify([
+            this.uuid, accessToken, this.region, this.profileArn, url.href,
+            resolveProxyUrlForProvider(this.config, this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, { forSidecar: true })
+        ])).digest('hex');
+        this._modelCache ||= new KiroModelCache();
+        const configuredTtl = Number(this.config.KIRO_MODEL_CACHE_TTL_MS ?? 300000);
+        const ttl = Number.isFinite(configuredTtl) && configuredTtl >= 0 ? configuredTtl : 300000;
+        const operation = this._modelCache.get(key, async () => {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 10000);
+            const models = [];
+            const seenTokens = new Set();
+            try {
+                let nextToken;
+                for (let page = 0; page < 20; page++) {
+                    const pageUrl = new URL(url);
+                    if (nextToken) pageUrl.searchParams.set('nextToken', nextToken);
+                    const request = { method: 'get', url: pageUrl.href, signal: controller.signal, timeout: 10000,
+                        maxContentLength: 1024 * 1024, headers: { Authorization: `Bearer ${accessToken}`, TokenType: apiKey ? 'API_KEY' : undefined } };
+                    this._applySidecar(request);
+                    const response = await this.axiosInstance.request(request);
+                    for (const model of response.data?.models || []) {
+                        const name = model.modelId || model.id || model.name;
+                        if (typeof name === 'string' && name) {
+                            const entry = { name, modelId: name };
+                            for (const field of ['modelName', 'description']) {
+                                if (typeof model[field] === 'string') entry[field] = model[field].slice(0, 4096);
+                            }
+                            if (Array.isArray(model.supportedInputTypes)) entry.supportedInputTypes = model.supportedInputTypes.filter(value => typeof value === 'string').slice(0, 32);
+                            if (Number.isFinite(model.rateMultiplier)) entry.rateMultiplier = model.rateMultiplier;
+                            if (model.tokenLimits) {
+                                entry.tokenLimits = {};
+                                for (const field of ['maxInputTokens', 'maxOutputTokens']) {
+                                    if (Number.isSafeInteger(model.tokenLimits[field]) && model.tokenLimits[field] > 0) entry.tokenLimits[field] = model.tokenLimits[field];
+                                }
+                            }
+                            models.push(entry);
+                        }
+                    }
+                    nextToken = response.data?.nextToken;
+                    if (!nextToken) break;
+                    if (seenTokens.has(nextToken) || page === 19) throw new Error('Invalid model-list pagination');
+                    seenTokens.add(nextToken);
+                }
+                if (!models.length) throw new Error('Empty upstream model list');
+                return { models: [...new Map(models.map(model => [model.name, model])).values()] };
+            } catch (error) {
+                logger.warn('[Kiro Models] Discovery failed; retaining configured model list');
+                throw error;
+            } finally { clearTimeout(timer); controller.abort(); }
+        }, fallback, ttl);
+        return allowedModels(await waitForKiroOperation(operation, signal));
     }
 
     /**
@@ -3713,8 +3714,11 @@ async saveCredentialsToFile(filePath, newData) {
      * 获取用量限制信息
      * @returns {Promise<Object>} 用量限制信息
      */
-    async getUsageLimits() {
-        if (!this.isInitialized) await this.initialize();
+    async getUsageLimits(options = {}) {
+        const { signal } = options;
+        signal?.throwIfAborted();
+        if (!this.isInitialized) await waitForKiroOperation(this.initialize(), signal);
+        signal?.throwIfAborted();
 
         // Token 刷新策略：
         // 1. 已过期 → 必须等待刷新
@@ -3758,7 +3762,6 @@ async saveCredentialsToFile(filePath, newData) {
             'user-agent': `aws-sdk-js/1.0.34 ua/2.1 os/${osName} lang/js md/nodejs#${nodeVersion} api/codewhispererstreaming#1.0.34 m/E KiroIDE-${kiroVersion}-${machineId}`,
             'amz-sdk-invocation-id': uuidv4(),
             'amz-sdk-request': 'attempt=1; max=1',
-            'Connection': 'close'
         };
         if (this.accessToken && (this.accessToken.startsWith('ksk_') || (this.apiKey && this.accessToken === this.apiKey))) {
             headers['TokenType'] = 'API_KEY';
@@ -3767,7 +3770,8 @@ async saveCredentialsToFile(filePath, newData) {
         const axiosConfig = {
             method: 'get',
             url: fullUrl,
-            headers
+            headers,
+            signal
         };
         this._applySidecar(axiosConfig);
 
@@ -3776,6 +3780,7 @@ async saveCredentialsToFile(filePath, newData) {
             logger.info('[Kiro] Usage limits fetched successfully');
             return response.data;
         } catch (error) {
+            signal?.throwIfAborted();
             const status = error.response?.status;
             
             // 从响应体中提取错误信息
@@ -3805,7 +3810,7 @@ async saveCredentialsToFile(filePath, newData) {
             }
             
             if (status === 403) {
-                this._handleForbiddenCredentialError(error, 'usage query');
+                await this._handleForbiddenCredentialError(error, 'usage query', { signal });
                 formattedError.credentialMarkedUnhealthy = true;
                 throw formattedError;
             }

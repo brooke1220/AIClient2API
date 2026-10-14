@@ -1,8 +1,10 @@
+import { writeWithBackpressure, clientRequestCancellation } from './stream-lifecycle.js';
 export { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import * as http from 'http'; // Add http for IncomingMessage and ServerResponse types
 import * as crypto from 'crypto'; // Import crypto for MD5 hashing
+import { setTimeout as sleep } from 'node:timers/promises';
 import logger from './logger.js';
 import { convertData, getOpenAIStreamChunkStop, releaseStreamState } from '../convert/convert.js';
 import { ProviderStrategyFactory } from './provider-strategies.js';
@@ -152,21 +154,53 @@ function extractReadableErrorText(data) {
     }
 }
 
-export async function getNormalizedErrorResponseText(error) {
+/**
+ * Read error bodies with a bounded lifetime and memory budget. Axios rejects
+ * non-2xx streaming responses before EOF, so its request signal is not enough
+ * to cancel a later read of error.response.data.
+ */
+export async function getNormalizedErrorResponseText(error, options = {}) {
+    const { signal } = options;
     const data = error?.response?.data;
-    const fallbackText = extractReadableErrorText(data) || error?.message || '';
-
-    if (!data || typeof data?.on !== 'function' || typeof data?.read !== 'function') {
-        return fallbackText;
+    if (!data || typeof data.on !== 'function' || typeof data.read !== 'function') {
+        signal?.throwIfAborted();
+        return extractReadableErrorText(data) || error?.message || '';
     }
 
+    // Never stringify an IncomingMessage/Readable for a fallback: it contains
+    // transport internals rather than a meaningful upstream error message.
+    const fallbackText = error?.message || '';
+    const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? options.timeoutMs : 10000;
+    const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes >= 1
+        ? Math.floor(options.maxBytes) : 64 * 1024;
     const chunks = [];
-    try {
-        for await (const chunk of data) {
-            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
-        }
+    let bytesRead = 0;
+    let timer;
+    const onAbort = () => data.destroy(signal.reason instanceof Error
+        ? signal.reason : new Error('Error response read aborted'));
 
-        const bodyText = Buffer.concat(chunks).toString('utf8');
+    try {
+        signal?.throwIfAborted();
+        signal?.addEventListener('abort', onAbort, { once: true });
+        timer = setTimeout(() => {
+            data.destroy(new Error(`Error response read timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        for await (const chunk of data) {
+            signal?.throwIfAborted();
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+            const remaining = maxBytes - bytesRead;
+            chunks.push(buffer.subarray(0, remaining));
+            bytesRead += Math.min(buffer.length, remaining);
+            if (bytesRead >= maxBytes) {
+                logger.warn(`[Error Normalize] Error response reached the ${maxBytes}-byte limit; closing stream`);
+                break;
+            }
+        }
+        signal?.throwIfAborted();
+
+        const bodyText = Buffer.concat(chunks, bytesRead).toString('utf8');
         if (!bodyText) return fallbackText;
 
         try {
@@ -176,8 +210,15 @@ export async function getNormalizedErrorResponseText(error) {
             return bodyText;
         }
     } catch (readError) {
+        // A downstream cancellation must escape error normalization, otherwise
+        // callers could penalize/refresh a credential after its client left.
+        signal?.throwIfAborted();
         logger.warn(`[Error Normalize] Failed to read error response stream: ${readError.message}`);
         return fallbackText;
+    } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        if (!data.readableEnded && !data.destroyed) data.destroy();
     }
 }
 
@@ -191,7 +232,8 @@ export function buildHttpErrorReason(status, context, responseText = '', options
 
 export async function normalizeProviderErrorMessage(error, options = {}) {
     const status = options.status ?? getErrorStatusCode(error);
-    const responseText = await getNormalizedErrorResponseText(error);
+    const responseText = await getNormalizedErrorResponseText(error, options);
+    options.signal?.throwIfAborted();
     const reason = buildHttpErrorReason(status, options.context || '', responseText, {
         suffix: options.suffix || ''
     });
@@ -814,7 +856,16 @@ export function isAuthorized(req, requestUrl, REQUIRED_API_KEY) {
 export async function handleUnifiedResponse(res, responsePayload, isStream, statusCode = 200) {
     const validatedStatusCode = ensureValidStatusCode(statusCode);
     if (isStream) {
-        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive", "Transfer-Encoding": "chunked" });
+        res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "Transfer-Encoding": "chunked",
+            "X-Accel-Buffering": "no"
+        });
+        // Send headers even while awaiting the first upstream token. This does
+        // not count as model output and must not disable empty-response retries.
+        res.flushHeaders?.();
     } else {
         res.writeHead(validatedStatusCode, { 'Content-Type': 'application/json' });
     }
@@ -889,9 +940,10 @@ function throwIfUpstreamResponseFailed(response, provider, providerLabel = provi
  *
  * @param {string} [providerLabel='Upstream'] - 用于日志的 provider 标签
  * @param {string} [failureLabel='upstream response failure'] - 归一化失败类型
- * @returns {Promise<{retry: boolean, result?: object, responseFailureRetry?: number}>}
+ * @param {AbortSignal} [signal] - 客户端取消信号；等待期间被取消则放弃重试
+ * @returns {Promise<{retry: boolean, aborted?: boolean, result?: object, responseFailureRetry?: number}>}
  */
-async function resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, logPrefix, providerLabel = 'Upstream', failureLabel = 'upstream response failure') {
+async function resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, logPrefix, providerLabel = 'Upstream', failureLabel = 'upstream response failure', signal) {
     const retryMax = CONFIG?.EMPTY_RESPONSE_MAX_RETRIES ?? 2;
     const retryDelayMs = CONFIG?.EMPTY_RESPONSE_RETRY_DELAY_MS ?? 500;
 
@@ -902,13 +954,18 @@ async function resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, log
 
     logger.warn(`${logPrefix} ${providerLabel} ${failureLabel} detected. Retrying with the same request body (${attemptsMade + 1}/${retryMax})...`);
     if (retryDelayMs > 0) {
-        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        await sleep(retryDelayMs, undefined, { signal }).catch(() => {});
+    }
+    // 客户端在等待期间断开：不再占用新凭证的并发插槽
+    if (signal?.aborted) {
+        logger.info(`${logPrefix} Client disconnected during retry delay, skipping retry`);
+        return { retry: false, aborted: true };
     }
 
     try {
         // 动态导入以避免循环依赖
         const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-        const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true });
+        const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true, signal });
 
         if (result && result.service) {
             logger.info(`${logPrefix} Retrying ${failureLabel} from ${providerLabel} with credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -918,6 +975,7 @@ async function resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, log
         logger.warn(`${logPrefix} No service available for response-failure retry.`);
         return { retry: false };
     } catch (retryError) {
+        if (signal?.aborted) return { retry: false, aborted: true };
         logger.error(`${logPrefix} Failed to get service for response-failure retry:`, retryError.message);
         return { retry: false };
     }
@@ -929,6 +987,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     let fullOldResponseJson = '';
     let responseClosed = false;
     let anyDataSent = retryContext?.anyDataSent || false; // 跟踪是否已向客户端发送过任何数据
+    const upstreamAbortController = retryContext?.upstreamAbortController || new AbortController();
+    // All credential/empty-response retries share the client's cancellation.
+    retryContext = { ...retryContext, upstreamAbortController };
     
     // 重试上下文：包含 CONFIG 和重试计数
     // maxRetries: 凭证切换最大次数（跨凭证），默认 5 次
@@ -952,11 +1013,13 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     // 监听客户端断开连接事件（命名函数，便于移除）
     const onClientClose = () => {
         clientDisconnected.value = true;
+        upstreamAbortController.abort();
         logger.info('[Stream] Client disconnected, stopping stream processing');
     };
     
     const onClientError = (err) => {
         clientDisconnected.value = true;
+        upstreamAbortController.abort(err);
         logger.error('[Stream] Response stream error:', err.message);
     };
     
@@ -966,11 +1029,18 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         res.on('error', onClientError);
     }
 
-    // 只在首次请求时发送响应头，重试时跳过（响应头已发送）
+    let heartbeat;
     if (!isRetry) {
-        await handleUnifiedResponse(res, '', true);
+        const ms = Number(CONFIG?.SSE_HEARTBEAT_INTERVAL_MS ?? 15000);
+        if (Number.isFinite(ms) && ms > 0) {
+            heartbeat = setInterval(() => {
+                if (res.headersSent && !res.destroyed && !res.writableEnded && !res.writableNeedDrain && !clientDisconnected.value) {
+                    try { res.write(': keep-alive\n\n'); } catch (error) { onClientError(error); }
+                }
+            }, ms);
+            heartbeat.unref?.();
+        }
     }
-
     let hasToolCall = false;
     let hasMessageStop = false; // 跟踪是否已经发送过结束标志（message_stop / done）
     // finally 必须能访问这两个值：客户端 close、上游 throw 和无终止块 EOF 都要释放状态。
@@ -978,12 +1048,42 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     let needsConversion = false;
     let streamRequestId = null;
 
+    let slotReleased = false;
+    const releaseCurrentSlot = () => {
+        if (slotReleased) return;
+        slotReleased = true;
+        if (retryContext?.slotLease) retryContext.slotLease.release();
+        else if (providerPoolManager && pooluuid) providerPoolManager.releaseSlot(toProvider, pooluuid);
+    };
+
     try {
+        // The client may have disconnected while routing or waiting for an
+        // account slot, before this handler installed its close listener.
+        if (clientDisconnected.value || res.destroyed || res.writableEnded) {
+            clientDisconnected.value = true;
+            upstreamAbortController.abort();
+            responseClosed = true;
+            return;
+        }
+
+        // Only the outer request writes headers. A header/flush failure belongs
+        // to the downstream connection, not to the selected provider account.
+        if (!isRetry) {
+            try {
+                await handleUnifiedResponse(res, '', true);
+            } catch (error) {
+                onClientError(error);
+                throw error;
+            }
+        }
+
         // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
         // The service returns a stream in its native format (toProvider).
         needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
         requestBody.model = model;
-        const nativeStream = await service.generateContentStream(model, requestBody);
+        const nativeStream = await service.generateContentStream(model, requestBody, {
+            signal: upstreamAbortController.signal
+        });
         
         // 如果提供者内部发生了模型回退（如 Antigravity 自动降级），同步更新本地 model 变量
         // 这确保了后续的监控钩子和统计插件记录的是实际使用的模型
@@ -1097,11 +1197,11 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     // fullResponseJson += chunk.type+"\n";
                     if (!clientDisconnected.value && !res.writableEnded) {
                         try {
-                            res.write(`event: ${chunk.type}\n`);
-                            anyDataSent = true;
+                            await writeWithBackpressure(res, `event: ${chunk.type}\n`, upstreamAbortController.signal, () => { anyDataSent = true; });
                         } catch (writeErr) {
                             logger.error('[Stream] Failed to write event:', writeErr.message);
                             clientDisconnected.value = true;
+                            upstreamAbortController.abort(writeErr);
                             break;
                         }
                     }
@@ -1112,11 +1212,11 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 // fullResponseJson += JSON.stringify(chunk)+"\n\n";
                 if (!clientDisconnected.value && !res.writableEnded) {
                     try {
-                        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                        anyDataSent = true;
+                        await writeWithBackpressure(res, `data: ${JSON.stringify(chunk)}\n\n`, upstreamAbortController.signal, () => { anyDataSent = true; });
                     } catch (writeErr) {
                         logger.error('[Stream] Failed to write data:', writeErr.message);
                         clientDisconnected.value = true;
+                        upstreamAbortController.abort(writeErr);
                         break;
                     }
                 }
@@ -1133,7 +1233,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
 
         // 流式请求成功完成，统计使用次数，错误次数重置为0
-        if (providerPoolManager && pooluuid) {
+        if (!clientDisconnected.value && providerPoolManager && pooluuid) {
             const customNameDisplay = customName ? `, ${customName}` : '';
             logger.info(`[Provider Pool] Increasing usage count for ${toProvider} (${pooluuid}${customNameDisplay}) after successful stream request`);
             providerPoolManager.markProviderHealthy(toProvider, {
@@ -1142,15 +1242,15 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
 
     }  catch (error) {
-        logger.error('\n[Server] Error during stream processing:', error.stack);
-        
         // 如果客户端已断开，不需要发送错误响应
         if (clientDisconnected.value) {
             logger.info('[Stream] Skipping error response due to client disconnect');
             responseClosed = true;
             return;
         }
-        
+
+        logger.error('\n[Server] Error during stream processing:', error.stack);
+
         // 如果已经发送了数据（包括 metadata），不进行重试（避免响应数据损坏或顺序错误）
         if (anyDataSent) {
             logger.info(`[Stream Retry] Cannot retry: data already sent to client`);
@@ -1173,12 +1273,19 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (error.isRetryableUpstreamResponseFailure || error.isEmptyUpstreamResponse) {
             const attemptsMade = retryContext?.responseFailureRetry ?? retryContext?.emptyResponseRetry ?? 0;
             const failureLabel = error.responseFailureLabel || 'upstream response failure';
-            const outcome = await resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, '[Stream Retry]', toProvider, failureLabel);
+            releaseCurrentSlot();
+            const outcome = await resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, '[Stream Retry]', toProvider, failureLabel, upstreamAbortController.signal);
+
+            if (outcome.aborted) {
+                responseClosed = true;
+                return;
+            }
 
             if (outcome.retry) {
                 const { result, responseFailureRetry } = outcome;
                 const newRetryContext = {
                     ...retryContext,
+                    slotLease: result.slotLease || null,
                     CONFIG,
                     currentRetry,
                     maxRetries,
@@ -1262,15 +1369,22 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 不再依赖状态码判断，只要凭证被标记不健康且可以重试，就尝试切换
         if (credentialMarkedUnhealthy && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             // 增加10秒内的随机等待时间，避免所有请求同时切换凭证
+            releaseCurrentSlot();
             const randomDelay = Math.floor(Math.random() * 10000); // 0-10000毫秒
             logger.info(`[Stream Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
-            await new Promise(resolve => setTimeout(resolve, randomDelay));
-            
+            await sleep(randomDelay, undefined, { signal: upstreamAbortController.signal }).catch(() => {});
+            // 客户端在等待期间断开：不再占用新凭证的并发插槽，也无需写错误响应
+            if (upstreamAbortController.signal.aborted) {
+                logger.info('[Stream Retry] Client disconnected during retry delay, skipping credential switch');
+                responseClosed = true;
+                return;
+            }
+
             try {
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
-                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true });
+                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true, signal: upstreamAbortController.signal });
                 
                 if (result && result.service) {
                     logger.info(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -1278,6 +1392,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     // 使用新服务重试
                     const newRetryContext = {
                         ...retryContext,
+                        slotLease: result.slotLease || null,
                         CONFIG,
                         currentRetry: currentRetry + 1,
                         maxRetries,
@@ -1320,6 +1435,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
         responseClosed = true;
     } finally {
+        clearInterval(heartbeat);
+        if (!isRetry) upstreamAbortController.abort();
+
         // 单例转换器中的 Gemini → OpenAI 状态不能只依赖上游 finishReason 清理。
         // 客户端 close、上游 throw、无终止块 EOF 都会绕过转换器的正常终止分支。
         // 状态保存在“来源协议”的转换器内：Gemini → OpenAI 时必须释放 GeminiConverter，
@@ -1329,9 +1447,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
 
         // 释放并发插槽
-        if (providerPoolManager && pooluuid) {
-            providerPoolManager.releaseSlot(toProvider, pooluuid);
-        }
+        releaseCurrentSlot();
 
         // 只在首次请求时移除事件监听器（避免重试时误删）
         if (!isRetry) {
@@ -1348,7 +1464,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 try {
                     if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI) {
                         // OpenAI 规范：无论是否已有 finish_reason chunk，都必须以 [DONE] 收尾
-                        res.write('data: [DONE]\n\n');
+                        await writeWithBackpressure(res, 'data: [DONE]\n\n');
                         hasMessageStop = true;
                     } else if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES) {
                         // OpenAI Responses 以 response.completed/response.incomplete（或 error）作为结束事件。
@@ -1389,12 +1505,21 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
     const currentRetry = retryContext?.currentRetry ?? 0;
     const CONFIG = retryContext?.CONFIG;
     
+    let slotReleased = false;
+    const releaseCurrentSlot = () => {
+        if (slotReleased) return;
+        slotReleased = true;
+        if (retryContext?.slotLease) retryContext.slotLease.release();
+        else if (providerPoolManager && pooluuid) providerPoolManager.releaseSlot(toProvider, pooluuid);
+    };
+
     try{
         // The service returns the response in its native format (toProvider).
         const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
         requestBody.model = model;
         // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
-        const nativeResponse = await service.generateContent(model, requestBody);
+        const nativeResponse = await service.generateContent(model, requestBody, { signal: retryContext?.upstreamAbortController?.signal });
+        retryContext?.upstreamAbortController?.signal.throwIfAborted();
 
         // 与流式链路一致，由协议策略在转换前识别原生终止失败。
         throwIfUpstreamResponseFailed(
@@ -1448,6 +1573,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
             });
         }
     } catch (error) {
+        if (retryContext?.upstreamAbortController?.signal.aborted || res.destroyed) return;
         logger.error('\n[Server] Error during unary processing:', error.stack);
 
         // 协议策略识别出的可重试终止失败和 provider core 抛出的空响应共享独立的小额预算，
@@ -1455,12 +1581,15 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         if (error.isRetryableUpstreamResponseFailure || error.isEmptyUpstreamResponse) {
             const attemptsMade = retryContext?.responseFailureRetry ?? retryContext?.emptyResponseRetry ?? 0;
             const failureLabel = error.responseFailureLabel || 'upstream response failure';
-            const outcome = await resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, '[Unary Retry]', toProvider, failureLabel);
+            releaseCurrentSlot();
+            const outcome = await resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, '[Unary Retry]', toProvider, failureLabel, retryContext?.upstreamAbortController?.signal);
 
+            if (outcome.aborted) return;
             if (outcome.retry) {
                 const { result, responseFailureRetry } = outcome;
                 const newRetryContext = {
                     ...retryContext,
+                    slotLease: result.slotLease || null,
                     CONFIG,
                     currentRetry,
                     maxRetries,
@@ -1534,15 +1663,17 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         // 不再依赖状态码判断，只要凭证被标记不健康且可以重试，就尝试切换
         if (credentialMarkedUnhealthy && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             // 增加10秒内的随机等待时间，避免所有请求同时切换凭证
+            releaseCurrentSlot();
             const randomDelay = Math.floor(Math.random() * 10000); // 0-10000毫秒
             logger.info(`[Unary Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
-            await new Promise(resolve => setTimeout(resolve, randomDelay));
+            await sleep(randomDelay, undefined, { signal: retryContext?.upstreamAbortController?.signal }).catch(() => {});
+            if (retryContext?.upstreamAbortController?.signal.aborted) return;
             
             try {
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
-                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true });
+                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true, signal: retryContext?.upstreamAbortController?.signal });
                 
                 if (result && result.service) {
                     logger.info(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -1550,6 +1681,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                     // 使用新服务重试
                     const newRetryContext = {
                         ...retryContext,
+                        slotLease: result.slotLease || null,
                         CONFIG,
                         currentRetry: currentRetry + 1,
                         maxRetries
@@ -1585,9 +1717,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         await handleUnifiedResponse(res, JSON.stringify(errorResponse), false, statusCode);
     } finally {
         // 确保在请求结束或出错时释放插槽
-        if (providerPoolManager && pooluuid) {
-            providerPoolManager.releaseSlot(toProvider, pooluuid);
-        }
+        releaseCurrentSlot();
     }
 }
 
@@ -1747,169 +1877,181 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
  * @param {string} PROMPT_LOG_FILENAME - The prompt log filename.
  */
 export async function handleContentGenerationRequest(req, res, service, endpointType, CONFIG, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, requestPath = null) {
-    const originalRequestBody = await getRequestBody(req, { maxBytes: CONFIG.REQUEST_BODY_MAX_BYTES });
-
-    if (!originalRequestBody) {
-        throw new Error("Request body is missing for content generation.");
-    }
-
-    const clientProviderMap = {
-        [ENDPOINT_TYPE.OPENAI_CHAT]: MODEL_PROTOCOL_PREFIX.OPENAI,
-        [ENDPOINT_TYPE.OPENAI_RESPONSES]: MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES,
-        [ENDPOINT_TYPE.CLAUDE_MESSAGE]: MODEL_PROTOCOL_PREFIX.CLAUDE,
-        [ENDPOINT_TYPE.GEMINI_CONTENT]: MODEL_PROTOCOL_PREFIX.GEMINI,
-    };
-
-    const fromProvider = clientProviderMap[endpointType];
-    // 使用实际的提供商类型（可能是 fallback 后的类型）
-    let toProvider = CONFIG.actualProviderType || CONFIG.MODEL_PROVIDER;
-    let actualUuid = pooluuid;
-    
-    if (!fromProvider) {
-        throw new Error(`Unsupported endpoint type for content generation: ${endpointType}`);
-    }
-
-    // 2. Extract model and determine if the request is for streaming.
-    let { model, isStream } = _extractModelAndStreamInfo(req, originalRequestBody, fromProvider);
-
-    if (!model) {
-        throw new Error("Could not determine the model from the request.");
-    }
-    
-    // 2.1. 处理自定义模型映射和别名
-    const customModelConfig = getCustomModelConfig(model, CONFIG.MODEL_PROVIDER);
-    CONFIG.customConfig = customModelConfig || null;
-    if (customModelConfig) {
-        const customRouting = resolveCustomModelRouting(model, CONFIG.MODEL_PROVIDER, customModelConfig);
-        logger.info(`[Custom Model] Resolved '${model}' to actual model '${customRouting.actualModel}'`);
-        
-        if (customRouting.actualProvider && customRouting.actualProvider !== CONFIG.MODEL_PROVIDER) {
-            CONFIG.MODEL_PROVIDER = customRouting.actualProvider;
-            toProvider = customRouting.actualProvider;
-            logger.info(`[Custom Model] Switched provider to '${CONFIG.MODEL_PROVIDER}' based on custom model config`);
-        }
-
-        // 映射到实际模型 ID
-        if (customRouting.actualModel) {
-            model = customRouting.actualModel;
-        }
-    }
-
-    logger.info(`[Content Generation] Model: ${model}, Stream: ${isStream}`);
-
-    let actualCustomName = CONFIG.customName;
-
-    // 2.5. 根据模型选择服务适配器：
-    // - service 缺失时（例如上游未预先注入）进行兜底选择
-    // - 使用号池/AUTO 时按模型重选并支持 fallback
-    // 注意：仅在号池场景开启 acquireSlot，占用并发名额或进入队列
-    const shouldSelectByPool = providerPoolManager && (CONFIG.MODEL_PROVIDER === MODEL_PROVIDER.AUTO || (CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER]));
-    if (!service || shouldSelectByPool) {
-        const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-        const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: shouldSelectByPool });
-
-        service = result.service;
-        toProvider = result.actualProviderType;
-        actualUuid = result.uuid || pooluuid;
-        actualCustomName = result.serviceConfig?.customName || CONFIG.customName;
-
-        // 如果发生了模型级别的 fallback，需要更新请求使用的模型
-        if (result.actualModel && result.actualModel !== model) {
-            logger.info(`[Content Generation] Model Fallback: ${model} -> ${result.actualModel}`);
-            model = result.actualModel;
-        }
-
-        if (result.isFallback) {
-            logger.info(`[Content Generation] Fallback activated: ${CONFIG.MODEL_PROVIDER} -> ${toProvider} (uuid: ${actualUuid})`);
-        } else {
-            logger.info(`[Content Generation] Selected service adapter based on model: ${model}`);
-        }
-    }
-
-    // 1. Convert request body from client format to backend format, if necessary.
-    // 使用浅拷贝以避免直接变异 originalRequestBody，保持原始数据的纯净性以供后续钩子使用
-    let processedRequestBody = { ...originalRequestBody };
-
-    // 将 _monitorRequestId 注入到 requestBody 中，以便在 service 内部访问
-    if (CONFIG._monitorRequestId) {
-        processedRequestBody._monitorRequestId = CONFIG._monitorRequestId;
-    }
-    
-    // 将 requestBaseUrl 注入到 requestBody 中，以便在转换器中使用
-    if (CONFIG.requestBaseUrl) {
-        processedRequestBody._requestBaseUrl = CONFIG.requestBaseUrl;
-    }
-
-    // fs.writeFile('originalRequestBody'+Date.now()+'.json', JSON.stringify(originalRequestBody));
-    if (getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider)) {
-        logger.info(`[Request Convert] Converting request from ${fromProvider} to ${toProvider}`);
-        const preConvertBody = processedRequestBody;
-        processedRequestBody = convertData(preConvertBody, 'request', fromProvider, toProvider);
-
-        // 保持以 _ 开头的内部属性（如 _monitorRequestId, _requestBaseUrl）
-        Object.keys(preConvertBody).forEach(key => {
-            if (key.startsWith('_') && processedRequestBody[key] === undefined) {
-                processedRequestBody[key] = preConvertBody[key];
-            }
-        });
-    } else {
-        logger.info(`[Request Convert] Request format matches backend provider. No conversion needed.`);
-    }
-    
-    // 为 forward provider 添加原始请求路径作为 endpoint
-    if (requestPath && getProtocolPrefix(toProvider) === MODEL_PROTOCOL_PREFIX.FORWARD) {
-        logger.info(`[Forward API] Request path: ${requestPath}`);
-        processedRequestBody.endpoint = requestPath;
-    }
-
-    // 3. Apply system prompt from file if configured.
-    processedRequestBody = await _applySystemPromptFromFile(CONFIG, processedRequestBody, toProvider);
-    await _manageSystemPrompt(processedRequestBody, toProvider);
-
-    // 4. Log the incoming prompt (after potential conversion to the backend's format).
-    const promptText = extractPromptText(processedRequestBody, toProvider);
-    
-    // 4.1. 应用自定义模型参数 (温度、最大长度等)
-    if (customModelConfig) {
-        _applyCustomModelParameters(processedRequestBody, customModelConfig, toProvider);
-    }
-
-    await logConversation('input', promptText, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
-    
-    // 5. Call the appropriate stream or unary handler, passing the provider info.
-    // 创建重试上下文，包含 CONFIG 以便在认证错误时切换凭证重试
-    // 凭证切换重试次数（默认 5），可在配置中自定义更大的值
-    // 注意：这与底层的 429/5xx 重试（REQUEST_MAX_RETRIES）是不同层次的重试机制
-    // - 底层重试：同一凭证遇到 429/5xx 时的重试
-    // - 凭证切换重试：凭证被标记不健康后切换到其他凭证
-    // 当没有不同的健康凭证可用时，重试会自动停止
-    const credentialSwitchMaxRetries = CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
-    const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries };
-    
-    if (isStream) {
-        await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);
-    } else {
-        await handleUnaryRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);
-    }
-
-    // 同步更新模型名称（如果处理器内部或提供者发生了回退）
-    if (processedRequestBody.model && processedRequestBody.model !== model) {
-        model = processedRequestBody.model;
-    }
-
-    // 执行插件钩子：内容生成后
+    const cancellation = clientRequestCancellation(req, res);
+    let ownedSlotLease = null;
     try {
-        const pluginManager = getPluginManager();
-        await pluginManager.executeHook('onContentGenerated', {
-            ...CONFIG,
-            originalRequestBody,
-            processedRequestBody,
-            fromProvider,
-            toProvider,
-            model,
-            isStream
-        });
-    } catch (e) { /* 静默失败，不影响主流程 */ }
+        cancellation.controller.signal.throwIfAborted();
+        const originalRequestBody = await getRequestBody(req, { maxBytes: CONFIG.REQUEST_BODY_MAX_BYTES });
+
+        if (!originalRequestBody) {
+            throw new Error("Request body is missing for content generation.");
+        }
+
+        const clientProviderMap = {
+            [ENDPOINT_TYPE.OPENAI_CHAT]: MODEL_PROTOCOL_PREFIX.OPENAI,
+            [ENDPOINT_TYPE.OPENAI_RESPONSES]: MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES,
+            [ENDPOINT_TYPE.CLAUDE_MESSAGE]: MODEL_PROTOCOL_PREFIX.CLAUDE,
+            [ENDPOINT_TYPE.GEMINI_CONTENT]: MODEL_PROTOCOL_PREFIX.GEMINI,
+        };
+
+        const fromProvider = clientProviderMap[endpointType];
+        // 使用实际的提供商类型（可能是 fallback 后的类型）
+        let toProvider = CONFIG.actualProviderType || CONFIG.MODEL_PROVIDER;
+        let actualUuid = pooluuid;
+    
+        if (!fromProvider) {
+            throw new Error(`Unsupported endpoint type for content generation: ${endpointType}`);
+        }
+
+        // 2. Extract model and determine if the request is for streaming.
+        let { model, isStream } = _extractModelAndStreamInfo(req, originalRequestBody, fromProvider);
+
+        if (!model) {
+            throw new Error("Could not determine the model from the request.");
+        }
+    
+        // 2.1. 处理自定义模型映射和别名
+        const customModelConfig = getCustomModelConfig(model, CONFIG.MODEL_PROVIDER);
+        CONFIG.customConfig = customModelConfig || null;
+        if (customModelConfig) {
+            const customRouting = resolveCustomModelRouting(model, CONFIG.MODEL_PROVIDER, customModelConfig);
+            logger.info(`[Custom Model] Resolved '${model}' to actual model '${customRouting.actualModel}'`);
+        
+            if (customRouting.actualProvider && customRouting.actualProvider !== CONFIG.MODEL_PROVIDER) {
+                CONFIG.MODEL_PROVIDER = customRouting.actualProvider;
+                toProvider = customRouting.actualProvider;
+                logger.info(`[Custom Model] Switched provider to '${CONFIG.MODEL_PROVIDER}' based on custom model config`);
+            }
+
+            // 映射到实际模型 ID
+            if (customRouting.actualModel) {
+                model = customRouting.actualModel;
+            }
+        }
+
+        logger.info(`[Content Generation] Model: ${model}, Stream: ${isStream}`);
+
+        let actualCustomName = CONFIG.customName;
+
+        // 2.5. 根据模型选择服务适配器：
+        // - service 缺失时（例如上游未预先注入）进行兜底选择
+        // - 使用号池/AUTO 时按模型重选并支持 fallback
+        // 注意：仅在号池场景开启 acquireSlot，占用并发名额或进入队列
+        const shouldSelectByPool = providerPoolManager && (CONFIG.MODEL_PROVIDER === MODEL_PROVIDER.AUTO || (CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER]));
+        if (!service || shouldSelectByPool) {
+            const { getApiServiceWithFallback } = await import('../services/service-manager.js');
+            const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: shouldSelectByPool, signal: cancellation.controller.signal });
+
+            ownedSlotLease = result.slotLease || null;
+            cancellation.controller.signal.throwIfAborted();
+            service = result.service;
+            toProvider = result.actualProviderType;
+            actualUuid = result.uuid || pooluuid;
+            actualCustomName = result.serviceConfig?.customName || CONFIG.customName;
+
+            // 如果发生了模型级别的 fallback，需要更新请求使用的模型
+            if (result.actualModel && result.actualModel !== model) {
+                logger.info(`[Content Generation] Model Fallback: ${model} -> ${result.actualModel}`);
+                model = result.actualModel;
+            }
+
+            if (result.isFallback) {
+                logger.info(`[Content Generation] Fallback activated: ${CONFIG.MODEL_PROVIDER} -> ${toProvider} (uuid: ${actualUuid})`);
+            } else {
+                logger.info(`[Content Generation] Selected service adapter based on model: ${model}`);
+            }
+        }
+
+        // 1. Convert request body from client format to backend format, if necessary.
+        // 使用浅拷贝以避免直接变异 originalRequestBody，保持原始数据的纯净性以供后续钩子使用
+        let processedRequestBody = { ...originalRequestBody };
+
+        // 将 _monitorRequestId 注入到 requestBody 中，以便在 service 内部访问
+        if (CONFIG._monitorRequestId) {
+            processedRequestBody._monitorRequestId = CONFIG._monitorRequestId;
+        }
+    
+        // 将 requestBaseUrl 注入到 requestBody 中，以便在转换器中使用
+        if (CONFIG.requestBaseUrl) {
+            processedRequestBody._requestBaseUrl = CONFIG.requestBaseUrl;
+        }
+
+        // fs.writeFile('originalRequestBody'+Date.now()+'.json', JSON.stringify(originalRequestBody));
+        if (getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider)) {
+            logger.info(`[Request Convert] Converting request from ${fromProvider} to ${toProvider}`);
+            const preConvertBody = processedRequestBody;
+            processedRequestBody = convertData(preConvertBody, 'request', fromProvider, toProvider);
+
+            // 保持以 _ 开头的内部属性（如 _monitorRequestId, _requestBaseUrl）
+            Object.keys(preConvertBody).forEach(key => {
+                if (key.startsWith('_') && processedRequestBody[key] === undefined) {
+                    processedRequestBody[key] = preConvertBody[key];
+                }
+            });
+        } else {
+            logger.info(`[Request Convert] Request format matches backend provider. No conversion needed.`);
+        }
+    
+        // 为 forward provider 添加原始请求路径作为 endpoint
+        if (requestPath && getProtocolPrefix(toProvider) === MODEL_PROTOCOL_PREFIX.FORWARD) {
+            logger.info(`[Forward API] Request path: ${requestPath}`);
+            processedRequestBody.endpoint = requestPath;
+        }
+
+        // 3. Apply system prompt from file if configured.
+        processedRequestBody = await _applySystemPromptFromFile(CONFIG, processedRequestBody, toProvider);
+        await _manageSystemPrompt(processedRequestBody, toProvider);
+
+        // 4. Log the incoming prompt (after potential conversion to the backend's format).
+        const promptText = extractPromptText(processedRequestBody, toProvider);
+    
+        // 4.1. 应用自定义模型参数 (温度、最大长度等)
+        if (customModelConfig) {
+            _applyCustomModelParameters(processedRequestBody, customModelConfig, toProvider);
+        }
+
+        await logConversation('input', promptText, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
+    
+        // 5. Call the appropriate stream or unary handler, passing the provider info.
+        // 创建重试上下文，包含 CONFIG 以便在认证错误时切换凭证重试
+        // 凭证切换重试次数（默认 5），可在配置中自定义更大的值
+        // 注意：这与底层的 429/5xx 重试（REQUEST_MAX_RETRIES）是不同层次的重试机制
+        // - 底层重试：同一凭证遇到 429/5xx 时的重试
+        // - 凭证切换重试：凭证被标记不健康后切换到其他凭证
+        // 当没有不同的健康凭证可用时，重试会自动停止
+        const credentialSwitchMaxRetries = CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
+        const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, slotLease: ownedSlotLease, upstreamAbortController: cancellation.controller };
+    
+        if (isStream) {
+            await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);
+        } else {
+            await handleUnaryRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);
+        }
+
+        // 同步更新模型名称（如果处理器内部或提供者发生了回退）
+        if (processedRequestBody.model && processedRequestBody.model !== model) {
+            model = processedRequestBody.model;
+        }
+
+        // 执行插件钩子：内容生成后
+        try {
+            const pluginManager = getPluginManager();
+            await pluginManager.executeHook('onContentGenerated', {
+                ...CONFIG,
+                originalRequestBody,
+                processedRequestBody,
+                fromProvider,
+                toProvider,
+                model,
+                isStream
+            });
+        } catch (e) { /* 静默失败，不影响主流程 */ }
+    } catch (error) {
+        if (!cancellation.controller.signal.aborted) throw error;
+    } finally {
+        ownedSlotLease?.release();
+        cancellation.cleanup();
+    }
 }
 
 /**

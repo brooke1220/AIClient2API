@@ -48,9 +48,10 @@ export class ApiServiceAdapter {
      * 生成内容
      * @param {string} model - 模型名称
      * @param {object} requestBody - 请求体
+     * @param {object} [options] - 请求级选项；支持取消的适配器可读取 options.signal
      * @returns {Promise<object>} - API响应
      */
-    async generateContent(model, requestBody) {
+    async generateContent(model, requestBody, options = {}) {
         throw new Error("Method 'generateContent()' must be implemented.");
     }
 
@@ -58,9 +59,10 @@ export class ApiServiceAdapter {
      * 流式生成内容
      * @param {string} model - 模型名称
      * @param {object} requestBody - 请求体
+     * @param {object} [options] - 请求级选项；支持取消的适配器可读取 options.signal
      * @returns {AsyncIterable<object>} - API响应流
      */
-    async *generateContentStream(model, requestBody) {
+    async *generateContentStream(model, requestBody, options = {}) {
         throw new Error("Method 'generateContentStream()' must be implemented.");
     }
 
@@ -363,23 +365,13 @@ export class KiroApiServiceAdapter extends ApiServiceAdapter {
         // });
     }
 
-    async generateContent(model, requestBody) {
-        // The adapter expects the requestBody to be in OpenAI format for Kiro API
-        if (!this.kiroApiService.isInitialized) {
-            logger.warn("kiroApiService not initialized, attempting to re-initialize...");
-            await this.kiroApiService.initialize();
-        }
-        return this.kiroApiService.generateContent(model, requestBody);
+    async generateContent(model, requestBody, options = {}) {
+        return this.kiroApiService.generateContent(model, requestBody, options);
     }
 
-    async *generateContentStream(model, requestBody) {
-        // The adapter expects the requestBody to be in OpenAI format for Kiro API
-        if (!this.kiroApiService.isInitialized) {
-            logger.warn("kiroApiService not initialized, attempting to re-initialize...");
-            await this.kiroApiService.initialize();
-        }
-        const stream = this.kiroApiService.generateContentStream(model, requestBody);
-        yield* stream;
+    async *generateContentStream(model, requestBody, options = {}) {
+        // Initialization and cancellation are handled together by the service.
+        yield* this.kiroApiService.generateContentStream(model, requestBody, options);
     }
 
     async listModels() {

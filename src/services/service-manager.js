@@ -444,7 +444,8 @@ export async function getApiService(config, requestedModel = null, options = {})
  * @param {Object} config - The current request configuration
  * @param {string} [requestedModel] - Optional. The model name to filter providers by.
  * @param {Object} [options] - Optional. Additional options.
- * @returns {Promise<Object>} Object containing service adapter and metadata
+ * @param {AbortSignal} [options.signal] - Cancels account selection/queueing.
+ * @returns {Promise<Object>} Service metadata and an optional idempotent slotLease; acquired slots must be released.
  */
 export async function getApiServiceWithFallback(config, requestedModel = null, options = {}) {
     // 1. 前置路由解析
@@ -460,66 +461,77 @@ export async function getApiServiceWithFallback(config, requestedModel = null, o
     let actualProviderType = config.MODEL_PROVIDER;
     let isFallback = false;
     let selectedUuid = null;
+    let slotLease = null;
     let actualModel = actualModelName;
     
-    const isPoolable = PROVIDER_MAPPINGS.some(m => m.providerType === config.MODEL_PROVIDER);
-    if (providerPoolManager && ((config.providerPools && config.providerPools[config.MODEL_PROVIDER]) || isPoolable)) {
-        // selectProviderWithFallback 现在是异步的，使用链式锁确保并发安全
-        // 如果开启了并发限制，则使用 acquireSlot 进行选择和占位
-        const useAcquire = options.acquireSlot === true;
-        let selectedResult;
+    options.signal?.throwIfAborted();
+    try {
+        const isPoolable = PROVIDER_MAPPINGS.some(m => m.providerType === config.MODEL_PROVIDER);
+        if (providerPoolManager && ((config.providerPools && config.providerPools[config.MODEL_PROVIDER]) || isPoolable)) {
+            // selectProviderWithFallback 现在是异步的，使用链式锁确保并发安全
+            // 如果开启了并发限制，则使用 acquireSlot 进行选择和占位
+            const useAcquire = options.acquireSlot === true;
+            let selectedResult;
         
-        if (useAcquire) {
-             // 我们需要一个支持 Fallback 的 acquireSlot
-             selectedResult = await providerPoolManager.acquireSlotWithFallback(
-                config.MODEL_PROVIDER,
-                actualModelName,
-                options
-            );
-        } else {
-            selectedResult = await providerPoolManager.selectProviderWithFallback(
-                config.MODEL_PROVIDER,
-                actualModelName,
-                { ...options, skipUsageCount: true }
-            );
-        }
-        
-        if (selectedResult) {
-            const { config: selectedProviderConfig, actualProviderType: selectedType, isFallback: fallbackUsed, actualModel: fallbackModel } = selectedResult;
-            
-            // 合并选中的提供者配置到当前请求的 config 中
-            serviceConfig = deepmerge(config, selectedProviderConfig);
-            delete serviceConfig.providerPools;
-            
-            actualProviderType = selectedType;
-            isFallback = fallbackUsed;
-            selectedUuid = selectedProviderConfig.uuid;
-            actualModel = fallbackModel || actualModelName;
-            
-            // 如果发生了 fallback，需要更新 MODEL_PROVIDER
-            if (isFallback) {
-                serviceConfig.MODEL_PROVIDER = actualProviderType;
+            if (useAcquire) {
+                 // 我们需要一个支持 Fallback 的 acquireSlot
+                 selectedResult = await providerPoolManager.acquireSlotWithFallback(
+                    config.MODEL_PROVIDER,
+                    actualModelName,
+                    options
+                );
+            } else {
+                selectedResult = await providerPoolManager.selectProviderWithFallback(
+                    config.MODEL_PROVIDER,
+                    actualModelName,
+                    { ...options, skipUsageCount: true }
+                );
             }
-        } else {
-            const errorMsg = `[API Service] No healthy provider found in pool for ${config.MODEL_PROVIDER}${actualModelName ? ` supporting model: ${actualModelName}` : ''}`;
-            logger.error(errorMsg);
-            throw new Error(errorMsg);
+        
+            if (selectedResult) {
+                const { config: selectedProviderConfig, actualProviderType: selectedType, isFallback: fallbackUsed, actualModel: fallbackModel } = selectedResult;
+            
+                slotLease = selectedProviderConfig._slotLease || null;
+                options.signal?.throwIfAborted();
+                // 合并选中的提供者配置到当前请求的 config 中
+                serviceConfig = deepmerge(config, selectedProviderConfig);
+                delete serviceConfig.providerPools;
+            
+                actualProviderType = selectedType;
+                isFallback = fallbackUsed;
+                selectedUuid = selectedProviderConfig.uuid;
+                actualModel = fallbackModel || actualModelName;
+            
+                // 如果发生了 fallback，需要更新 MODEL_PROVIDER
+                if (isFallback) {
+                    serviceConfig.MODEL_PROVIDER = actualProviderType;
+                }
+            } else {
+                const errorMsg = `[API Service] No healthy provider found in pool for ${config.MODEL_PROVIDER}${actualModelName ? ` supporting model: ${actualModelName}` : ''}`;
+                logger.error(errorMsg);
+                throw new Error(errorMsg);
+            }
+        } else if (effectiveProvider === MODEL_PROVIDER.AUTO && actualModelName) {
+            // 如果在 AUTO 模式下依然没能解析出具体提供商，则报错
+            throw new Error(`[API Service] Auto-routing failed: Model name must include a provider prefix (e.g., 'provider:model'). Received: '${actualModelName}'`);
         }
-    } else if (effectiveProvider === MODEL_PROVIDER.AUTO && actualModelName) {
-        // 如果在 AUTO 模式下依然没能解析出具体提供商，则报错
-        throw new Error(`[API Service] Auto-routing failed: Model name must include a provider prefix (e.g., 'provider:model'). Received: '${actualModelName}'`);
+    
+        options.signal?.throwIfAborted();
+        const service = getServiceAdapter(serviceConfig);
+    
+        return {
+            service,
+            slotLease,
+            serviceConfig,
+            actualProviderType,
+            isFallback,
+            uuid: selectedUuid,
+            actualModel
+        };
+    } catch (error) {
+        slotLease?.release();
+        throw error;
     }
-    
-    const service = getServiceAdapter(serviceConfig);
-    
-    return {
-        service,
-        serviceConfig,
-        actualProviderType,
-        isFallback,
-        uuid: selectedUuid,
-        actualModel
-    };
 }
 
 /**

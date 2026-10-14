@@ -1,3 +1,4 @@
+import { acquireProviderSlot, releaseProviderSlot } from './provider-slot-lease.js';
 import * as fs from 'fs';
 import { getServiceAdapter, getRegisteredProviders, invalidateServiceAdapter } from './adapter.js';
 import logger from '../utils/logger.js';
@@ -873,15 +874,13 @@ export class ProviderPoolManager {
                     providerConfig.lastErrorMessage = providerConfig.lastErrorMessage || null;
                     providerConfig.customName = providerConfig.customName || null;
 
+                    const slotState = existing ? existing.state : { activeCount: 0, waitingCount: 0, queue: [] };
+                    Object.defineProperty(slotState, '_slotConfig', { value: providerConfig, writable: true, configurable: true });
                     this.providerStatus[providerType].push({
                         config: providerConfig,
                         uuid: providerConfig.uuid, // Still keep uuid at the top level for easy access
                         type: providerType, // 保存 providerType 引用
-                        state: existing ? existing.state : {
-                            activeCount: 0,
-                            waitingCount: 0,
-                            queue: []
-                        }
+                        state: slotState
                     });
                 } catch (nodeError) {
                     logger.error(`[ProviderPoolManager] Error initializing node for ${providerType}: ${nodeError.message}`);
@@ -901,96 +900,18 @@ export class ProviderPoolManager {
      * @param {object} options 
      */
     async acquireSlot(providerType, requestedModel = null, options = {}) {
-        // 使用 selectProvider 进行初次选择（评分逻辑已经包含了并发考虑）
+        options.signal?.throwIfAborted();
         const selectedConfig = await this.selectProvider(providerType, requestedModel, { ...options, skipUsageCount: true });
-        
-        if (!selectedConfig) {
-            return null;
-        }
-
+        options.signal?.throwIfAborted();
+        if (!selectedConfig) return null;
         const provider = this._findProvider(providerType, selectedConfig.uuid);
-        if (!provider) return selectedConfig;
-
-        const config = provider.config;
-        const state = provider.state;
-        const concurrencyLimit = parseInt(config.concurrencyLimit || 0);
-        const queueLimit = parseInt(config.queueLimit || 0);
-
-        // 如果没有限制，直接增加活跃计数并返回
-        if (concurrencyLimit <= 0) {
-            state.activeCount++;
-            return config;
-        }
-
-        // 检查是否在并发限制内
-        if (state.activeCount < concurrencyLimit) {
-            state.activeCount++;
-            return config;
-        }
-
-        // 超过并发限制，尝试进入队列
-        if (queueLimit > 0 && state.waitingCount < queueLimit) {
-            this._log('info', `[Concurrency] Node ${this._getDisplayName(config)} busy (${state.activeCount}/${concurrencyLimit}), enqueuing request (queue: ${state.waitingCount + 1}/${queueLimit})`);
-            
-            state.waitingCount++;
-            try {
-                // 等待释放信号
-                await new Promise((resolve, reject) => {
-                    // 设置较短的超时用于测试验证，或者由外部控制
-                    const timeoutMs = options.queueTimeout || 300000;
-                    const timeout = setTimeout(() => {
-                        const idx = state.queue.indexOf(handler);
-                        if (idx !== -1) {
-                            state.queue.splice(idx, 1);
-                            reject(new Error(`Queue timeout after ${timeoutMs/1000}s`));
-                        }
-                    }, timeoutMs);
-
-                    const handler = () => {
-                        clearTimeout(timeout);
-                        resolve();
-                    };
-                    state.queue.push(handler);
-                });
-            } finally {
-                state.waitingCount--;
-            }
-
-            // 获得信号后，增加活跃计数
-            state.activeCount++;
-            return config;
-        }
-
-        // 队列也满了
-        this._log('warn', `[Concurrency] Node ${this._getDisplayName(config)} full capacity (${state.activeCount}/${concurrencyLimit}, queue: ${state.waitingCount}/${queueLimit}), returning 429`);
-        const error = new Error('Too many requests: account concurrency limit and queue reached');
-        error.status = 429;
-        error.code = 429;
-        throw error;
+        return provider ? await acquireProviderSlot(provider, options) : selectedConfig;
     }
 
-    /**
-     * 释放提供商插槽
-     */
     releaseSlot(providerType, uuid) {
         if (!providerType || !uuid) return;
-        
         const provider = this._findProvider(providerType, uuid);
-        if (!provider) return;
-
-        const state = provider.state;
-        if (state.activeCount > 0) {
-            state.activeCount--;
-        }
-
-        // 如果队列中有等待的任务，释放下一个
-        if (state.queue && state.queue.length > 0) {
-            const next = state.queue.shift();
-            if (next) {
-                // 异步触发
-                setImmediate(next);
-            }
-        }
+        if (provider) releaseProviderSlot(provider);
     }
 
     /**
