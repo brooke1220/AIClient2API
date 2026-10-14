@@ -31,6 +31,7 @@
 | `KIRO_REQUIRE_STOP_REASON` | false | 严格检查终止 metadata。旧端点可能没有该字段，先观察真实流再开启；明确异常/残帧在关闭时也会失败。 |
 | `KIRO_MAX_PAYLOAD_BYTES` | 10485760 | 最终上游 JSON 的应用层字节预算；需按实际端点验证后调整。超限返回 413，不标记凭证不健康。 |
 | `KIRO_TRIM_HISTORY` | false | 显式开启后才能裁剪较旧的完整对话轮次；保留开头的 priming 对话和最近轮次，修复孤立工具结果，并添加省略提示。不会截短当前输入或工具参数，仍超限则返回 413。 |
+| `KIRO_HISTORY_IMAGE_MESSAGE_WINDOW` | 5 | 保留图片的历史消息距末尾最大距离，按过滤空消息、合并同角色消息后的序列计算，含 assistant 消息，不等于用户轮次数。`0` 只省略历史图片，当前消息图片仍保留；无效值回退默认。超窗口的图片留省略说明，不静默丢弃。 |
 | `KIRO_ENABLE_INFERENCE_CONFIG` | true | 将 `max_tokens`、`temperature`、`top_p` 映射到上游 `inferenceConfig`；保留 `temperature=0`。不支持该字段的自定义端点可关闭。参数仍需合法。 |
 | `KIRO_DYNAMIC_MODELS` | false | 开启账号隔离的动态模型列表和能力读取；关闭时继续使用配置模型列表。 |
 | `KIRO_MODEL_CACHE_TTL_MS` | 300000 | 动态元数据缓存 TTL；失败回退最多缓存 30 秒。0 禁用结果缓存，仍合并同时发起的相同读取。 |
@@ -52,5 +53,7 @@
 4. 分别验证 Q、CodeWhisperer、自定义端点对 `inferenceConfig` 的实际支持；不支持时关闭该开关。
 5. API Key runtime 和动态发现单独小流量启用，确认账号权限、模型 ID、区域和端点契约。
 6. 观察首事件延迟、排队长度、活跃插槽、取消耗时、完整性错误、背压等待与请求体拒绝率。
+
+7. 分别通过 Claude `/v1/messages` 和 Responses `/v1/responses` 验收截图工具返回的图片。Responses 的 `function_call_output.output` 应使用包含 `input_text` / `input_image` 的结构化数组，而不是含图片 JSON 的字符串；确认单图、文本混合、并行工具图片编号、历史图片窗口和流式/非流式发送。超限请求应返回 413，Kiro 的远程 URL 图片、文件 ID 图片和 `input_file` 工具输出应有明确的未转发说明，且二进制数据不能出现在工具结果文本中。
 
 自动测试使用本地模拟流和临时 HTTP 服务，不代表已完成真实上游或生产代理验收。

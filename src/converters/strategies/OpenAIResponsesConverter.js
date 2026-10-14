@@ -27,6 +27,10 @@ import {
     generateResponseCompleted
 } from '../../providers/openai/openai-responses-core.mjs';
 
+const RESPONSES_TOOL_OUTPUT_CONTENT_TYPES = new Set([
+    'input_text', 'output_text', 'text', 'input_image', 'image_url', 'input_file'
+]);
+
 /**
  * OpenAI Responses API 转换器类
  * 支持 OpenAI Responses 格式与 OpenAI、Claude、Gemini 之间的转换
@@ -427,10 +431,10 @@ export class OpenAIResponsesConverter extends BaseConverter {
     }
 
     _dataUrlToClaudeImage(url) {
-        if (!url || typeof url !== 'string' || !url.startsWith('data:')) {
+        if (typeof url !== 'string' || !/^data:/i.test(url)) {
             return null;
         }
-        const match = url.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/s);
+        const match = url.match(/^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/is);
         if (!match) {
             return null;
         }
@@ -517,6 +521,33 @@ export class OpenAIResponsesConverter extends BaseConverter {
         }
         if (typeof output === 'string') {
             return output;
+        }
+        // Only typed Responses content arrays are multimodal. Preserve legacy
+        // JSON objects/arrays and never parse a caller's text as image content.
+        if (Array.isArray(output) && output.some(part => RESPONSES_TOOL_OUTPUT_CONTENT_TYPES.has(part?.type))) {
+            return output.flatMap(part => {
+                if (part?.type === 'input_image' || part?.type === 'image_url') {
+                    const url = this._extractResponsesImageUrl(part);
+                    const image = this._dataUrlToClaudeImage(url);
+                    if (image) return [image];
+                    // Retain URL sources for providers that support them; Kiro's
+                    // content converter reports them as unsupported without fetching.
+                    if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
+                        return [{ type: 'image', source: { type: 'url', url } }];
+                    }
+                    return [{ type: 'text', text: '[Tool output image was not forwarded: provide a base64 data URL or an HTTP(S) image URL; file_id images are not supported.]' }];
+                }
+                if (part?.type === 'input_file') {
+                    return [{ type: 'text', text: '[Tool output file was not forwarded: file inputs are not supported in tool results.]' }];
+                }
+                if (part?.type === 'input_text' || part?.type === 'output_text' || part?.type === 'text' || typeof part === 'string') {
+                    return this._responsesContentToClaudeBlocks(typeof part === 'string' ? part : [part]);
+                }
+                // Do not serialize an unknown/binary block alongside valid images
+                // into text: acknowledge the unsupported part without its data.
+                const kind = typeof part?.type === 'string' ? part.type.slice(0, 64) : 'unknown';
+                return [{ type: 'text', text: `[Unsupported tool output content block "${kind}" was not forwarded.]` }];
+            });
         }
         return JSON.stringify(output);
     }

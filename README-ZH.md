@@ -474,7 +474,7 @@ docker compose up -d
 4. **重要提示**：Kiro 服务使用政策已更新，请访问官方网站查看最新使用限制和条款
 
 #### Kiro 扩展思考 (Claude 模型)
-AIClient2API 在使用路由到 `claude-kiro-oauth` 的 Claude 兼容请求 (`/v1/messages`) 或 OpenAI 兼容请求 (`/v1/chat/completions`) 时支持 Kiro 扩展思考。
+AIClient2API 在使用路由到 `claude-kiro-oauth` 的 Claude 兼容请求 (`/v1/messages`) 或 OpenAI 兼容请求 (`/v1/chat/completions`) 时支持思考请求适配。默认 `KIRO_THINKING_PROMPT_MODE=auto`：只有显式原生 thinking 控制才会替代 XML 启用提示，不能仅凭存在 effort 字段就判定思考已启用。当前模型映射只构造 effort，因此 Claude 的显式思考请求继续保留兼容 XML；不向其他模型注入 Claude XML。自适应请求的兼容 XML 与结构化 effort 使用统一解析后的强度来源，保留原有 XML 格式，不擅自试验新的启用格式。结构化 effort 不等同于原生 extended-thinking 开关或独立预算，须按实际模型验收。
 
 **Claude 兼容接口 (`/v1/messages`)**:
 ```bash
@@ -510,8 +510,39 @@ curl http://localhost:3000/claude-kiro-oauth/v1/chat/completions \
 - OpenAI: `"extra_body.anthropic.thinking": { "type": "adaptive", "effort": "high" }`
 
 注意：
-- `budget_tokens` 被限制在 `[1024, 24576]` 之间（如果省略或无效，默认值为 `20000`）。
+- XML 兼容路径中的 `budget_tokens` 被限制在 `[1024, 24576]` 之间（如果省略或无效，默认值为 `20000`）。这是提示词文本，不代表上游保证执行的原生思考预算。`legacy` 可显式沿用此路径，`off` 仅关闭网关添加的 XML，不删除客户端指令。
 - Token 获取/刷新/池轮换机制保持不变。
+
+#### Kiro 提示词与工具说明策略
+
+默认不再加入固定身份、禁止讨论 Kiro 或要求所有写操作拆小的全局提示词。客户端 system 保留；`KIRO_IDENTITY_PROMPT` 默认为空，仅在显式配置时追加自定义文案。外部提示词仍受 `SYSTEM_PROMPT_MODE` 控制：`append` 保留入站 system，`overwrite` 仍会覆盖它；配置示例已对齐服务默认的 `append`。
+
+超过 9216 UTF-8 字节的工具说明默认完整移到引用文档区，工具字段保留稳定引用；工具名、参数结构和缓存点不变，最终请求仍受字节预算约束，超限返回 413 而不是静默删文本。大文件写入/编辑工具才获得条件性参数大小提醒；小修改保持单次调用，提醒不改变原子性和工具语义。
+
+| 配置 | 默认值 | 说明 |
+| --- | --- | --- |
+| `KIRO_IDENTITY_PROMPT` | 空字符串 | 显式追加自定义身份文案；不再硬编码模型来源或替换 `{{identity}}`。 |
+| `KIRO_TOOL_DESCRIPTION_MODE` | `reference` | 超长说明完整转移并引用；`error` 则返回 400。没有静默截断模式。 |
+| `KIRO_TOOL_SIZE_HINTS` | `true` | 仅向同时具备文件修改、内容参数信号的工具增加条件性提醒。 |
+| `KIRO_TOOL_ARG_SOFT_LIMIT_BYTES` | `16384` | 大参数提醒的参考大小（UTF-8 字节），不是上游硬限制，也不是工具参数裁剪规则。 |
+| `KIRO_THINKING_PROMPT_MODE` | `auto` | `auto` 保留必要的思考启用 XML，不把 effort 当启用证据；`legacy` 强制兼容 XML；`off` 不添加网关 XML，但不删除客户端指令或结构化 effort。 |
+| `KIRO_TRUNCATION_RECOVERY` | `true` | 仅对网关实际观察到 `max_tokens` 正常结束的纯正文响应，在匹配的后续历史里补充截断说明。不猜测普通 EOF，不修复或重放工具调用。 |
+
+Claude 强度来源的优先级为 `reasoning_effort` > `output_config.effort` > 已启用思考中的 `thinking.effort` > 模型默认值。空白值不遮蔽下一来源；不支持的强度继续按已有模型规则回退，不向未支持的模型添加扩展字段。
+
+截断记录按服务实例隔离，只保留会话输入/输出摘要和到期时间，最多 64 条、10 分钟。模型、客户端 system、工具定义、完整历史及可用的用户/会话标识必须匹配。账号轮换或历史压缩可能无法匹配，此时不注入；没有向所有会话广播通知。 相同输入和正文的后续重试若以 `end_turn` 或 `stop_sequence` 完整结束，会删除对应旧截断标记；未知终止、取消和残缺响应不会清除证据，也不会清除其他会话或正文分支。详见 [Kiro 提示词策略与验收](docs/KIRO_PROMPT_POLICY.md)。
+
+#### Kiro 历史图片保留
+
+在 `configs/config.json` 中设置 `KIRO_HISTORY_IMAGE_MESSAGE_WINDOW`（默认 `5`），或在 Kiro 账号池节点中覆盖它。该值是非负整数，表示保留图片的历史消息距末尾的最大距离，按过滤空消息、合并同角色消息后的消息序列计算，包含 assistant 消息，不等同于用户轮次数量。设置 `0` 只省略历史图片，当前消息的图片仍会保留；无效值使用默认值。
+
+工具结果里的 base64 图片会放到同一条消息的图片字段，工具结果文本注明对应图片编号；超出窗口的图片会留下省略说明。URL 图片不会被自动下载；不支持的图片来源和内容块会明确注明未透传，避免静默丢失。工具结果的 `is_error: true` 会转换为 `status: "error"`。
+
+该工具图片能力覆盖 Claude 原生 `/v1/messages` 的 `tool_result`，以及 Responses `/v1/responses` 转 Kiro 时 `function_call_output.output` 中的结构化内容数组：`input_text` 保留为文本，`input_image.image_url` 中的 base64 data URL 保留为图片，不会序列化成含 base64 的工具结果文本。原有字符串、JSON 对象及非内容块数组仍按原有文本方式处理，也不会从 JSON 字符串中自动解析图片。Kiro 不下载远程 URL 图片；文件 ID 形式图片和 `input_file` 工具输出会留下明确的未转发说明。
+
+历史首条消息前面没有 assistant 轮次，其工具结果无法与 `toolUses` 配对，会按上游要求降级为 `[Earlier tool result omitted from history]` 文本内联（保留失败状态与图片编号说明），而不是作为孤立 `toolResults` 发出。
+
+图片 token 计数仍是每张已透传图片约 1600 token 的本地粗估，不是上游实际用量；无法透传的图片不计入。日志 `Converted request images` 在请求含图片时记录最终保留的图片数量和 base64 字节数，不输出图片内容；可结合排队、上游首事件和首个可见文本日志分析延迟。提高窗口可能增加请求负载，默认值保持不变。
 
 #### Codex OAuth 配置
 1. **生成授权**：在 Web UI 的"提供商池"或"配置管理"页面，点击 Codex 的"生成授权"按钮

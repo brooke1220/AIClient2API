@@ -30,19 +30,39 @@ export function buildKiroInferenceConfig(body, enabled = true) {
 
 function byteSize(value) { return Buffer.byteLength(JSON.stringify(value)); }
 
+function toolResultText(result) {
+    return typeof result.content === 'string' ? result.content : (result.content || []).map(part => part.text || '').join('\n');
+}
+
+/**
+ * Fold tool results that have no matching toolUses into plain message text.
+ * Kiro rejects orphaned results, so a text fallback is the only lossless option;
+ * it preserves failure status plus any image-association/omission notes.
+ */
+export function inlineOrphanToolResults(content, results) {
+    let text = content || '';
+    for (const result of results) {
+        const body = toolResultText(result);
+        if (!body) continue;
+        const statusNote = result.status === 'error' ? ' (error)' : '';
+        const note = `[Earlier tool result${statusNote} omitted from history]\n${body}`;
+        text = text ? `${text}\n${note}` : note;
+    }
+    return text;
+}
+
 function repairTools(history, current) {
     const repair = (message, previous) => {
         const results = message?.userInputMessageContext?.toolResults;
         if (!results) return;
         const ids = new Set(previous?.assistantResponseMessage?.toolUses?.map(tool => tool.toolUseId) || []);
         const kept = [];
+        const orphaned = [];
         for (const result of results) {
             if (ids.has(result.toolUseId)) kept.push(result);
-            else {
-                const text = typeof result.content === 'string' ? result.content : (result.content || []).map(part => part.text || '').join('\n');
-                if (text) message.content = `${message.content || ''}\n[Earlier tool result omitted from history]\n${text}`;
-            }
+            else orphaned.push(result);
         }
+        if (orphaned.length) message.content = inlineOrphanToolResults(message.content, orphaned);
         if (kept.length) message.userInputMessageContext.toolResults = kept;
         else delete message.userInputMessageContext.toolResults;
     };

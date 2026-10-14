@@ -23,9 +23,14 @@ function normalizeModel(model) {
     return String(model || '').toLowerCase().replace(/^[^:]+:/, '').replace('gpt-5_6', 'gpt-5.6');
 }
 
-function normalizeExplicitEffort(outputConfig, reasoningEffort) {
-    const effort = reasoningEffort || outputConfig?.effort;
-    return typeof effort === 'string' ? effort.toLowerCase().trim() : '';
+/** Existing explicit fields win; active thinking.effort is the compatibility fallback. */
+export function resolveKiroRequestedEffort(thinking, outputConfig = null, reasoningEffort = null) {
+    const type = String(thinking?.type || '').toLowerCase().trim();
+    const thinkingEffort = type === 'enabled' || type === 'adaptive' ? thinking?.effort : null;
+    for (const effort of [reasoningEffort, outputConfig?.effort, thinkingEffort]) {
+        if (typeof effort === 'string' && effort.trim()) return effort.toLowerCase().trim();
+    }
+    return '';
 }
 
 /**
@@ -34,9 +39,11 @@ function normalizeExplicitEffort(outputConfig, reasoningEffort) {
  */
 export function buildKiroAdditionalModelRequestFields(model, thinking, outputConfig = null, reasoningEffort = null) {
     const normalizedModel = normalizeModel(model);
-    const explicitEffort = normalizeExplicitEffort(outputConfig, reasoningEffort);
-
     if (GPT_EFFORT_MODELS.has(normalizedModel)) {
+        // Keep the pre-existing GPT behavior; the new thinking.effort fallback
+        // belongs to Claude compatibility, not another model family's namespace.
+        const value = reasoningEffort || outputConfig?.effort;
+        const explicitEffort = typeof value === 'string' ? value.toLowerCase().trim() : '';
         let effort = '';
         if (thinking?.type === 'disabled') {
             effort = 'none';
@@ -52,10 +59,12 @@ export function buildKiroAdditionalModelRequestFields(model, thinking, outputCon
         return undefined;
     }
 
+    const requestedEffort = resolveKiroRequestedEffort(thinking, outputConfig, reasoningEffort);
+    const thinkingType = String(thinking?.type || '').toLowerCase().trim();
     let effort = '';
-    if (explicitEffort) {
-        effort = supportedLevels.has(explicitEffort) ? explicitEffort : 'medium';
-    } else if (thinking?.type === 'enabled' || thinking?.type === 'adaptive') {
+    if (requestedEffort) {
+        effort = supportedLevels.has(requestedEffort) ? requestedEffort : 'medium';
+    } else if (thinkingType === 'enabled' || thinkingType === 'adaptive') {
         effort = 'medium';
     }
 

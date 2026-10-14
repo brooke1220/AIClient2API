@@ -514,6 +514,18 @@ Notes:
 - `budget_tokens` is clamped to `[1024, 24576]` (default `20000` if omitted/invalid).
 - Token acquisition/refresh/pool rotation is unchanged.
 
+#### Kiro History Image Retention
+
+Set `KIRO_HISTORY_IMAGE_MESSAGE_WINDOW` in `configs/config.json` (default `5`), or override it on a Kiro pool node. The value is a non-negative integer: the maximum distance from the end of the conversation at which a historical message still keeps its images. Distance is measured on the message sequence after empty turns are dropped and same-role messages are merged, and it counts assistant messages, so it is not the same as a count of user turns. `0` omits history images only; images on the current message are still sent. Invalid values fall back to the default.
+
+Base64 images inside tool results are moved to the enclosing message's image field, and the tool result text records which image numbers they correspond to. Images beyond the window leave an omission note behind. URL images are never downloaded: unsupported image sources and content blocks are explicitly noted as not forwarded rather than silently dropped. A tool result with `is_error: true` becomes `status: "error"`.
+
+Tool images are supported for native Claude `/v1/messages` `tool_result` blocks and for structured content arrays in Responses `/v1/responses` `function_call_output.output` when converting to Kiro. `input_text` stays text, and base64 data URLs in `input_image.image_url` stay image blocks instead of becoming base64-filled tool-result text. Existing strings, JSON objects, and non-content-block arrays retain their legacy text handling; JSON strings are not automatically parsed for images. Kiro does not download remote image URLs. File-ID images and `input_file` tool outputs leave explicit not-forwarded notes.
+
+The first history message has no preceding assistant turn, so a tool result there cannot be paired with any `toolUses`. Upstream rejects that shape, so it is inlined as `[Earlier tool result omitted from history]` text (preserving failure status and image-number notes) instead of being sent as an orphaned `toolResults` entry.
+
+Image token counts remain a local approximation of roughly 1600 tokens per forwarded image, not actual upstream usage; images that cannot be forwarded are not counted. The `Converted request images` log records the final retained image count and base64 byte size without logging image content, and pairs well with the queueing, upstream-first-event and first-visible-text logs when investigating latency. Raising the window may increase request size; the default is unchanged.
+
 #### Codex OAuth Configuration
 1. **Generate Authorization**: On the Web UI "Provider Pools" or "Configuration" page, click the "Generate Authorization" button for Codex
 2. **Browser Login**: The system opens the OpenAI Codex authorization page to complete OAuth login

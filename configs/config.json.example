@@ -4,7 +4,7 @@
     "HOST": "0.0.0.0",
     "MODEL_PROVIDER": "gemini-cli-oauth",
     "SYSTEM_PROMPT_FILE_PATH": "configs/input_system_prompt.txt",
-    "SYSTEM_PROMPT_MODE": "overwrite",
+    "SYSTEM_PROMPT_MODE": "append",
     "SYSTEM_PROMPT_REPLACEMENTS": [
         { "old": "Old text to replace", "new": "New replacement text" },
         { "old": "AI", "new": "Smart Bot" }
@@ -24,7 +24,14 @@
     "KIRO_REQUIRE_STOP_REASON": false,
     "KIRO_MAX_PAYLOAD_BYTES": 10485760,
     "KIRO_TRIM_HISTORY": false,
+    "KIRO_HISTORY_IMAGE_MESSAGE_WINDOW": 5,
     "KIRO_ENABLE_INFERENCE_CONFIG": true,
+    "KIRO_IDENTITY_PROMPT": "",
+    "KIRO_TOOL_DESCRIPTION_MODE": "reference",
+    "KIRO_TOOL_SIZE_HINTS": true,
+    "KIRO_TOOL_ARG_SOFT_LIMIT_BYTES": 16384,
+    "KIRO_THINKING_PROMPT_MODE": "auto",
+    "KIRO_TRUNCATION_RECOVERY": true,
     "KIRO_DYNAMIC_MODELS": false,
     "KIRO_MODEL_CACHE_TTL_MS": 300000,
     "KIRO_API_KEY_RUNTIME_ENABLED": false,

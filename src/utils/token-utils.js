@@ -1,6 +1,35 @@
 import { countTokens } from '@anthropic-ai/tokenizer';
 import logger from './logger.js';
 
+// A heuristic, not provider-reported usage; actual image tokens depend on size/model.
+export const ESTIMATED_IMAGE_TOKENS = 1600;
+
+/**
+ * Remote URLs are never fetched on the way upstream, so charging for them would
+ * bill tokens for an image the provider never sees. Only inline base64 counts.
+ */
+function hasInlineImageData(block) {
+    if (block.type === 'image') return typeof block.source?.data === 'string' && block.source.data.trim() !== '';
+    const url = typeof block.image_url === 'string' ? block.image_url : block.image_url?.url;
+    return typeof url === 'string' && /^data:[^;,]*;base64,./i.test(url);
+}
+
+function estimateMediaTokens(content) {
+    if (!Array.isArray(content)) return 0;
+    let tokens = 0;
+    for (const block of content) {
+        if (block?.type === 'image' || block?.type === 'image_url') {
+            if (hasInlineImageData(block)) tokens += ESTIMATED_IMAGE_TOKENS;
+        } else if (block?.type === 'document' && typeof block.source?.data === 'string') {
+            // Preserve the existing base64-document estimate, including nested results.
+            tokens += Math.ceil(block.source.data.length * 0.75 / 4);
+        } else if (block?.type === 'tool_result') {
+            tokens += estimateMediaTokens(block.content);
+        }
+    }
+    return tokens;
+}
+
 /**
  * Extract text content from message format
  */
@@ -75,6 +104,7 @@ export function countTextTokens(text) {
  */
 export function estimateInputTokens(requestBody) {
     let allText = "";
+    let extraTokens = 0;
     
     // Count system prompt tokens
     if (requestBody.system) {
@@ -108,6 +138,7 @@ else if (t === 'adaptive') {
         for (const message of requestBody.messages) {
             if (message.content) {
                 allText += processContent(message.content);
+                extraTokens += estimateMediaTokens(message.content);
             }
         }
     }
@@ -117,7 +148,7 @@ else if (t === 'adaptive') {
         allText += JSON.stringify(requestBody.tools);
     }
     
-    return countTextTokens(allText);
+    return countTextTokens(allText) + extraTokens;
 }
 
 /**
@@ -138,25 +169,8 @@ export function countTokensAnthropic(requestBody) {
     if (requestBody.messages && Array.isArray(requestBody.messages)) {
         for (const message of requestBody.messages) {
             if (message.content) {
-                if (Array.isArray(message.content)) {
-                    for (const block of message.content) {
-                        if (block.type === 'image') {
-                            // Images have a fixed token cost (approximately 1600 tokens for a typical image)
-                            extraTokens += 1600;
-                        } else if (block.type === 'document') {
-                            // Documents - estimate based on content if available
-                            if (block.source?.data) {
-                                // For base64 encoded documents, estimate tokens
-                                const estimatedChars = block.source.data.length * 0.75; // base64 to bytes ratio
-                                extraTokens += Math.ceil(estimatedChars / 4);
-                            }
-                        } else {
-                            allText += processContent([block]);
-                        }
-                    }
-                } else {
-                    allText += processContent(message.content);
-                }
+                allText += processContent(message.content);
+                extraTokens += estimateMediaTokens(message.content);
             }
         }
     }

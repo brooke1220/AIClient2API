@@ -19,6 +19,12 @@ export function kiroIntegrityError(reason) {
     error.skipErrorCount = true;
     error.isRetryableUpstreamResponseFailure = true;
     error.responseFailureLabel = reason;
+    if (reason === 'truncated trailing event frame') {
+        error.recoveryHint = 'The transport ended with an incomplete event frame. Do not treat this as successful completion or automatically replay earlier tool calls.';
+    } else if (['incomplete tool argument JSON', 'unfinished empty tool call', 'invalid legacy tool argument JSON', 'incomplete legacy tool call'].includes(reason)) {
+        error.recoveryHint = 'Request a smaller valid tool call instead of repairing partial JSON or replaying completed calls. No malformed tool call was emitted.';
+    }
+    if (error.recoveryHint) error.message += ` ${error.recoveryHint}`;
     return error;
 }
 

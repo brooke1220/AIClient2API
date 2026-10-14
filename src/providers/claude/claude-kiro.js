@@ -1,5 +1,8 @@
 import { KiroModelCache } from './kiro-model-cache.js';
-import { buildKiroInferenceConfig, guardKiroPayload, validateKiroGenerationRequest } from './kiro-request-guards.js';
+import { appendKiroPromptAdditions, getKiroIdentityPrompt, prepareKiroToolDescription, shouldUseKiroThinkingPrompt } from './kiro-prompt-policy.js';
+import { KiroTruncationRecovery } from './kiro-truncation-recovery.js';
+import { convertKiroUserContent, getKiroHistoryImageMessageWindow, getKiroImagePayloadStats } from './kiro-message-content.js';
+import { buildKiroInferenceConfig, guardKiroPayload, inlineOrphanToolResults, validateKiroGenerationRequest } from './kiro-request-guards.js';
 import { decodeKiroFrames, kiroIntegrityError, normalizeKiroStopReason } from './kiro-event-stream.js';
 import { KiroToolAssembler } from './kiro-tool-assembler.js';
 import { KiroBracketToolParser } from './kiro-bracket-tools.js';
@@ -26,7 +29,7 @@ import {
 import { configureAxiosProxy, configureTLSSidecar, isTLSSidecarEnabledForProvider, resolveProxyUrlForProvider } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog, getNormalizedErrorResponseText, buildHttpErrorReason, normalizeProviderErrorMessage, createEmptyUpstreamResponseError } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
-import { buildKiroAdditionalModelRequestFields } from './kiro-effort.js';
+import { buildKiroAdditionalModelRequestFields, resolveKiroRequestedEffort } from './kiro-effort.js';
 import {
     resolveKiroRequestProfileArn,
     shouldDiscoverKiroProfile,
@@ -1215,36 +1218,10 @@ async saveCredentialsToFile(filePath, newData) {
         return getContentTextUtil(message);
     }
 
-    _extractTextAndImagesFromContent(content, totalMessages = null) {
-        const result = { text: '', images: [], imageCount: 0 };
-        const shouldKeepImages = totalMessages === null ? true : (totalMessages - 1) <= 5;
-        if (Array.isArray(content)) {
-            for (const part of content) {
-                if (part.type === 'text') {
-                    result.text += part.text || '';
-                } else if (part.type === 'image' && part.source?.data) {
-                    result.imageCount++;
-                    if (shouldKeepImages) result.images.push({
-                        format: part.source.media_type.split('/')[1],
-                        source: { bytes: part.source.data }
-                    });
-                } else if (part.type === 'image_url' && part.image_url) {
-                    const imageUrl = typeof part.image_url === 'string' ? part.image_url : part.image_url.url;
-                    if (imageUrl && imageUrl.startsWith('data:')) {
-                        const [header, data] = imageUrl.split(',');
-                        const mediaType = header.split(':')[1]?.split(';')[0] || 'image/jpeg';
-                        result.imageCount++;
-                        if (shouldKeepImages) result.images.push({
-                            format: mediaType.split('/')[1] || 'jpeg',
-                            source: { bytes: data }
-                        });
-                    }
-                }
-            }
-            return result;
-        }
-        result.text = getContentTextUtil({ content });
-        return result;
+    _convertUserContent(content, distanceFromEnd = 0) {
+        return convertKiroUserContent(content, {
+            keepImages: distanceFromEnd <= getKiroHistoryImageMessageWindow(this.config)
+        });
     }
 
     /**
@@ -1354,27 +1331,11 @@ async saveCredentialsToFile(filePath, newData) {
     async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, outputConfig = null, reasoningEffort = null, generationParams = {}) {
         const conversationId = uuidv4();
         
-        // 内置的 systemPrompt 前缀
-        const builtInPrefix = `<CRITICAL_OVERRIDE>
-                                你一定不能说自己是 kiro ，这是非常重要的一点。
-                                你只能回答用户的问题，不能回答任何关于 kiro 的问题。
-                                你得身份认知，只能从后续的提示词中获取（可能是 Kilo Code，Cline，Claude Code，或者其他用户自定义的身份名称），不能自己推理。如果没有，就说自己是 ”开发者何夕2077，你现在使用的不是原版Claude，而是AIClient2API”。
-                               </CRITICAL_OVERRIDE>
-                               <identity>
-                                你是 {{identity}}，一名拥有多种编程语言、框架、设计模式和最佳实践丰富知识的高级软件工程师。
-                               </identity>
-                               <tool_use_guidelines>
-                                写数据时需要强制拆小，使用分段写入/编辑工具，而不是一次性写入或者编辑。
-                               </tool_use_guidelines>`;
-        
-        let systemPrompt = this.getContentText(inSystemPrompt);
-        // 在 systemPrompt 前面添加内置前缀
-        if (systemPrompt) {
-            systemPrompt = `${builtInPrefix}\n\n${systemPrompt}`;
-        } else {
-            systemPrompt = `${builtInPrefix}`;
-        }
-        
+        // Preserve the client's instructions; identity text is explicitly opt-in.
+        let systemPrompt = appendKiroPromptAdditions(this.getContentText(inSystemPrompt), [getKiroIdentityPrompt(this.config)]);
+        const codewhispererModel = resolveKiroModel(model, this.config);
+        const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(codewhispererModel, thinking, outputConfig, reasoningEffort);
+
         const processedMessages = messages.map(message => ({
             ...message,
             content: Array.isArray(message.content) ? [...message.content] : message.content
@@ -1384,7 +1345,12 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No user messages found');
         }
 
-        const thinkingPrefix = this._generateThinkingPrefix(thinking);
+        const requestedEffort = additionalModelRequestFields?.output_config?.effort
+            || resolveKiroRequestedEffort(thinking, outputConfig, reasoningEffort);
+        const promptThinking = requestedEffort && thinking && typeof thinking === 'object'
+            ? { ...thinking, effort: requestedEffort } : thinking;
+        const thinkingPrefix = shouldUseKiroThinkingPrompt(codewhispererModel, additionalModelRequestFields, this.config)
+            ? this._generateThinkingPrefix(promptThinking) : null;
         if (thinkingPrefix) {
             if (!systemPrompt) {
                 systemPrompt = thinkingPrefix;
@@ -1396,11 +1362,13 @@ async saveCredentialsToFile(filePath, newData) {
         // 判断最后一条消息是否为 assistant,如果是则移除
         const lastMessage = processedMessages[processedMessages.length - 1];
         if (processedMessages.length > 0 && lastMessage.role === 'assistant') {
-            if (lastMessage.content[0].type === "text" && lastMessage.content[0].text === "{") {
+            if (lastMessage.content?.[0]?.type === "text" && lastMessage.content[0].text === "{") {
                 logger.info('[Kiro] Removing last assistant with "{" message from processedMessages');
                 processedMessages.pop();
             }
         }
+
+        if (!processedMessages.length) validateKiroGenerationRequest(model, { messages: processedMessages });
 
         // 移除实质为空的历史轮次（空文本、无工具调用/结果/图片/思考）。这些空轮次以前会被填成
         // "Continue" 污染上下文并撑大请求体。在合并前移除后，相邻同 role 消息会被下面的合并步骤归并，
@@ -1451,10 +1419,10 @@ async saveCredentialsToFile(filePath, newData) {
         processedMessages.length = 0;
         processedMessages.push(...mergedMessages);
 
-        const codewhispererModel = resolveKiroModel(model, this.config);
         const toolNameMaps = buildKiroToolNameMaps(tools);
         
-        // 动态压缩 tools（保留全部工具，但过滤掉 web_search/websearch）
+        // Move oversized descriptions into referenced documentation, never silently truncate.
+        const toolDocumentation = [];
         let toolsContext = {};
         if (tools && Array.isArray(tools) && tools.length > 0) {
             // 过滤掉 web_search 或 websearch 工具（忽略大小写）
@@ -1472,32 +1440,24 @@ async saveCredentialsToFile(filePath, newData) {
                 logger.info('[Kiro] All tools were filtered out, adding placeholder tool');
                 toolsContext = { tools: [buildKiroPlaceholderTool()] };
             } else {
-                const MAX_DESCRIPTION_LENGTH = 9216;
-
-                let truncatedCount = 0;
                 const kiroTools = filteredTools
                     .filter(tool => {
                         // 过滤掉描述为空的工具
-                        if (!tool.description || tool.description.trim() === '') {
+                        if (typeof tool.description !== 'string' || tool.description.trim() === '') {
                             logger.info(`[Kiro] Ignoring tool with empty description: ${tool.name}`);
                             return false;
                         }
                         return true;
                     })
                     .map(tool => {
-                        let desc = tool.description || "";
-                        const originalLength = desc.length;
-                        
-                        if (desc.length > MAX_DESCRIPTION_LENGTH) {
-                            desc = desc.substring(0, MAX_DESCRIPTION_LENGTH) + "...";
-                            truncatedCount++;
-                            logger.info(`[Kiro] Truncated tool '${tool.name}' description: ${originalLength} -> ${desc.length} chars`);
-                        }
-                        
+                        const wireName = toolNameMaps.toKiroName(tool.name);
+                        const { description, documentation } = prepareKiroToolDescription(tool, wireName, this.config);
+                        if (documentation) toolDocumentation.push(documentation);
+
                         const entry = {
                             toolSpecification: {
-                                name: toolNameMaps.toKiroName(tool.name),
-                                description: desc,
+                                name: wireName,
+                                description,
                                 inputSchema: {
                                     json: tool.input_schema || {}
                                 }
@@ -1507,10 +1467,6 @@ async saveCredentialsToFile(filePath, newData) {
                             ? [entry, { cachePoint: { type: "default" } }]
                             : [entry];
                     }).flat();
-                
-                if (truncatedCount > 0) {
-                    logger.info(`[Kiro] Truncated ${truncatedCount} tool description(s) to max ${MAX_DESCRIPTION_LENGTH} chars`);
-                }
 
                 // 检查过滤后是否还有有效工具
                 if (kiroTools.length === 0) {
@@ -1526,27 +1482,37 @@ async saveCredentialsToFile(filePath, newData) {
             toolsContext = { tools: [buildKiroPlaceholderTool()] };
         }
 
+        systemPrompt = appendKiroPromptAdditions(systemPrompt, toolDocumentation);
+        if (toolDocumentation.length) logger.info(`[Kiro] Preserved ${toolDocumentation.length} oversized tool description(s) in referenced documentation`);
+
         const history = [];
         let startIndex = 0;
 
         let prependSystemToCurrentMessage = false;
 
-        // Handle system prompt
-        if (systemPrompt) {
+        // Preserve user-first history and orphan-result repair without relying on
+        // an injected system prefix. Assistant-first resumes need only a placeholder.
+        if (systemPrompt || processedMessages.length > 1 || processedMessages[0].role !== 'user') {
             // Keep single-turn requests as a single current message. Duplicating the same user
             // payload into history and currentMessage can make Kiro reject large agent prompts.
             if (processedMessages[0].role === 'user' && processedMessages.length === 1) {
                 prependSystemToCurrentMessage = true;
             } else if (processedMessages[0].role === 'user') {
-                const firstUserPayload = this._extractTextAndImagesFromContent(processedMessages[0].content, processedMessages.length);
-                const firstImagePlaceholder = firstUserPayload.imageCount > 0 && firstUserPayload.images.length === 0
-                    ? `[此消息包含 ${firstUserPayload.imageCount} 张图片，已在历史记录中省略]`
-                    : '';
+                const firstUserPayload = this._convertUserContent(processedMessages[0].content, processedMessages.length - 1);
+                // history[0] has no preceding assistantResponseMessage, so any tool result here is
+                // orphaned (no matching toolUses) and Kiro rejects that shape. Inline it as text
+                // instead of dropping it, matching the trimming fallback in kiro-request-guards.
+                const firstUserText = firstUserPayload.toolResults.length > 0
+                    ? inlineOrphanToolResults(firstUserPayload.text, firstUserPayload.toolResults)
+                    : firstUserPayload.text;
+                if (firstUserPayload.toolResults.length > 0) {
+                    logger.info(`[Kiro] Inlined ${firstUserPayload.toolResults.length} orphaned tool result(s) from the first history message`);
+                }
                 const firstHistoryMsg = {
                     userInputMessage: {
-                        content: firstUserPayload.text
-                            ? `${systemPrompt}\n\n${firstUserPayload.text}${firstImagePlaceholder ? `\n${firstImagePlaceholder}` : ''}`
-                            : `${systemPrompt}${firstImagePlaceholder ? `\n${firstImagePlaceholder}` : ''}`,
+                        content: systemPrompt
+                            ? (firstUserText ? `${systemPrompt}\n\n${firstUserText}` : systemPrompt)
+                            : (firstUserText || (firstUserPayload.images.length ? 'Image provided.' : 'Continue')),
                         modelId: codewhispererModel,
                         origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR,
                     }
@@ -1561,7 +1527,7 @@ async saveCredentialsToFile(filePath, newData) {
                 // add system prompt as a standalone user message.
                 history.push({
                     userInputMessage: {
-                        content: systemPrompt,
+                        content: systemPrompt || '(empty placeholder)',
                         modelId: codewhispererModel,
                         origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR,
                     }
@@ -1569,80 +1535,24 @@ async saveCredentialsToFile(filePath, newData) {
             }
         }
 
-        // 保留最近 5 条历史消息中的图片
-        const keepImageThreshold = 5;        
+        // 按处理、合并后的消息距末尾距离保留图片，当前消息始终保留。
         for (let i = startIndex; i < processedMessages.length - 1; i++) {
             const message = processedMessages[i];
             // 计算当前消息距离最后一条消息的位置（从后往前数）
             const distanceFromEnd = (processedMessages.length - 1) - i;
-            // 如果距离末尾不超过 5 条，则保留图片
-            const shouldKeepImages = distanceFromEnd <= keepImageThreshold;
             
             if (message.role === 'user') {
-                let userInputMessage = {
-                    content: '',
+                const payload = this._convertUserContent(message.content, distanceFromEnd);
+                const toolResults = payload.toolResults;
+                const userInputMessage = {
+                    content: payload.text,
                     modelId: codewhispererModel,
                     origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
                 };
-                let imageCount = 0;
-                let toolResults = [];
-                let images = [];
-                
-                if (Array.isArray(message.content)) {
-                    for (const part of message.content) {
-                        if (part.type === 'text') {
-                            userInputMessage.content += part.text;
-                        } else if (part.type === 'tool_result') {
-                            toolResults.push({
-                                content: [{ text: this.getContentText(part.content) }],
-                                status: 'success',
-                                toolUseId: part.tool_use_id
-                            });
-                        } else if (part.type === 'image') {
-                            if (shouldKeepImages) {
-                                // 最近 5 条消息内的图片保留原始数据
-                                images.push({
-                                    format: part.source.media_type.split('/')[1],
-                                    source: {
-                                        bytes: part.source.data
-                                    }
-                                });
-                            } else {
-                                // 超过 5 条历史记录的图片只记录数量
-                                imageCount++;
-                            }
-                        }
-                    }
-                } else {
-                    userInputMessage.content = this.getContentText(message);
-                }
-                
-                // 如果有保留的图片，添加到消息中
-                if (images.length > 0) {
-                    userInputMessage.images = images;
-                    logger.info(`[Kiro] Kept ${images.length} image(s) in recent history message (distance from end: ${distanceFromEnd})`);
-                }
-                
-                // 如果有被替换的图片，添加占位符说明
-                if (imageCount > 0) {
-                    const imagePlaceholder = `[此消息包含 ${imageCount} 张图片，已在历史记录中省略]`;
-                    userInputMessage.content = userInputMessage.content
-                        ? `${userInputMessage.content}\n${imagePlaceholder}`
-                        : imagePlaceholder;
-                    logger.info(`[Kiro] Replaced ${imageCount} image(s) with placeholder in old history message (distance from end: ${distanceFromEnd})`);
-                }
-                
-                if (toolResults.length > 0) {
-                    // 去重 toolResults - Kiro API 不接受重复的 toolUseId
-                    const uniqueToolResults = [];
-                    const seenIds = new Set();
-                    for (const tr of toolResults) {
-                        if (!seenIds.has(tr.toolUseId)) {
-                            seenIds.add(tr.toolUseId);
-                            uniqueToolResults.push(tr);
-                        }
-                    }
-                    userInputMessage.userInputMessageContext = { toolResults: uniqueToolResults };
+                if (payload.images.length > 0) userInputMessage.images = payload.images;
+                if (toolResults.length > 0) userInputMessage.userInputMessageContext = { toolResults };
+                if (payload.omittedImageCount > 0 || payload.unsupportedImageCount > 0) {
+                    logger.info(`[Kiro] History images: ${payload.images.length} kept, ${payload.omittedImageCount} omitted, ${payload.unsupportedImageCount} unsupported (distance from end: ${distanceFromEnd})`);
                 }
 
                 // 兜底处理空 content（正常情况下空轮次已在合并前被过滤掉）：
@@ -1708,7 +1618,6 @@ async saveCredentialsToFile(filePath, newData) {
         let currentMessage = processedMessages[processedMessages.length - 1];
         let currentContent = '';
         let currentToolResults = [];
-        let currentToolUses = [];
         let currentImages = [];
 
         // 如果最后一条消息是 assistant，需要将其加入 history，然后创建一个 user 类型的 currentMessage
@@ -1767,39 +1676,15 @@ async saveCredentialsToFile(filePath, newData) {
                 }
             }
             
-            // 处理 user 消息
-            if (Array.isArray(currentMessage.content)) {
-                for (const part of currentMessage.content) {
-                    if (part.type === 'text') {
-                        currentContent += part.text;
-                    } else if (part.type === 'tool_result') {
-                        currentToolResults.push({
-                            content: [{ text: this.getContentText(part.content) }],
-                            status: 'success',
-                            toolUseId: part.tool_use_id
-                        });
-                    } else if (part.type === 'tool_use') {
-                        currentToolUses.push({
-                            input: this._sanitizeToolInput(part.input),
-                            name: toolNameMaps.toKiroName(part.name),
-                            toolUseId: part.id
-                        });
-                    } else if (part.type === 'image') {
-                        currentImages.push({
-                            format: part.source.media_type.split('/')[1],
-                            source: {
-                                bytes: part.source.data
-                            }
-                        });
-                    }
-                }
-            } else {
-                currentContent = this.getContentText(currentMessage);
-            }
+            const payload = this._convertUserContent(currentMessage.content);
+            currentContent = payload.text;
+            currentToolResults = payload.toolResults;
+            currentImages = payload.images;
 
-            // Kiro API 要求 content 不能为空，即使有 toolResults
-            if (!currentContent) {
-                currentContent = currentToolResults.length > 0 ? 'Tool results provided.' : 'Continue';
+            // Kiro API 要求 content 非空，即使本轮只有工具结果或图片。
+            if (!currentContent.trim()) {
+                currentContent = currentToolResults.length > 0 ? 'Tool results provided.'
+                    : currentImages.length > 0 ? 'Image provided.' : 'Continue';
             }
 
             if (prependSystemToCurrentMessage) {
@@ -1807,6 +1692,24 @@ async saveCredentialsToFile(filePath, newData) {
                     ? `${systemPrompt}\n\n${currentContent}`
                     : systemPrompt;
             }
+        }
+
+        // A resumed/single-turn request may begin with tool results but no matching
+        // assistant tool use. Keep their content and image references as plain text.
+        if (currentToolResults.length) {
+            const previousIds = new Set(history.at(-1)?.assistantResponseMessage?.toolUses?.map(tool => tool.toolUseId) || []);
+            const orphaned = currentToolResults.filter(result => !previousIds.has(result.toolUseId));
+            if (orphaned.length) {
+                currentContent = inlineOrphanToolResults(currentContent, orphaned);
+                currentToolResults = currentToolResults.filter(result => previousIds.has(result.toolUseId));
+            }
+        }
+
+        if (this.config.KIRO_TRUNCATION_RECOVERY !== false) {
+            const notice = this._truncationRecovery?.getNotice(codewhispererModel, {
+                ...generationParams, messages, system: inSystemPrompt, tools
+            });
+            if (notice) currentContent = appendKiroPromptAdditions(currentContent, [notice]);
         }
 
         const request = {
@@ -1839,16 +1742,7 @@ async saveCredentialsToFile(filePath, newData) {
         // 构建 userInputMessageContext，只包含非空字段
         const userInputMessageContext = {};
         if (currentToolResults.length > 0) {
-            // 去重 toolResults - Kiro API 不接受重复的 toolUseId
-            const uniqueToolResults = [];
-            const seenToolUseIds = new Set();
-            for (const tr of currentToolResults) {
-                if (!seenToolUseIds.has(tr.toolUseId)) {
-                    seenToolUseIds.add(tr.toolUseId);
-                    uniqueToolResults.push(tr);
-                }
-            }
-            userInputMessageContext.toolResults = uniqueToolResults;
+            userInputMessageContext.toolResults = currentToolResults;
         }
         if (Object.keys(toolsContext).length > 0 && toolsContext.tools) {
             userInputMessageContext.tools = toolsContext.tools;
@@ -1861,12 +1755,6 @@ async saveCredentialsToFile(filePath, newData) {
 
         request.conversationState.currentMessage.userInputMessage = userInputMessage;
 
-        const additionalModelRequestFields = buildKiroAdditionalModelRequestFields(
-            codewhispererModel,
-            thinking,
-            outputConfig,
-            reasoningEffort
-        );
         if (additionalModelRequestFields) {
             request.additionalModelRequestFields = additionalModelRequestFields;
         }
@@ -1879,6 +1767,10 @@ async saveCredentialsToFile(filePath, newData) {
         const inference = buildKiroInferenceConfig(generationParams, this.config.KIRO_ENABLE_INFERENCE_CONFIG !== false);
         if (inference) request.inferenceConfig = inference;
         const guarded = guardKiroPayload(request, this.config);
+        const imageStats = getKiroImagePayloadStats(guarded);
+        if (imageStats.imageCount > 0) {
+            logger.info(`[Kiro] Converted request images: ${imageStats.imageCount}; base64 payload: ${imageStats.imageBase64Bytes} bytes`);
+        }
 
         Object.defineProperty(guarded, '_kiroToolNameMaps', {
             value: toolNameMaps,
@@ -3315,10 +3207,14 @@ async saveCredentialsToFile(filePath, newData) {
             // until the raw generator produces a meaningful content event.
             const pendingMessageStart = first.value;
             let flushedMessageStart = false;
+            const recovery = this.config.KIRO_TRUNCATION_RECOVERY === false ? null
+                : (this._truncationRecovery ||= new KiroTruncationRecovery());
+            const observation = recovery?.observe(resolveKiroModel(model, this.config), requestBody);
 
             while (true) {
                 const { value, done } = await rawGenerator.next();
                 if (done) break;
+                observation?.accept(value);
 
                 if (!flushedMessageStart) {
                     yield pendingMessageStart;
