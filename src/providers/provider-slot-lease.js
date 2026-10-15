@@ -1,13 +1,29 @@
+import { getKiroAccountUnavailableError } from './kiro-account-state.js';
+
+function assertUsable(provider, options) {
+    const error = getKiroAccountUnavailableError(provider.type, provider.state._slotConfig || provider.config, options);
+    if (error) throw error;
+}
+
+/** Stop queued Kiro work immediately when its authoritative account is paused. */
+export function rejectUnavailableProviderWaiters(provider) {
+    const error = getKiroAccountUnavailableError(provider.type, provider.state._slotConfig || provider.config);
+    if (!error) return;
+    while (provider.state.queue.length) provider.state.queue.shift().reject(error);
+}
+
 function limitFor(provider) {
     return Math.max(0, Number.parseInt((provider.state._slotConfig || provider.config).concurrencyLimit || 0, 10) || 0);
 }
 
 function reserve(provider) {
+    assertUsable(provider);
     const state = provider.state;
     state.activeCount++;
     let released = false;
     const lease = {
         get released() { return released; },
+        assertUsable(options) { assertUsable(provider, options); },
         release() {
             if (released) return;
             released = true;
@@ -23,6 +39,7 @@ function reserve(provider) {
 export function releaseProviderSlot(provider) {
     const state = provider.state;
     if (state.activeCount > 0) state.activeCount--;
+    rejectUnavailableProviderWaiters(provider);
     const limit = limitFor(provider);
     while (state.queue.length && (limit <= 0 || state.activeCount < limit)) {
         const waiter = state.queue.shift();
@@ -33,6 +50,7 @@ export function releaseProviderSlot(provider) {
 export async function acquireProviderSlot(provider, options = {}) {
     const { signal } = options;
     signal?.throwIfAborted();
+    assertUsable(provider);
     const state = provider.state;
     const limit = limitFor(provider);
     if (limit <= 0 || state.activeCount < limit && !state.queue.length) return reserve(provider);
@@ -62,9 +80,11 @@ export async function acquireProviderSlot(provider, options = {}) {
         };
         const onAbort = () => fail(signal.reason);
         const waiter = {
+            reject: fail,
             grant() {
                 if (settled) return;
                 if (signal?.aborted) return fail(signal.reason);
+                try { assertUsable(provider); } catch (error) { return fail(error); }
                 const reserved = reserve(provider); // Reserve before resolve(), not after await.
                 cleanup();
                 resolve(reserved);

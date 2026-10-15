@@ -1,8 +1,10 @@
 /** Write one record without reading more upstream data while the client is slow. */
-export function writeWithBackpressure(res, chunk, signal, onWritten = () => {}) {
+export function writeWithBackpressure(res, chunk, signal, onWritten = () => {}, options = {}) {
     return new Promise((resolve, reject) => {
         let settled = false;
+        let timer;
         const cleanup = () => {
+            clearTimeout(timer);
             res.off('drain', onDrain);
             res.off('close', onClose);
             res.off('error', onError);
@@ -28,6 +30,14 @@ export function writeWithBackpressure(res, chunk, signal, onWritten = () => {}) 
             const writable = res.write(chunk);
             onWritten();
             if (writable !== false) finish();
+            else if (!settled && Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0) {
+                timer = setTimeout(() => {
+                    const error = new Error(`Downstream write did not drain within ${options.timeoutMs}ms`);
+                    error.code = 'DOWNSTREAM_WRITE_TIMEOUT';
+                    error.isDownstreamWriteError = true;
+                    finish(error);
+                }, options.timeoutMs);
+            }
         } catch (error) { finish(error); }
     });
 }

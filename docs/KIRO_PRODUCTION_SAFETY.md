@@ -14,6 +14,9 @@
 - 并发插槽在交接时预留，以独立租约幂等释放；排队可取消，失败重试先释放上一尝试的插槽。UUID 变化不影响已获取插槽的释放。
 - SSE 写入遇到背压时等待 `drain`；断开或取消可以中止等待。心跳是 SSE 注释，不算模型输出，不会关闭空响应重试窗口。
 - 原有错误响应体的 10 秒/64 KiB 读取保护继续保留。
+- Kiro 凭证只读取指定账号文件；IdC 注册信息按 `clientIdHash` 定位，仅补充客户端注册字段。同目录其它账号的 token、区域、过期时间不参与合并。Base64 按原始配置内容的指纹使用独立缓存，重启或 UUID 变化仍读取自身轮换后的令牌；写入失败时优先保留内存中的新令牌。
+- Kiro 暂停状态贯穿选点、并发排队、发送前检查和健康检查。明确 suspended 状态不会被并发成功请求或后台刷新自动清除；人工恢复入口仍可用。
+- Kiro 的完整工具调用优先于正常 `end_turn`；明确的 `max_tokens`、上下文超限等终止原因保持原样。
 
 ## 配置
 
@@ -25,6 +28,7 @@
 | `KIRO_FIRST_EVENT_TIMEOUT_MS` | 30000 | 从实际发起上游请求开始，等待有意义的文本、思考或工具事件；元数据字节不算首事件。0 关闭。 |
 | `KIRO_STREAM_IDLE_TIMEOUT_MS` | 120000 | 开始产出后等待更多上游数据；消费者应用背压期间暂停该计时。0 关闭。 |
 | `KIRO_STREAM_TOTAL_TIMEOUT_MS` | 0 | 单次上游尝试总期限；默认关闭，长任务可自行设置。不会取消共享的客户端信号。 |
+| `KIRO_DOWNSTREAM_WRITE_TIMEOUT_MS` | 30000 | 仅 Kiro 调用链启用的单次下游写入期限，覆盖正文、心跳、错误和结束记录。有效值为 1–2147483647 的整数毫秒；无效值（含 0）回退默认值。节点配置优先。客户端持续不读取时取消生成、关闭响应并释放并发名额，不处罚账号。 |
 | `KIRO_MAX_FRAME_BYTES` | 33554432 | 解码器的单帧资源预算，不是对上游服务允许大小的承诺。 |
 | `KIRO_MAX_TOOL_ARGUMENT_BYTES` | 4194304 | 单次响应累计工具参数的存储预算。 |
 | `KIRO_MAX_TOOL_CALLS` | 1024 | 单次响应最大工具调用数量。 |
@@ -40,6 +44,14 @@
 | `KIRO_API_KEY_BASE_URL` | 未设置 | 显式配置 API Key runtime URL，也会启用该路径。开启时使用 CLI origin、对应内容类型，并去除 profileArn。 |
 
 生成流请求显式关闭继承的 Axios socket 超时，由以上三个 Kiro 请求级期限管理连接。因此关闭或延长某项期限不会再受原有 120 秒实例超时限制，消费者背压也不会触发该隐藏超时。认证刷新、模型发现、用量查询和错误响应体仍保留各自的期限。
+
+Kiro 的上游尝试期限与下游写入期限分别管理；上游结束不意味着客户端已经接收完数据。启用既有 `RATE_LIMIT_COOLDOWN_ENABLED` 后，Kiro 的显式 `Retry-After` 不再受 `RATE_LIMIT_COOLDOWN_MAX_MS` 截短，恢复时间不会早于上游要求；其它渠道保留原有策略。冷却默认开关不变。`REQUEST_MAX_RETRIES=0` 关闭 Kiro 网络重试，`CREDENTIAL_SWITCH_MAX_RETRIES=0` 关闭 Kiro 凭证切换重试；空响应预算仍由原有 `EMPTY_RESPONSE_MAX_RETRIES` 独立控制。
+
+本轮修复参考固定源码快照：`kiro-gateway@a5292ca` 的指定凭证/匹配注册文件与截断优先工具映射，`Kiro-Go@f8f6071` 的明确暂停处理，`sub2api@9c2cca9` 的权威可调度状态复查，以及 `new-api@7de10f2` 的逐次下游写入期限。参考设计只用于对应的 Kiro 修复，没有迁移其它平台的配额规则或改变其它渠道默认行为。UUID 代理绑定与 API Key runtime origin 的待验证问题不在本轮修复范围内。
+
+可复核源码：[kiro-gateway 凭证读取](https://github.com/jwadow/kiro-gateway/blob/a5292ca04c7c6231e0b47673ac3f981f5a706e1e/kiro/auth.py#L413)、[Kiro-Go 暂停处理](https://github.com/Quorinex/Kiro-Go/blob/f8f6071c9298a4266ad3e0c7e483d4a2510cbcaf/pool/account.go#L344)、[sub2api 可调度状态](https://github.com/Wei-Shaw/sub2api/blob/9c2cca9e627291bc719bada3d57de23b625a4180/backend/internal/service/account.go#L191)、[new-api 写入期限](https://github.com/QuantumNous/new-api/blob/7de10f2c602b50122017556e8a09cb7c488c273c/relay/helper/stream_scanner.go#L29)。
+
+Base64 独立缓存保存在凭证目录的 `.kiro-base64/<原始配置指纹>.json`，不会自动迁入旧默认共享文件中的令牌，以免迁入其它账号。若旧 Base64 配置中的 refresh token 已轮换失效，应重新导入该账号的当前凭证。文件路径方式保持原路径；同时提供 Base64 和文件路径时仍按原有 Base64 优先规则处理。Kiro 热重载不会通过旧磁盘快照解除当前暂停或禁用，重新启用应使用现有人工启用、重置或成功的人工健康检测入口。
 
 动态缓存按服务实例、认证、区域、profile、端点和代理身份隔离，最多缓存 16 个条目，并限制共享读取数量。发现请求总期限为 10 秒、响应体最多 1 MiB、分页最多 20 页；失败保留静态模型列表，不因为发现失败处罚生成账号。共享只读发现不会被一个调用方的取消打断。缓存不作为全局账号权限注册表，也不自动把新模型加入所有账号池。
 

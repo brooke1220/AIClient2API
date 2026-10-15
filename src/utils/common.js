@@ -10,6 +10,7 @@ import { convertData, getOpenAIStreamChunkStop, releaseStreamState } from '../co
 import { ProviderStrategyFactory } from './provider-strategies.js';
 import { getPluginManager } from '../core/plugin-manager.js';
 import { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
+import { isKiroProviderType } from '../providers/kiro-account-state.js';
 
 // ==================== 时间与时区 ====================
 
@@ -347,8 +348,8 @@ function getPositiveInteger(value, fallback) {
  * Calculates a scheduled recovery time for optional 429 account cooldown.
  * Returns null when cooldown is disabled or the error is not an HTTP 429.
  */
-export function getRateLimitCooldownRecoveryTime(error, config = {}, now = Date.now()) {
-    if (!config?.RATE_LIMIT_COOLDOWN_ENABLED || Number(getErrorStatusCode(error)) !== 429) {
+export function getRateLimitCooldownRecoveryTime(error, config = {}, now = Date.now(), providerType) {
+    if (!config?.RATE_LIMIT_COOLDOWN_ENABLED || Number(getErrorStatusCode(error)) !== 429 || error?.isKiroAccountUnavailable) {
         return null;
     }
 
@@ -357,10 +358,20 @@ export function getRateLimitCooldownRecoveryTime(error, config = {}, now = Date.
     const jitterMs = getPositiveInteger(config.RATE_LIMIT_COOLDOWN_JITTER_MS, 0);
     const retryAfterMs = getRetryAfterMs(error, now);
     const baseCooldownMs = retryAfterMs === null ? defaultCooldownMs : retryAfterMs;
-    const cappedCooldownMs = Math.min(baseCooldownMs, Math.max(defaultCooldownMs, maxCooldownMs));
+    // For Kiro, an explicit server deadline must not be shortened by the local
+    // backoff ceiling. Other providers retain their existing cooldown policy.
+    const preserveServerDeadline = isKiroProviderType(providerType) && retryAfterMs !== null;
+    const cappedCooldownMs = preserveServerDeadline ? baseCooldownMs
+        : Math.min(baseCooldownMs, Math.max(defaultCooldownMs, maxCooldownMs));
     const jitter = jitterMs > 0 ? Math.floor(Math.random() * (jitterMs + 1)) : 0;
 
-    return new Date(now + cappedCooldownMs + jitter);
+    const recoveryAt = now + cappedCooldownMs + jitter;
+    return new Date(preserveServerDeadline ? Math.min(recoveryAt, 8.64e15) : recoveryAt);
+}
+
+function kiroRetryCount(value, fallback) {
+    const parsed = typeof value === 'number' || typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+    return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 // ==================== API 常量 ====================
@@ -993,9 +1004,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     
     // 重试上下文：包含 CONFIG 和重试计数
     // maxRetries: 凭证切换最大次数（跨凭证），默认 5 次
-    const maxRetries = retryContext?.maxRetries ?? 5;
-    const currentRetry = retryContext?.currentRetry ?? 0;
     const CONFIG = retryContext?.CONFIG;
+    const isKiroStream = isKiroProviderType(toProvider);
+    const maxRetries = isKiroStream
+        ? kiroRetryCount(CONFIG?.CREDENTIAL_SWITCH_MAX_RETRIES ?? retryContext?.maxRetries, 5)
+        : retryContext?.maxRetries ?? 5;
+    const currentRetry = retryContext?.currentRetry ?? 0;
     // isRetry 用于判断当前调用是否是某次重试的递归帧：既包括凭证切换重试（currentRetry），
     // 也包括归一化的上游响应失败重试（responseFailureRetry）。只有最外层调用帧才负责
     // 绑定/解绑客户端事件监听器、发送响应头、以及在 finally 中写入流结束标记 / res.end()。
@@ -1029,13 +1043,49 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         res.on('error', onClientError);
     }
 
+    const configuredTimeout = isKiroStream
+        ? service?.kiroApiService?.config?.KIRO_DOWNSTREAM_WRITE_TIMEOUT_MS ?? CONFIG?.KIRO_DOWNSTREAM_WRITE_TIMEOUT_MS
+        : undefined;
+    const configuredWriteTimeout = typeof configuredTimeout === 'number'
+        || typeof configuredTimeout === 'string' && configuredTimeout.trim() !== '' ? Number(configuredTimeout) : NaN;
+    const writeTimeoutMs = Number.isSafeInteger(configuredWriteTimeout)
+        && configuredWriteTimeout > 0 && configuredWriteTimeout <= 2147483647 ? configuredWriteTimeout : 30000;
+    let pendingDownstreamWrites = 0;
+    let writeChain = Promise.resolve();
+    // Kiro writes, including comments/errors/terminal records, share one bounded
+    // writer. A failed client write cancels generation without penalizing an account.
+    const writeStreamRecord = (chunk, onWritten = () => {}, signal = upstreamAbortController.signal) => {
+        if (!isKiroStream) return writeWithBackpressure(res, chunk, signal, onWritten);
+        pendingDownstreamWrites++;
+        const operation = writeChain.then(async () => {
+            try {
+                if (clientDisconnected.value) throw upstreamAbortController.signal.reason || new Error('Client connection closed');
+                await writeWithBackpressure(res, chunk, signal, onWritten, { timeoutMs: writeTimeoutMs });
+            } catch (error) {
+                onClientError(error);
+                responseClosed = true;
+                if (!res.destroyed && !res.writableEnded) {
+                    if (typeof res.destroy === 'function') res.destroy();
+                    else res.end?.();
+                }
+                throw error;
+            } finally {
+                pendingDownstreamWrites--;
+            }
+        });
+        writeChain = operation.catch(() => {});
+        return operation;
+    };
+
     let heartbeat;
     if (!isRetry) {
         const ms = Number(CONFIG?.SSE_HEARTBEAT_INTERVAL_MS ?? 15000);
         if (Number.isFinite(ms) && ms > 0) {
             heartbeat = setInterval(() => {
-                if (res.headersSent && !res.destroyed && !res.writableEnded && !res.writableNeedDrain && !clientDisconnected.value) {
-                    try { res.write(': keep-alive\n\n'); } catch (error) { onClientError(error); }
+                if (res.headersSent && !res.destroyed && !res.writableEnded && !res.writableNeedDrain && !clientDisconnected.value
+                    && (!isKiroStream || pendingDownstreamWrites === 0)) {
+                    if (isKiroStream) void writeStreamRecord(': keep-alive\n\n').catch(() => {});
+                    else try { res.write(': keep-alive\n\n'); } catch (error) { onClientError(error); }
                 }
             }, ms);
             heartbeat.unref?.();
@@ -1081,9 +1131,13 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // The service returns a stream in its native format (toProvider).
         needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
         requestBody.model = model;
-        const nativeStream = await service.generateContentStream(model, requestBody, {
-            signal: upstreamAbortController.signal
-        });
+        const generationOptions = { signal: upstreamAbortController.signal };
+        if (isKiroStream) {
+            retryContext?.slotLease?.assertUsable?.();
+            providerPoolManager?.assertProviderAvailable?.(toProvider, pooluuid);
+            if (retryContext?.slotLease?.assertUsable) generationOptions.kiroAccountLease = retryContext.slotLease;
+        }
+        const nativeStream = await service.generateContentStream(model, requestBody, generationOptions);
         
         // 如果提供者内部发生了模型回退（如 Antigravity 自动降级），同步更新本地 model 变量
         // 这确保了后续的监控钩子和统计插件记录的是实际使用的模型
@@ -1094,7 +1148,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态。
         streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
-        for await (const nativeChunk of nativeStream) {
+        nativeLoop: for await (const nativeChunk of nativeStream) {
             // 检查客户端是否已断开连接
             if (clientDisconnected.value) {
                 logger.info('[Stream] Stopping iteration due to client disconnect');
@@ -1197,11 +1251,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     // fullResponseJson += chunk.type+"\n";
                     if (!clientDisconnected.value && !res.writableEnded) {
                         try {
-                            await writeWithBackpressure(res, `event: ${chunk.type}\n`, upstreamAbortController.signal, () => { anyDataSent = true; });
+                            await writeStreamRecord(`event: ${chunk.type}\n`, () => { anyDataSent = true; });
                         } catch (writeErr) {
                             logger.error('[Stream] Failed to write event:', writeErr.message);
                             clientDisconnected.value = true;
                             upstreamAbortController.abort(writeErr);
+                            if (isKiroStream) break nativeLoop;
                             break;
                         }
                     }
@@ -1212,17 +1267,20 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 // fullResponseJson += JSON.stringify(chunk)+"\n\n";
                 if (!clientDisconnected.value && !res.writableEnded) {
                     try {
-                        await writeWithBackpressure(res, `data: ${JSON.stringify(chunk)}\n\n`, upstreamAbortController.signal, () => { anyDataSent = true; });
+                        await writeStreamRecord(`data: ${JSON.stringify(chunk)}\n\n`, () => { anyDataSent = true; });
                     } catch (writeErr) {
                         logger.error('[Stream] Failed to write data:', writeErr.message);
                         clientDisconnected.value = true;
                         upstreamAbortController.abort(writeErr);
+                        if (isKiroStream) break nativeLoop;
                         break;
                     }
                 }
                 // logger.info(`data: ${JSON.stringify(chunk)}\n`);
             }
         }
+
+        if (isKiroStream) await writeChain;
 
         // 上游流正常结束但一个字节都没发给客户端：这是「静默空响应」，不能算成功。
         // 直接抛出通用空响应错误，交给下面的 isEmptyUpstreamResponse 分支做小额重试；
@@ -1258,7 +1316,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             const errorPayload = createStreamErrorResponse(error, fromProvider);
             if (!res.writableEnded) {
                 try {
-                    res.write(errorPayload);
+                    if (isKiroStream) await writeStreamRecord(errorPayload);
+                    else res.write(errorPayload);
                     res.end();
                 } catch (writeErr) {
                     logger.error('[Stream] Failed to write error response:', writeErr.message);
@@ -1315,7 +1374,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             const errorPayload = createStreamErrorResponse(giveUpError, fromProvider);
             if (!clientDisconnected.value && !res.writableEnded) {
                 try {
-                    res.write(errorPayload);
+                    if (isKiroStream) await writeStreamRecord(errorPayload);
+                    else res.write(errorPayload);
                     res.end();
                 } catch (writeErr) {
                     logger.error('[Stream] Failed to write error response:', writeErr.message);
@@ -1336,7 +1396,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
 
-        const rateLimitRecoveryTime = getRateLimitCooldownRecoveryTime(error, CONFIG);
+        const rateLimitRecoveryTime = getRateLimitCooldownRecoveryTime(error, CONFIG, Date.now(), toProvider);
         if (rateLimitRecoveryTime && providerPoolManager && pooluuid) {
             logger.info(`[Provider Pool] Applying 429 cooldown for ${toProvider} (${pooluuid}) until ${rateLimitRecoveryTime.toISOString()}`);
             providerPoolManager.markProviderUnhealthyWithRecoveryTime(toProvider, {
@@ -1427,7 +1487,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         const errorPayload = createStreamErrorResponse(error, fromProvider);
         if (!clientDisconnected.value && !res.writableEnded) {
             try {
-                res.write(errorPayload);
+                if (isKiroStream) await writeStreamRecord(errorPayload);
+                else res.write(errorPayload);
                 res.end();
             } catch (writeErr) {
                 logger.error('[Stream] Failed to write error response:', writeErr.message);
@@ -1464,20 +1525,27 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 try {
                     if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI) {
                         // OpenAI 规范：无论是否已有 finish_reason chunk，都必须以 [DONE] 收尾
-                        await writeWithBackpressure(res, 'data: [DONE]\n\n');
+                        if (isKiroStream) await writeStreamRecord('data: [DONE]\n\n', undefined, null);
+                        else await writeWithBackpressure(res, 'data: [DONE]\n\n');
                         hasMessageStop = true;
                     } else if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES) {
                         // OpenAI Responses 以 response.completed/response.incomplete（或 error）作为结束事件。
                         // 连接关闭即表示流结束；不要再追加 `event: done` + `data: {}`，否则会触发下游类型校验失败（AI_TypeValidationError）。
                     } else if (clientProtocol === MODEL_PROTOCOL_PREFIX.CLAUDE) {
                         if (!hasMessageStop) {
-                            res.write('event: message_stop\n');
-                            res.write('data: {"type":"message_stop"}\n\n');
+                            if (isKiroStream) {
+                                await writeStreamRecord('event: message_stop\n', undefined, null);
+                                await writeStreamRecord('data: {"type":"message_stop"}\n\n', undefined, null);
+                            } else {
+                                res.write('event: message_stop\n');
+                                res.write('data: {"type":"message_stop"}\n\n');
+                            }
                             hasMessageStop = true;
                         }
                     } else if (clientProtocol === MODEL_PROTOCOL_PREFIX.GEMINI) {
                         if (!hasMessageStop) {
-                            res.write('data: {"candidates":[{"finishReason":"STOP"}]}\n\n');
+                            if (isKiroStream) await writeStreamRecord('data: {"candidates":[{"finishReason":"STOP"}]}\n\n', undefined, null);
+                            else res.write('data: {"candidates":[{"finishReason":"STOP"}]}\n\n');
                             hasMessageStop = true;
                         }
                     }
@@ -1501,9 +1569,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 export async function handleUnaryRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName, retryContext = null) {
     // 重试上下文：包含 CONFIG 和重试计数
     // maxRetries: 凭证切换最大次数（跨凭证），默认 5 次
-    const maxRetries = retryContext?.maxRetries ?? 5;
-    const currentRetry = retryContext?.currentRetry ?? 0;
     const CONFIG = retryContext?.CONFIG;
+    const isKiroRequest = isKiroProviderType(toProvider);
+    const maxRetries = isKiroRequest
+        ? kiroRetryCount(CONFIG?.CREDENTIAL_SWITCH_MAX_RETRIES ?? retryContext?.maxRetries, 5)
+        : retryContext?.maxRetries ?? 5;
+    const currentRetry = retryContext?.currentRetry ?? 0;
     
     let slotReleased = false;
     const releaseCurrentSlot = () => {
@@ -1517,8 +1588,14 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         // The service returns the response in its native format (toProvider).
         const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
         requestBody.model = model;
+        const generationOptions = { signal: retryContext?.upstreamAbortController?.signal };
+        if (isKiroRequest) {
+            retryContext?.slotLease?.assertUsable?.();
+            providerPoolManager?.assertProviderAvailable?.(toProvider, pooluuid);
+            if (retryContext?.slotLease?.assertUsable) generationOptions.kiroAccountLease = retryContext.slotLease;
+        }
         // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
-        const nativeResponse = await service.generateContent(model, requestBody, { signal: retryContext?.upstreamAbortController?.signal });
+        const nativeResponse = await service.generateContent(model, requestBody, generationOptions);
         retryContext?.upstreamAbortController?.signal.throwIfAborted();
 
         // 与流式链路一致，由协议策略在转换前识别原生终止失败。
@@ -1630,7 +1707,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
 
-        const rateLimitRecoveryTime = getRateLimitCooldownRecoveryTime(error, CONFIG);
+        const rateLimitRecoveryTime = getRateLimitCooldownRecoveryTime(error, CONFIG, Date.now(), toProvider);
         if (rateLimitRecoveryTime && providerPoolManager && pooluuid) {
             logger.info(`[Provider Pool] Applying 429 cooldown for ${toProvider} (${pooluuid}) until ${rateLimitRecoveryTime.toISOString()}`);
             providerPoolManager.markProviderUnhealthyWithRecoveryTime(toProvider, {
@@ -2019,7 +2096,9 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         // - 底层重试：同一凭证遇到 429/5xx 时的重试
         // - 凭证切换重试：凭证被标记不健康后切换到其他凭证
         // 当没有不同的健康凭证可用时，重试会自动停止
-        const credentialSwitchMaxRetries = CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
+        const credentialSwitchMaxRetries = isKiroProviderType(toProvider)
+            ? kiroRetryCount(CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES, 5)
+            : CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
         const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, slotLease: ownedSlotLease, upstreamAbortController: cancellation.controller };
     
         if (isStream) {

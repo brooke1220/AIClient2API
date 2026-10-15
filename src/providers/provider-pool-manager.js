@@ -1,4 +1,5 @@
-import { acquireProviderSlot, releaseProviderSlot } from './provider-slot-lease.js';
+import { acquireProviderSlot, releaseProviderSlot, rejectUnavailableProviderWaiters } from './provider-slot-lease.js';
+import { getKiroAccountUnavailableError, isKiroAccountSuspended, isKiroProviderType, isKiroSuspensionMessage } from './kiro-account-state.js';
 import * as fs from 'fs';
 import { getServiceAdapter, getRegisteredProviders, invalidateServiceAdapter } from './adapter.js';
 import logger from '../utils/logger.js';
@@ -14,6 +15,14 @@ import {
 } from './provider-models.js';
 import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { ENDPOINT_TYPE } from '../utils/common.js';
+
+function kiroPauseSnapshot(provider, config) {
+    return JSON.stringify([
+        provider?.state?._kiroPauseVersion || 0, config.kiroAccountSuspended,
+        config.scheduledRecoveryTime, config.isDisabled, config.needsRefresh,
+        config.lastErrorTime, config.lastErrorMessage
+    ]);
+}
 
 function getCustomModelAliasesForProvider(config, providerType) {
     const customModels = Array.isArray(config?.customModels) ? config.customModels : [];
@@ -250,6 +259,7 @@ export class ProviderPoolManager {
      */
     _enqueueRefresh(providerType, providerStatus, force = false) {
         const uuid = providerStatus.uuid;
+        if (getKiroAccountUnavailableError(providerType, providerStatus.config, { allowUnhealthy: true, allowNeedsRefresh: true })) return;
         
         // 如果节点被禁用，不进行刷新
         if (providerStatus.config.isDisabled) {
@@ -468,6 +478,7 @@ export class ProviderPoolManager {
      */
     async _refreshNodeToken(providerType, providerStatus, force = false) {
         const config = providerStatus.config;
+        if (getKiroAccountUnavailableError(providerType, config, { allowUnhealthy: true, allowNeedsRefresh: true })) return;
         
         // 检查刷新次数是否已达上限（最大5次）
         const currentRefreshCount = config.refreshCount || 0;
@@ -511,6 +522,8 @@ export class ProviderPoolManager {
                     refreshOperation = serviceAdapter.refreshToken();
                 }
                 const refreshResult = await this._awaitRefreshWithTimeout(refreshOperation, providerType, this._getDisplayName(config));
+                // An older refresh must not undo a pause reported while it ran.
+                if (getKiroAccountUnavailableError(providerType, config, { allowUnhealthy: true, allowNeedsRefresh: true })) return;
 
                 const duration = Date.now() - startTime;
                 
@@ -539,6 +552,7 @@ export class ProviderPoolManager {
             // 记录错误信息
             config.lastErrorTime = new Date().toISOString();
             config.lastErrorMessage = `Refresh failed: ${error.message}`;
+            this._recordKiroAccountFailure(providerType, providerStatus, config.lastErrorMessage);
             
             // 增加错误计数（用于普通的健康检查参考，虽然刷新错误主要参考 refreshCount）
             config.errorCount = (config.errorCount || 0) + 1;
@@ -874,14 +888,29 @@ export class ProviderPoolManager {
                     providerConfig.lastErrorMessage = providerConfig.lastErrorMessage || null;
                     providerConfig.customName = providerConfig.customName || null;
 
+                    // Configuration edits can arrive from an older disk snapshot
+                    // before the debounced state save. Runtime Kiro pauses remain
+                    // authoritative until an explicit recovery changes them.
+                    if (existing && isKiroProviderType(providerType)) {
+                        providerConfig.isDisabled = existing.config.isDisabled === true || providerConfig.isDisabled === true;
+                        for (const key of ['isHealthy', 'needsRefresh', 'refreshCount', 'scheduledRecoveryTime', 'kiroAccountSuspended', 'lastErrorTime', 'lastErrorMessage']) {
+                            providerConfig[key] = existing.config[key];
+                        }
+                    }
+                    if (isKiroProviderType(providerType) && (existing?.config.kiroAccountSuspended || isKiroAccountSuspended(providerConfig))) {
+                        providerConfig.kiroAccountSuspended = true;
+                    }
+
                     const slotState = existing ? existing.state : { activeCount: 0, waitingCount: 0, queue: [] };
                     Object.defineProperty(slotState, '_slotConfig', { value: providerConfig, writable: true, configurable: true });
-                    this.providerStatus[providerType].push({
+                    const providerStatus = {
                         config: providerConfig,
                         uuid: providerConfig.uuid, // Still keep uuid at the top level for easy access
                         type: providerType, // 保存 providerType 引用
                         state: slotState
-                    });
+                    };
+                    this.providerStatus[providerType].push(providerStatus);
+                    rejectUnavailableProviderWaiters(providerStatus);
                 } catch (nodeError) {
                     logger.error(`[ProviderPoolManager] Error initializing node for ${providerType}: ${nodeError.message}`);
                 }
@@ -906,6 +935,35 @@ export class ProviderPoolManager {
         if (!selectedConfig) return null;
         const provider = this._findProvider(providerType, selectedConfig.uuid);
         return provider ? await acquireProviderSlot(provider, options) : selectedConfig;
+    }
+
+    /** Safe for standalone Kiro: missing pool entries do not block a request. */
+    assertProviderAvailable(providerType, uuid, options = {}) {
+        if (!isKiroProviderType(providerType) || !uuid) return;
+        const provider = this._findProvider(providerType, uuid);
+        if (!provider) return;
+        const error = getKiroAccountUnavailableError(providerType, provider.config, options);
+        if (error) throw error;
+    }
+
+    _recordKiroAccountFailure(providerType, provider, errorMessage) {
+        if (!isKiroProviderType(providerType)) return;
+        if (isKiroSuspensionMessage(errorMessage)) {
+            provider.config.kiroAccountSuspended = true;
+            provider.config.isHealthy = false;
+            provider.config.scheduledRecoveryTime = null;
+        }
+        if (getKiroAccountUnavailableError(providerType, provider.config)) {
+            provider.state._kiroPauseVersion = (provider.state._kiroPauseVersion || 0) + 1;
+        }
+        rejectUnavailableProviderWaiters(provider);
+    }
+
+    _clearKiroManualPause(providerType, provider) {
+        if (!isKiroProviderType(providerType)) return;
+        provider.config.kiroAccountSuspended = false;
+        provider.config.scheduledRecoveryTime = null;
+        provider.config.lastErrorMessage = null;
     }
 
     releaseSlot(providerType, uuid) {
@@ -964,7 +1022,8 @@ export class ProviderPoolManager {
         const minSeq = Math.min(...availableProviders.map(p => p.config._lastSelectionSeq || 0));
 
         let availableAndHealthyProviders = availableProviders.filter(p =>
-            p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh
+            p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh &&
+            !getKiroAccountUnavailableError(providerType, p.config)
         );
 
         // 如果指定了模型，则排除不支持该模型的提供商
@@ -1559,6 +1618,7 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
+            if (getKiroAccountUnavailableError(providerType, provider.config, { allowUnhealthy: true, allowNeedsRefresh: true })) return;
             // 防并发机制 A: 如果已经在刷新中，忽略请求
             if (this.refreshingUuids.has(provider.uuid)) {
                 this._log('info', `Provider ${this._getDisplayName(providerConfig)} is already in refresh queue, ignoring duplicate refresh request.`);
@@ -1574,6 +1634,7 @@ export class ProviderPoolManager {
             }
 
             provider.config.needsRefresh = true;
+            this._recordKiroAccountFailure(providerType, provider);
             this._log('info', `Marked provider ${this._getDisplayName(providerConfig)} as needsRefresh. Enqueuing...`);
             
             // 推入异步刷新队列
@@ -1644,6 +1705,7 @@ export class ProviderPoolManager {
                 this._log('warn', `Marked provider as unhealthy: ${this._getDisplayName(providerConfig)} for type ${providerType}. Total errors: ${provider.config.errorCount}`);
             } 
 
+            this._recordKiroAccountFailure(providerType, provider, errorMessage);
             this._debouncedSave(providerType);
         }
     }
@@ -1682,6 +1744,7 @@ export class ProviderPoolManager {
 
             this._log('warn', `Immediately marked provider as unhealthy: ${this._getDisplayName(providerConfig)} for type ${providerType}. Reason: ${errorMessage || 'Authentication error'}`);
            
+            this._recordKiroAccountFailure(providerType, provider, errorMessage);
             this._debouncedSave(providerType);
         }
     }
@@ -1715,13 +1778,18 @@ export class ProviderPoolManager {
 
             // Set recovery time if provided
             if (recoveryTime) {
-                const recoveryDate = recoveryTime instanceof Date ? recoveryTime : new Date(recoveryTime);
+                let recoveryDate = recoveryTime instanceof Date ? recoveryTime : new Date(recoveryTime);
+                const existingRecoveryDate = new Date(provider.config.scheduledRecoveryTime || 0);
+                if (isKiroProviderType(providerType) && existingRecoveryDate.getTime() > Date.now() && existingRecoveryDate > recoveryDate) {
+                    recoveryDate = existingRecoveryDate;
+                }
                 provider.config.scheduledRecoveryTime = recoveryDate.toISOString();
                 this._log('warn', `Marked provider as unhealthy with recovery time: ${this._getDisplayName(providerConfig)} for type ${providerType}. Recovery at: ${recoveryDate.toISOString()}. Reason: ${errorMessage || 'Quota exhausted'}`);
             } else {
                 this._log('warn', `Marked provider as unhealthy: ${this._getDisplayName(providerConfig)} for type ${providerType}. Reason: ${errorMessage || 'Quota exhausted'}`);
             }
 
+            this._recordKiroAccountFailure(providerType, provider, errorMessage);
             this._debouncedSave(providerType);
         }
     }
@@ -1733,7 +1801,7 @@ export class ProviderPoolManager {
      * @param {boolean} resetUsageCount - Whether to reset usage count (optional, default: false).
      * @param {string} [healthCheckModel] - Optional model name used for health check.
      */
-    markProviderHealthy(providerType, providerConfig, resetUsageCount = false, healthCheckModel = null) {
+    markProviderHealthy(providerType, providerConfig, resetUsageCount = false, healthCheckModel = null, options = {}) {
         if (!providerConfig?.uuid) {
             this._log('error', 'Invalid providerConfig in markProviderHealthy');
             return;
@@ -1741,6 +1809,13 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
+            if (isKiroProviderType(providerType) && options.manualRecovery === true && options.kiroRecoverySnapshot) {
+                const { state, snapshot } = options.kiroRecoverySnapshot;
+                const paused = getKiroAccountUnavailableError(providerType, provider.config, { allowUnhealthy: true });
+                if (paused && (state !== provider.state || snapshot !== kiroPauseSnapshot(provider, provider.config))) throw paused;
+            }
+            if (getKiroAccountUnavailableError(providerType, provider.config, { allowUnhealthy: true, manualRecovery: options.manualRecovery === true })) return;
+            if (options.manualRecovery === true) this._clearKiroManualPause(providerType, provider);
             const wasHealthy = provider.config.isHealthy;
             provider.config.isHealthy = true;
             provider.config.errorCount = 0;
@@ -1790,6 +1865,7 @@ export class ProviderPoolManager {
 
         const provider = this._findProvider(providerType, uuid);
         if (provider) {
+            if (getKiroAccountUnavailableError(providerType, provider.config, { allowUnhealthy: true, allowNeedsRefresh: true })) return;
             provider.config.needsRefresh = false;
             provider.config.refreshCount = 0;
             provider.config.lastRefreshTime = Date.now(); // 显式重置时也更新刷新时间
@@ -1836,6 +1912,7 @@ export class ProviderPoolManager {
         if (!pool) return;
 
         pool.forEach(provider => {
+            this._clearKiroManualPause(providerType, provider);
             provider.config.isHealthy = true;
             provider.config.errorCount = 0;
             provider.config.lastErrorTime = null;
@@ -1862,6 +1939,7 @@ export class ProviderPoolManager {
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
             provider.config.isDisabled = true;
+            this._recordKiroAccountFailure(providerType, provider);
             this._log('info', `Disabled provider: ${this._getDisplayName(providerConfig)} for type ${providerType}`);
             this._debouncedSave(providerType);
         }
@@ -1881,6 +1959,13 @@ export class ProviderPoolManager {
         const provider = this._findProvider(providerType, providerConfig.uuid);
         if (provider) {
             provider.config.isDisabled = false;
+            if (isKiroProviderType(providerType)) {
+                this._clearKiroManualPause(providerType, provider);
+                provider.config.isHealthy = true;
+                provider.config.needsRefresh = false;
+                provider.config.errorCount = 0;
+                provider.config.lastErrorTime = null;
+            }
             this._log('info', `Enabled provider: ${this._getDisplayName(providerConfig)} for type ${providerType}`);
             this._debouncedSave(providerType);
         }
@@ -1947,6 +2032,7 @@ export class ProviderPoolManager {
             const providers = this.providerStatus[type] || [];
             for (const providerStatus of providers) {
                 const config = providerStatus.config;
+                if (isKiroProviderType(type) && (config.isDisabled || config.needsRefresh || isKiroAccountSuspended(config))) continue;
                 
                 // 检查是否有 scheduledRecoveryTime 且已到恢复时间
                 if (config.scheduledRecoveryTime && !config.isHealthy) {
@@ -2002,6 +2088,7 @@ export class ProviderPoolManager {
             
             for (const providerStatus of this.providerStatus[providerType]) {
                 const providerConfig = providerStatus.config;
+                if (getKiroAccountUnavailableError(providerType, providerConfig, { allowUnhealthy: true })) continue;
 
                 // 如果提供商有 scheduledRecoveryTime 且未到恢复时间，跳过健康检查
                 if (providerConfig.scheduledRecoveryTime && !providerConfig.isHealthy) {
@@ -2054,6 +2141,7 @@ export class ProviderPoolManager {
                     }
 
                 } catch (error) {
+                    if (isKiroProviderType(providerType) && error.isKiroAccountUnavailable) continue;
                     this._log('error', `Health check for ${this._getDisplayName(providerConfig)} (${providerType}) failed: ${error.message}`);
                     // If a health check fails, mark it unhealthy, which will update error count and lastErrorTime
                     this.markProviderUnhealthy(providerType, providerConfig, error.message);
@@ -2098,6 +2186,7 @@ export class ProviderPoolManager {
             }
             
             for (const provider of this.providerStatus[providerType]) {
+                if (getKiroAccountUnavailableError(providerType, provider.config, { allowUnhealthy: true })) continue;
                 // Skip manually disabled providers
                 if (provider.config.isDisabled === true) {
                     this._log('debug', `[ScheduledHealthCheck] Skipping ${this._getDisplayName(provider.config)} (${providerType}): manually disabled`);
@@ -2115,6 +2204,8 @@ export class ProviderPoolManager {
         let failCount = 0;
         
         for (const { providerType, provider, uuid, customName } of providersToCheck) {
+            // A previous probe can change another node while this batch runs.
+            if (getKiroAccountUnavailableError(providerType, provider.config, { allowUnhealthy: true })) continue;
             const providerCheckStart = Date.now();
             const baseProviderType = this._getBaseProviderType(providerType);
             const checkModelName = provider.config.checkModelName || 
@@ -2140,6 +2231,7 @@ export class ProviderPoolManager {
                     this.markProviderHealthy(providerType, provider.config, false, result.modelName);
                 }
             } catch (error) {
+                if (isKiroProviderType(providerType) && error.isKiroAccountUnavailable) continue;
                 const checkDuration = Date.now() - providerCheckStart;
                 failCount++;
                 this._log('error', `[ScheduledHealthCheck] ${displayName} (${providerType}) EXCEPTION: ${error.message} (${checkDuration}ms)`);
@@ -2247,7 +2339,20 @@ export class ProviderPoolManager {
      * @param {object} providerConfig - The configuration of the provider to check.
      * @returns {Promise<{success: boolean, modelName: string, errorMessage: string}>} - Health check result object.
      */
-    async _checkProviderHealth(providerType, providerConfig) {
+    async _checkProviderHealth(providerType, providerConfig, options = {}) {
+        // Only an explicit management action may probe a suspended/cooling Kiro
+        // account. It does not clear the pause before the probe succeeds.
+        const kiroHealthCheck = isKiroProviderType(providerType);
+        const kiroProvider = kiroHealthCheck ? this._findProvider(providerType, providerConfig.uuid) : null;
+        let manualPauseSnapshot;
+        if (kiroHealthCheck) {
+            const current = kiroProvider?.config || providerConfig;
+            const error = getKiroAccountUnavailableError(providerType, current, {
+                allowUnhealthy: true, manualRecovery: options.manualRecovery === true
+            });
+            if (error) throw error;
+            if (options.manualRecovery === true) manualPauseSnapshot = kiroPauseSnapshot(kiroProvider, current);
+        }
         // 确定健康检查使用的模型名称
         const baseProviderType = this._getBaseProviderType(providerType);
         const modelName = providerConfig.checkModelName ||
@@ -2292,14 +2397,37 @@ export class ProviderPoolManager {
                     // signal: abortController.signal
                 };
 
-                await serviceAdapter.generateContent(modelName, requestWithSignal);
+                if (kiroHealthCheck) {
+                    await serviceAdapter.generateContent(modelName, requestWithSignal, {
+                        signal: abortController.signal,
+                        kiroHealthCheck: true,
+                        kiroManualRecovery: options.manualRecovery === true
+                    });
+                } else {
+                    await serviceAdapter.generateContent(modelName, requestWithSignal);
+                }
+                if (manualPauseSnapshot !== undefined) {
+                    // A manual probe can only recover the pause it started with.
+                    // An older successful probe must preserve a newer pause,
+                    // including repeated identical suspension responses.
+                    const current = kiroProvider?.state._slotConfig || kiroProvider?.config || providerConfig;
+                    const forbidden = getKiroAccountUnavailableError(providerType, current, { allowUnhealthy: true, manualRecovery: true });
+                    if (forbidden) throw forbidden;
+                    const paused = getKiroAccountUnavailableError(providerType, current, { allowUnhealthy: true });
+                    if (paused && kiroPauseSnapshot(kiroProvider, current) !== manualPauseSnapshot) throw paused;
+                }
                 
                 clearTimeout(timeoutId);
                 // 注意：使用量计数由调用方处理（performHealthChecks/performInitialHealthChecks）
                 // 这里只返回成功结果，让调用方统一处理状态更新和计数
-                return { success: true, modelName, errorMessage: null };
+                const result = { success: true, modelName, errorMessage: null };
+                if (manualPauseSnapshot !== undefined) {
+                    Object.defineProperty(result, 'kiroRecoverySnapshot', { value: { state: kiroProvider?.state, snapshot: manualPauseSnapshot } });
+                }
+                return result;
             } catch (error) {
                 clearTimeout(timeoutId);
+                if (kiroHealthCheck && error.isKiroAccountUnavailable) throw error;
                 lastError = error;
             }
         }

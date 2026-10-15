@@ -13,6 +13,7 @@ import { broadcastEvent as emitEvent } from './event-broadcast.js';
 import { getRegisteredProviders, getServiceAdapter, invalidateServiceAdapter } from '../providers/adapter.js';
 import { withFileLock, atomicWriteFile } from '../utils/file-lock.js';
 import { normalizeProviderConfigFields } from '../utils/provider-config-normalizer.js';
+import { isKiroProviderType } from '../providers/kiro-account-state.js';
 
 // The display marker deliberately contains a space: it cannot be saved as a
 // valid proxy URL if a client edits the address but leaves hidden credentials.
@@ -195,10 +196,11 @@ async function runProviderHealthCheck(providerPoolManager, providerType, provide
         const healthResult = await providerPoolManager._checkProviderHealth(providerType, {
             ...providerConfig,
             checkModelName
-        });
+        }, ...(isKiroProviderType(providerType) ? [{ manualRecovery: true }] : []));
 
         if (healthResult.success) {
-            providerPoolManager.markProviderHealthy(providerType, providerConfig, false, healthResult.modelName);
+            providerPoolManager.markProviderHealthy(providerType, providerConfig, false, healthResult.modelName,
+                ...(isKiroProviderType(providerType) ? [{ manualRecovery: true, kiroRecoverySnapshot: healthResult.kiroRecoverySnapshot }] : []));
             return {
                 uuid: providerConfig.uuid,
                 success: true,
@@ -233,6 +235,9 @@ async function runProviderHealthCheck(providerPoolManager, providerType, provide
         };
     } catch (error) {
         const errorMessage = error.message || 'Unknown error';
+        if (isKiroProviderType(providerType) && error.isKiroAccountUnavailable) {
+            return { uuid: providerConfig.uuid, success: false, healthy: false, message: errorMessage, skipped: true };
+        }
         const isAuthError = isAuthHealthCheckError(errorMessage);
 
         if (isAuthError) {
@@ -1267,10 +1272,12 @@ export async function handleHealthCheck(req, res, currentConfig, providerPoolMan
             }
 
              try {
-                const healthResult = await providerPoolManager._checkProviderHealth(providerType, providerConfig);
+                const healthResult = await providerPoolManager._checkProviderHealth(providerType, providerConfig,
+                    ...(isKiroProviderType(providerType) ? [{ manualRecovery: true }] : []));
                 
                 if (healthResult.success) {
-                    providerPoolManager.markProviderHealthy(providerType, providerConfig, false, healthResult.modelName);
+                    providerPoolManager.markProviderHealthy(providerType, providerConfig, false, healthResult.modelName,
+                        ...(isKiroProviderType(providerType) ? [{ manualRecovery: true, kiroRecoverySnapshot: healthResult.kiroRecoverySnapshot }] : []));
                     results.push({
                         uuid: providerConfig.uuid,
                         success: true,
@@ -1304,6 +1311,10 @@ export async function handleHealthCheck(req, res, currentConfig, providerPoolMan
                 }
             } catch (error) {
                 const errorMessage = error.message || 'Unknown error';
+                if (isKiroProviderType(providerType) && error.isKiroAccountUnavailable) {
+                    results.push({ uuid: providerConfig.uuid, success: false, message: errorMessage, skipped: true });
+                    continue;
+                }
                 // 检查是否为认证错误（401/403），如果是则立即标记为不健康
                 const isAuthError = /\b(401|403)\b/.test(errorMessage) ||
                                    /\b(Unauthorized|Forbidden|AccessDenied|InvalidToken|ExpiredToken)\b/i.test(errorMessage);
