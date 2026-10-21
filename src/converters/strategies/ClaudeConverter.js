@@ -920,6 +920,14 @@ export class ClaudeConverter extends BaseConverter {
         const geminiRequest = {
             contents: []
         };
+        // 单次请求只保留最近 5 张 tool_result base64 图片。用旁路 Set 记录被淘汰的
+        // Gemini Part，不在 part 对象上写内部字段，避免 omitted 等非协议字段泄漏到上游。
+        const toolResultImageBudget = {
+            max: 5,
+            queue: [],
+            omittedParts: new Set(),
+            dropped: 0
+        };
 
         // 处理系统指令 - 支持数组和字符串格式
         if (claudeRequest.system) {
@@ -1103,13 +1111,21 @@ export class ClaudeConverter extends BaseConverter {
                                         const convertedImageItems = new Set();
                                         for (const item of responseData) {
                                             if (item && item.type === 'image' && item.source?.type === 'base64' && item.source.data) {
-                                                imageParts.push({
+                                                const imagePart = {
                                                     inlineData: {
                                                         mimeType: item.source.media_type || 'image/jpeg',
                                                         data: item.source.data
                                                     }
-                                                });
+                                                };
+                                                imageParts.push(imagePart);
+                                                toolResultImageBudget.queue.push(imagePart);
                                                 convertedImageItems.add(item);
+
+                                                if (toolResultImageBudget.queue.length > toolResultImageBudget.max) {
+                                                    const victim = toolResultImageBudget.queue.shift();
+                                                    toolResultImageBudget.omittedParts.add(victim);
+                                                    toolResultImageBudget.dropped++;
+                                                }
                                             }
                                         }
                                         const remaining = responseData.filter(item => !convertedImageItems.has(item));
@@ -1169,6 +1185,15 @@ export class ClaudeConverter extends BaseConverter {
             });
         }
 
+        // 已超出预算的早期图片改成合法文本占位，保留 part 顺序但不把内部标记发给上游。
+        for (const imagePart of toolResultImageBudget.omittedParts) {
+            delete imagePart.inlineData;
+            imagePart.text = '[Earlier image omitted: too many images in one request. Re-read the file if you need to see it again.]';
+        }
+        if (toolResultImageBudget.dropped > 0) {
+            logger.info(`[Image Cap] Kept the ${toolResultImageBudget.max} most recent tool-result images, omitted ${toolResultImageBudget.dropped} earlier ones.`);
+        }
+
         // 添加生成配置
         const generationConfig = {};
         
@@ -1193,7 +1218,9 @@ export class ClaudeConverter extends BaseConverter {
                     generationConfig.thinkingConfig = {};
                 }
                 generationConfig.thinkingConfig.thinkingBudget = budget;
-                generationConfig.thinkingConfig.include_thoughts = true;
+                // 必须用驼峰 includeThoughts：下游 gemini/antigravity 层只认驼峰并在缺失时补写，
+                // 蛇形字段会和它们补的驼峰同时出现在 JSON 里，Google 的 proto oneof 视为重复赋值直接 400。
+                generationConfig.thinkingConfig.includeThoughts = true;
             }
         }
         

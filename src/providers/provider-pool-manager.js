@@ -9,6 +9,8 @@ import { convertData } from '../convert/convert.js';
 
 import {
     getConfiguredSupportedModels,
+    getCustomModelActualProvider,
+    customModelMatchesProvider,
     getCustomModelListProvider,
     getProviderModels,
     normalizeModelIds
@@ -65,6 +67,7 @@ export class ProviderPoolManager {
         'openai-custom': 'gpt-5.5',
         'atlascloud': 'gpt-5.5',
         'qiniu': 'gpt-5.5',
+        'apimart': 'gpt-5',
         'fenno': 'gpt-5.5',
         'openai-qwen-oauth': 'qwen3-coder-plus',
         'openai-iflow': 'qwen3-max',
@@ -1021,9 +1024,10 @@ export class ProviderPoolManager {
         // 提前计算池中最小序列号，避免在排序算法中重复 O(N) 计算
         const minSeq = Math.min(...availableProviders.map(p => p.config._lastSelectionSeq || 0));
 
+        const excludedUuids = new Set(Array.isArray(options.excludeUuids) ? options.excludeUuids : []);
         let availableAndHealthyProviders = availableProviders.filter(p =>
             p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh &&
-            !getKiroAccountUnavailableError(providerType, p.config)
+            !excludedUuids.has(p.config.uuid) && !getKiroAccountUnavailableError(providerType, p.config)
         );
 
         // 如果指定了模型，则排除不支持该模型的提供商
@@ -1445,9 +1449,10 @@ export class ProviderPoolManager {
     /**
      * Gets all available models across all provider pools, with optional format conversion.
      * @param {string} [endpointType] - Optional endpoint type for format conversion (OPENAI_MODEL_LIST or GEMINI_MODEL_LIST).
+     * @param {{ includeUnavailable?: boolean }} options Include the full UI catalog with discovery status.
      * @returns {Promise<Object|Array>} Formatted model list or raw array of model objects.
      */
-    async getAllAvailableModels(endpointType = null) {
+    async getAllAvailableModels(endpointType = null, { includeUnavailable = false } = {}) {
         const allModels = [];
         
         // 获取所有已注册的提供商和号池中的提供商
@@ -1458,6 +1463,7 @@ export class ProviderPoolManager {
             if (this.providerStatus[providerType]) {
                 const customAliases = getCustomModelAliasesForProvider(this.globalConfig, providerType);
                 const customModelIds = getCustomModelIdsForProvider(this.globalConfig, providerType);
+                const modelAvailability = new Map();
                 const configuredSupportedModels = normalizeModelIds(
                     this.providerStatus[providerType].flatMap(providerStatus =>
                         getConfiguredSupportedModels(providerType, providerStatus.config)
@@ -1471,13 +1477,17 @@ export class ProviderPoolManager {
                     ]);
 
                 if (providerType === MODEL_PROVIDER.ANTIGRAVITY && this.providerStatus[providerType].length > 0) {
-                    const { isAntigravityModelRetired } = await import('./gemini/antigravity-core.js');
-                    const currentTime = Date.now();
-                    if (models.some(model => isAntigravityModelRetired(model, currentTime, 'free-tier'))) {
+                    const {
+                        isAntigravityModelListed,
+                        isAntigravityModelRetired,
+                        resolveAntigravityUpstreamModel
+                    } = await import('./gemini/antigravity-core.js');
+                    if (includeUnavailable || models.some(model => !isAntigravityModelListed(model, 'free-tier'))) {
                         const accountAvailability = [];
                         for (const providerStatus of this.providerStatus[providerType]) {
                             let tierId;
                             let accountModelIds = null;
+                            let discoverySource = 'unknown';
                             try {
                                 const tempConfig = {
                                     ...this.globalConfig,
@@ -1493,6 +1503,7 @@ export class ProviderPoolManager {
                                             accountModelIds = new Set(nativeModelList.models
                                                 .map(model => model.name?.replace(/^models\//, ''))
                                                 .filter(Boolean));
+                                            discoverySource = serviceAdapter.antigravityApiService?.availableModelsSource || 'upstream';
                                         }
                                     } catch (err) {
                                         this._log('debug', `Failed to load Antigravity account tier for ${providerStatus.uuid}: ${err.message}`);
@@ -1502,17 +1513,51 @@ export class ProviderPoolManager {
                             } catch (err) {
                                 this._log('debug', `Failed to inspect Antigravity account tier for ${providerStatus.uuid}: ${err.message}`);
                             }
-                            accountAvailability.push({ tierId, modelIds: accountModelIds });
+                            accountAvailability.push({
+                                tierId,
+                                modelIds: accountModelIds,
+                                upstreamModelIds: accountModelIds
+                                    ? new Set([...accountModelIds].map(resolveAntigravityUpstreamModel))
+                                    : null,
+                                discoverySource
+                            });
                         }
 
-                        models = models.filter(model => {
-                            if (!isAntigravityModelRetired(model, currentTime, 'free-tier')) return true;
-                            return accountAvailability.some(({ tierId, modelIds }) => {
-                                if (!tierId) return true;
-                                if (isAntigravityModelRetired(model, currentTime, tierId)) return false;
-                                return !modelIds || modelIds.has(model);
+                        if (includeUnavailable) {
+                            const customModels = (Array.isArray(this.globalConfig.customModels) ? this.globalConfig.customModels : [])
+                                .filter(model => customModelMatchesProvider(model, providerType));
+                            for (const model of models) {
+                                const customModel = customModels.find(config => config.id?.trim() === model);
+                                const actualProvider = getCustomModelActualProvider(customModel) || providerType;
+                                if (actualProvider !== providerType) {
+                                    modelAvailability.set(model, 'unknown');
+                                    continue;
+                                }
+                                const actualModel = customModel?.actualModel || model;
+                                const upstreamModel = resolveAntigravityUpstreamModel(actualModel);
+                                const eligibleAccounts = accountAvailability.filter(account =>
+                                    !isAntigravityModelRetired(actualModel, Date.now(), account.tierId));
+                                const status = eligibleAccounts.length === 0 ? 'tier_restricted'
+                                    : eligibleAccounts.some(account => account.discoverySource === 'upstream' &&
+                                        account.upstreamModelIds?.has(upstreamModel)) ? 'returned'
+                                    : eligibleAccounts.some(account => account.discoverySource !== 'upstream') ? 'unknown'
+                                    : 'not_returned';
+                                modelAvailability.set(model, status);
+                            }
+                        } else {
+                            const explicitCustomModels = new Set(normalizeModelIds(customModelIds));
+                            models = models.filter(model => {
+                                // Manual registrations are list entries, not discovery results.
+                                // Keep them visible; actual routing still enforces account permissions.
+                                if (explicitCustomModels.has(model)) return true;
+                                if (isAntigravityModelListed(model, 'free-tier')) return true;
+                                return accountAvailability.some(({ tierId, modelIds }) => {
+                                    if (!tierId) return true;
+                                    if (!isAntigravityModelListed(model, tierId)) return false;
+                                    return !modelIds || modelIds.has(model);
+                                });
                             });
-                        });
+                        }
                     }
                 }
 
@@ -1563,7 +1608,10 @@ export class ProviderPoolManager {
                     allModels.push({
                         id: `${providerType}:${model}`,
                         provider: providerType,
-                        model: model
+                        model: model,
+                        ...(includeUnavailable && providerType === MODEL_PROVIDER.ANTIGRAVITY
+                            ? { availability: modelAvailability.get(model) || 'unknown' }
+                            : {})
                     });
                 }
             }
@@ -1824,6 +1872,7 @@ export class ProviderPoolManager {
             provider.config.lastRefreshTime = Date.now(); // 标记为健康时也视为刚刷新完成
             provider.config.lastErrorTime = null;
             provider.config.lastErrorMessage = null;
+            provider.config.scheduledRecoveryTime = null;
             provider.config._lastSelectionSeq = 0;
             
             // 更新健康检测信息
@@ -1869,12 +1918,29 @@ export class ProviderPoolManager {
             provider.config.needsRefresh = false;
             provider.config.refreshCount = 0;
             provider.config.lastRefreshTime = Date.now(); // 显式重置时也更新刷新时间
-            // 更新为可用
             provider.config.lastHealthCheckTime = new Date().toISOString();
-            // 标记为健康，以便立即投入使用
-            this._log('info', `Reset refresh status and marked healthy for provider ${this._getDisplayName(provider.config)} (${providerType})`);
-
+            // 额度冷却未到期时，刷新只代表凭据还能用，不代表配额已经恢复。
+            // 提前标健康会让同一账号立刻被重新选中，继续空转。
+            const recoveryAt = provider.config.scheduledRecoveryTime ? new Date(provider.config.scheduledRecoveryTime) : null;
+            if (recoveryAt && !Number.isNaN(recoveryAt.getTime()) && recoveryAt.getTime() > Date.now()) {
+                this._log('info', `Reset refresh status for provider ${this._getDisplayName(provider.config)} (${providerType}); quota recovery still scheduled at ${recoveryAt.toISOString()}`);
+                this._debouncedSave(providerType);
+                return;
+            }
+            // 刷新成功意味着凭据已恢复可用。旧实现只写“marked healthy”日志却没改
+            // isHealthy，代理短断后的刷新成功节点会永久停留在不健康池、所有请求被入口拒绝。
+            // 不走 markProviderHealthy：那条路径会把 usageCount 加一，刷新并不是一次真实请求。
+            const wasHealthy = provider.config.isHealthy;
+            provider.config.isHealthy = true;
+            provider.config.errorCount = 0;
+            provider.config.lastErrorTime = null;
+            provider.config.lastErrorMessage = null;
+            provider.config.scheduledRecoveryTime = null;
+            if (!wasHealthy) {
+                this._logHealthStatusChange(providerType, provider.config, 'unhealthy', 'healthy', null);
+            }
             this._debouncedSave(providerType);
+            this._log('info', `Reset refresh status and marked healthy for provider ${this._getDisplayName(provider.config)} (${providerType})`);
         }
     }
 

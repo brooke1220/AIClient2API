@@ -54,6 +54,8 @@ export const PROVIDER_MODELS = {
         'gemini-3.8-flash',
     ],
     'gemini-antigravity': [
+        'gemini-4-argon',
+        'gemini-4-argon-high',
         'gemini-3-flash',
         'gemini-3.5-flash-low',
         'gemini-3.5-flash-high',
@@ -102,6 +104,7 @@ export const PROVIDER_MODELS = {
     'openai-custom': [],
     'atlascloud': [],
     'qiniu': [],
+    'apimart': [],
     'fenno': [],
     'openaiResponses-custom': [],
     'openai-qwen-oauth': [
@@ -195,6 +198,7 @@ export const MANAGED_MODEL_LIST_PROVIDERS = [
     'claude-custom',
     'atlascloud',
     'qiniu',
+    'apimart',
     'fenno',
     'github-copilot'
 ];

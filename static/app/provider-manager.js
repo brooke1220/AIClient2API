@@ -12,6 +12,7 @@ import { updateConfigProviderConfigs } from './config-manager.js';
 import { loadConfigList, updateProviderFilterOptions } from './upload-config-manager.js';
 import { setServiceMode } from './event-handlers.js';
 import { createCopilotQuotaUsageLoader } from './copilot-quota-summary.js';
+import { createCodexQuotaUsageLoader } from './codex-quota-badges.js';
 
 // 保存初始服务器时间和运行时间
 let initialServerTime = null;
@@ -21,6 +22,9 @@ let isStaticProviderConfigsUpdated = false;
 let cachedSupportedProviders = null;
 let latestProvidersAccessInfo = null;
 const loadCopilotQuotaUsage = createCopilotQuotaUsageLoader({ apiClient: window.apiClient });
+const loadCodexQuotaUsage = createCodexQuotaUsageLoader({
+    apiClient: window.apiClient
+});
 
 function navigateToSection(sectionId) {
     const navItem = document.querySelector(`.nav-item[data-section="${sectionId}"]`);
@@ -450,6 +454,12 @@ function renderProviders(providers, supportedProviders = []) {
                     <span class="provider-stat-label" data-i18n="providers.stat.healthyAccounts">${t('providers.stat.healthyAccounts')}</span>
                     <span class="provider-stat-value">${healthyCount}</span>
                 </div>
+                ${providerType === 'openai-codex-oauth' ? `
+                    <div class="provider-stat">
+                        <span class="provider-stat-label" data-i18n="providers.stat.codexQuotaUsed" title="${t('providers.codexQuota.summaryTitle')}">${t('providers.stat.codexQuotaUsed')}</span>
+                        <span class="provider-stat-value" data-codex-quota-summary>${t('providers.codexQuota.loading')}</span>
+                    </div>
+                ` : ''}
                 <div class="provider-stat">
                     <span class="provider-stat-label" data-i18n="providers.stat.usageCount">${t('providers.stat.usageCount')}</span>
                     <span class="provider-stat-value">${usageCount}</span>
@@ -486,6 +496,16 @@ function renderProviders(providers, supportedProviders = []) {
                 quotaValue.textContent = result.available
                     ? `${Math.round(result.usedPercent)}% / ${Math.round(result.totalPercent)}%`
                     : t('providers.copilotQuota.unavailable');
+            });
+        }
+
+        if (providerType === 'openai-codex-oauth') {
+            const quotaSummary = providerDiv.querySelector('[data-codex-quota-summary]');
+            loadCodexQuotaUsage(accounts).then(summary => {
+                if (!quotaSummary?.isConnected) return;
+                quotaSummary.textContent = summary.available
+                    ? `${summary.usedPercent}/${summary.totalPercent}%`
+                    : t('providers.codexQuota.unavailable');
             });
         }
         
@@ -991,7 +1011,7 @@ function showSimplePrompt(title, placeholder, callback) {
  * @returns {string} 按钮HTML
  */
 function generateAddGroupButton(providerType) {
-    const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud', 'qiniu', 'fenno'];
+    const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud', 'qiniu', 'apimart', 'fenno'];
     if (!allowedTypes.includes(providerType)) {
         return '';
     }
@@ -4851,7 +4871,7 @@ function showAddProviderGroupModal(defaultBaseType = null) {
         const isSupported = cachedSupportedProviders.includes(config.id);
         
         // 2. 限制只能添加特定类型的配置组 (Claude Custom, OpenAI Custom, OpenAI Responses)
-        const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud', 'qiniu', 'fenno'];
+        const allowedTypes = ['claude-custom', 'openai-custom', 'openaiResponses-custom', 'atlascloud', 'qiniu', 'apimart', 'fenno'];
         const isAllowed = allowedTypes.includes(config.id);
         
         return isSupported && isAllowed;

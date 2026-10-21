@@ -374,6 +374,43 @@ function kiroRetryCount(value, fallback) {
     return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+function formatQuotaRecovery(recoveryTime) {
+    if (!(recoveryTime instanceof Date) || Number.isNaN(recoveryTime.getTime())) return '';
+    return ` Quota is expected to recover at ${recoveryTime.toISOString()}.`;
+}
+
+async function hasAlternateAfterQuotaExhaustion(providerPoolManager, config, model, providerType, exhaustedUuids) {
+    if (!providerPoolManager?.selectProviderWithFallback) return false;
+    const selected = await providerPoolManager.selectProviderWithFallback(providerType, model, {
+        skipUsageCount: true,
+        excludeUuids: exhaustedUuids
+    });
+    return Boolean(selected?.config?.uuid && !exhaustedUuids.includes(selected.config.uuid));
+}
+
+function applyCredentialCooldown(error, config, providerPoolManager, providerType, pooluuid, logPrefix) {
+    const quotaExhausted = error?.quotaExhausted === true;
+    const quotaRecoveryTime = error?.quotaRecoveryTime instanceof Date && !Number.isNaN(error.quotaRecoveryTime.getTime())
+        ? error.quotaRecoveryTime
+        : null;
+    const rateLimitRecoveryTime = quotaRecoveryTime || getRateLimitCooldownRecoveryTime(error, config, Date.now(), providerType);
+    if (!rateLimitRecoveryTime || !providerPoolManager || !pooluuid) {
+        return { recoveryTime: quotaRecoveryTime, credentialMarkedUnhealthy: false, quotaExhausted };
+    }
+
+    const reason = quotaRecoveryTime
+        ? '429 RESOURCE_EXHAUSTED - quota recovery scheduled'
+        : '429 Too Many Requests - short cooldown';
+    logger.info(`[Provider Pool] ${logPrefix} applying cooldown for ${providerType} (${pooluuid}) until ${rateLimitRecoveryTime.toISOString()}`);
+    providerPoolManager.markProviderUnhealthyWithRecoveryTime(providerType, {
+        uuid: pooluuid
+    }, reason, rateLimitRecoveryTime);
+    if (quotaRecoveryTime && !String(error.message || '').includes('Quota is expected to recover')) {
+        error.message = `${error.message || 'Quota exhausted.'}${formatQuotaRecovery(quotaRecoveryTime)}`;
+    }
+    return { recoveryTime: rateLimitRecoveryTime, credentialMarkedUnhealthy: true, quotaExhausted };
+}
+
 // ==================== API 常量 ====================
 
 export const API_ACTIONS = {
@@ -578,6 +615,7 @@ export function getProtocolPrefix(provider) {
     // Special cases for OpenAI-compatible dedicated providers.
     if (provider === 'atlascloud' || provider.startsWith('atlascloud-') ||
         provider === 'qiniu' || provider.startsWith('qiniu-') ||
+        provider === 'apimart' || provider.startsWith('apimart-') ||
         provider === 'fenno' || provider.startsWith('fenno-') ||
         provider === 'github-copilot' || provider.startsWith('github-copilot-')) {
         return MODEL_PROTOCOL_PREFIX.OPENAI;
@@ -1093,10 +1131,216 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     }
     let hasToolCall = false;
     let hasMessageStop = false; // 跟踪是否已经发送过结束标志（message_stop / done）
+    let nextResponseSequenceNumber = 0;
     // finally 必须能访问这两个值：客户端 close、上游 throw 和无终止块 EOF 都要释放状态。
     // generateContentStream 初始化失败前 streamRequestId 仍为空，安全跳过清理。
     let needsConversion = false;
     let streamRequestId = null;
+    const clientProtocol = getProtocolPrefix(fromProvider);
+    let shouldNormalizeClaudeStream = false;
+
+    // 只用于“转换后输出为 Claude”的流。原生 Claude 流不进入该状态机，必须原样透传。
+    // 重试帧复用同一个状态，避免首次空流后重试产生第二个 message_start 或遗失 block stop。
+    const claudeStreamState = retryContext?.claudeStreamState || {
+        started: false,
+        nextIndex: 0,
+        current: null,
+        open: new Map(),
+        indexesUnreliable: false,
+        sawToolUse: false,
+        stopReasonSeen: false,
+        messageStopSent: false
+    };
+    const isClaudeToolBlock = type => type === 'tool_use' || type === 'server_tool_use';
+    const CLAUDE_DELTA_BLOCK = {
+        thinking_delta: 'thinking',
+        signature_delta: 'thinking',
+        text_delta: 'text'
+    };
+    const claudeStreamFix = (chunk, out) => {
+        const eventType = chunk?.type;
+        if (!eventType) {
+            out.push(chunk);
+            return;
+        }
+
+        const closeBlock = block => {
+            if (!block) return;
+            out.push({ type: 'content_block_stop', index: block.index });
+            claudeStreamState.open.delete(block.sourceIndex);
+            if (claudeStreamState.current === block) claudeStreamState.current = null;
+        };
+        const closeCurrent = () => closeBlock(claudeStreamState.current);
+        const closeAllOpen = () => {
+            for (const block of claudeStreamState.open.values()) {
+                out.push({ type: 'content_block_stop', index: block.index });
+            }
+            claudeStreamState.open.clear();
+            claudeStreamState.current = null;
+        };
+        const ensureMessageStart = () => {
+            if (claudeStreamState.started) return;
+            claudeStreamState.started = true;
+            out.push({
+                type: 'message_start',
+                message: {
+                    id: `msg_${Date.now().toString(36)}`,
+                    type: 'message',
+                    role: 'assistant',
+                    model,
+                    content: [],
+                    stop_reason: null,
+                    stop_sequence: null,
+                    usage: { input_tokens: 0, output_tokens: 0 }
+                }
+            });
+        };
+        const startSyntheticBlock = blockType => {
+            const index = claudeStreamState.nextIndex++;
+            // 合成块也必须登记进 open，收尾时才会被 closeAllOpen 关闭；
+            // sourceIndex 用字符串键，永不与转换器提供的整数索引相撞。
+            const opened = {
+                index,
+                sourceIndex: `synthetic-${index}`,
+                type: blockType,
+                toolId: null,
+                ownsSourceIndex: false
+            };
+            claudeStreamState.open.set(opened.sourceIndex, opened);
+            claudeStreamState.current = opened;
+            if (isClaudeToolBlock(blockType)) claudeStreamState.sawToolUse = true;
+            out.push({
+                type: 'content_block_start',
+                index,
+                content_block: blockType === 'thinking'
+                    ? { type: 'thinking', thinking: '' }
+                    : { type: 'text', text: '' }
+            });
+        };
+
+        // Converted streams normally do not include this event, but preserve one if a converter does.
+        if (eventType === 'message_start') {
+            if (!claudeStreamState.started) {
+                claudeStreamState.started = true;
+                out.push(chunk);
+            }
+            return;
+        }
+
+        ensureMessageStart();
+
+        if (eventType === 'content_block_start') {
+            const blockType = chunk.content_block?.type || 'text';
+            const suppliedIndex = Number.isInteger(chunk.index) ? chunk.index : null;
+            const sourceKnown = suppliedIndex !== null && !claudeStreamState.open.has(suppliedIndex);
+            const sourceIndex = sourceKnown ? suppliedIndex : claudeStreamState.nextIndex;
+            // Gemini repeats index 0 for every call. Once an index is reused it is not an identity,
+            // so later argument fragments follow the call that just opened.
+            if (suppliedIndex !== null && claudeStreamState.open.has(suppliedIndex)) {
+                claudeStreamState.indexesUnreliable = true;
+            }
+            // 只有没有可靠源索引的合成块，才在类型切换时提前关闭。
+            // 带源索引的文本/思考块必须留到它自己的 content_block_stop，
+            // 否则先开文本再开工具时，文本块被删掉，后续工具参数会因为找不到原块而被截断。
+            if (claudeStreamState.current && !claudeStreamState.current.ownsSourceIndex) closeCurrent();
+
+            const index = claudeStreamState.nextIndex++;
+            const block = chunk.content_block ? { ...chunk.content_block } : { type: blockType, text: '' };
+            if (blockType === 'thinking' && typeof block.thinking !== 'string') block.thinking = '';
+            if (blockType === 'text' && typeof block.text !== 'string') block.text = '';
+            const opened = {
+                index,
+                sourceIndex,
+                type: blockType,
+                toolId: isClaudeToolBlock(blockType) ? block.id || null : null,
+                ownsSourceIndex: sourceKnown
+            };
+            claudeStreamState.open.set(sourceIndex, opened);
+            claudeStreamState.current = opened;
+            if (isClaudeToolBlock(blockType)) claudeStreamState.sawToolUse = true;
+            out.push({ ...chunk, index, content_block: block });
+            return;
+        }
+
+        if (eventType === 'content_block_delta') {
+            const deltaType = chunk.delta?.type;
+            if (deltaType === 'input_json_delta') {
+                const addressed = Number.isInteger(chunk.index) ? claudeStreamState.open.get(chunk.index) : null;
+                // A source index identifies a call only while indexes are unique.
+                // Gemini repeats 0, so only its first call claims 0; later calls follow current.
+                const target = !claudeStreamState.indexesUnreliable
+                    && addressed?.ownsSourceIndex
+                    && isClaudeToolBlock(addressed.type)
+                    ? addressed
+                    : null;
+                if (target) {
+                    claudeStreamState.current = target;
+                    out.push({ ...chunk, index: target.index });
+                } else if (claudeStreamState.current && isClaudeToolBlock(claudeStreamState.current.type)) {
+                    out.push({ ...chunk, index: claudeStreamState.current.index });
+                } else {
+                    closeCurrent();
+                    startSyntheticBlock('text');
+                    out.push({
+                        type: 'content_block_delta',
+                        index: claudeStreamState.current.index,
+                        delta: { type: 'text_delta', text: chunk.delta?.partial_json || '' }
+                    });
+                }
+                return;
+            }
+
+            const blockType = CLAUDE_DELTA_BLOCK[deltaType] || 'text';
+            const addressed = Number.isInteger(chunk.index) ? claudeStreamState.open.get(chunk.index) : null;
+            const target = !claudeStreamState.indexesUnreliable
+                && addressed?.ownsSourceIndex
+                && addressed.type === blockType
+                ? addressed
+                : null;
+            if (target) {
+                claudeStreamState.current = target;
+            } else if (!claudeStreamState.current || claudeStreamState.current.type !== blockType) {
+                closeCurrent();
+                startSyntheticBlock(blockType);
+            }
+            out.push({ ...chunk, index: claudeStreamState.current.index });
+            return;
+        }
+
+        if (eventType === 'content_block_stop') {
+            const addressed = Number.isInteger(chunk.index) ? claudeStreamState.open.get(chunk.index) : null;
+            if (!claudeStreamState.indexesUnreliable && addressed?.ownsSourceIndex) closeBlock(addressed);
+            else closeCurrent();
+            return;
+        }
+
+        if (eventType === 'message_delta') {
+            closeAllOpen();
+            if (chunk.delta?.stop_reason) claudeStreamState.stopReasonSeen = true;
+            out.push(chunk);
+            return;
+        }
+
+        if (eventType === 'message_stop') {
+            if (claudeStreamState.open.size === 0) closeCurrent();
+            closeAllOpen();
+            if (!claudeStreamState.stopReasonSeen) {
+                out.push({
+                    type: 'message_delta',
+                    delta: { stop_reason: claudeStreamState.sawToolUse ? 'tool_use' : 'end_turn' },
+                    usage: { output_tokens: 0 }
+                });
+                claudeStreamState.stopReasonSeen = true;
+            }
+            if (!claudeStreamState.messageStopSent) {
+                out.push(chunk);
+                claudeStreamState.messageStopSent = true;
+            }
+            return;
+        }
+
+        out.push(chunk);
+    };
 
     let slotReleased = false;
     const releaseCurrentSlot = () => {
@@ -1130,6 +1374,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // fs.writeFile('request'+Date.now()+'.json', JSON.stringify(requestBody));
         // The service returns a stream in its native format (toProvider).
         needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
+        // 在创建 generator 前确定：若首次尝试空流/初始化失败后递归重试，外层 finally
+        // 仍需知道它负责的是转换后的 Claude 流，才能用共享状态完成收尾。
+        shouldNormalizeClaudeStream = clientProtocol === MODEL_PROTOCOL_PREFIX.CLAUDE && needsConversion;
         requestBody.model = model;
         const generationOptions = { signal: upstreamAbortController.signal };
         if (isKiroStream) {
@@ -1144,7 +1391,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (requestBody.model && requestBody.model !== model) {
             model = requestBody.model;
         }
-        const addEvent = getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.CLAUDE || getProtocolPrefix(fromProvider) === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
+        const addEvent = clientProtocol === MODEL_PROTOCOL_PREFIX.CLAUDE || clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES;
         // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态。
         streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
@@ -1194,10 +1441,17 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 continue;
             }
 
-            // 处理 chunkToSend 可能是数组或对象的情况
+            // 处理 chunkToSend 可能是数组或对象的情况。
             const chunksToSend = Array.isArray(chunkToSend) ? chunkToSend : [chunkToSend];
+            let outChunks = chunksToSend;
+            if (shouldNormalizeClaudeStream) {
+                outChunks = [];
+                for (const convertedChunk of chunksToSend) {
+                    claudeStreamFix(convertedChunk, outChunks);
+                }
+            }
 
-            for (const chunk of chunksToSend) {
+            for (const chunk of outChunks) {
                 // 再次检查客户端连接状态
                 if (clientDisconnected.value) {
                     break;
@@ -1268,6 +1522,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 if (!clientDisconnected.value && !res.writableEnded) {
                     try {
                         await writeStreamRecord(`data: ${JSON.stringify(chunk)}\n\n`, () => { anyDataSent = true; });
+                        if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES) {
+                            const sequence = chunk?.sequence_number;
+                            nextResponseSequenceNumber = Number.isInteger(sequence) && sequence >= 0
+                                ? Math.max(nextResponseSequenceNumber, sequence + 1)
+                                : nextResponseSequenceNumber + 1;
+                        }
                     } catch (writeErr) {
                         logger.error('[Stream] Failed to write data:', writeErr.message);
                         clientDisconnected.value = true;
@@ -1313,7 +1573,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (anyDataSent) {
             logger.info(`[Stream Retry] Cannot retry: data already sent to client`);
             // 直接发送错误并结束
-            const errorPayload = createStreamErrorResponse(error, fromProvider);
+            const errorPayload = createStreamErrorResponse(error, fromProvider, nextResponseSequenceNumber);
             if (!res.writableEnded) {
                 try {
                     if (isKiroStream) await writeStreamRecord(errorPayload);
@@ -1350,7 +1610,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     maxRetries,
                     responseFailureRetry,
                     clientDisconnected,
-                    anyDataSent
+                    anyDataSent,
+                    claudeStreamState
                 };
 
                 return await handleStreamRequest(
@@ -1371,7 +1632,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
 
             const giveUpError = new Error(`${toProvider} upstream response failed with ${failureLabel} after ${attemptsMade} retr${attemptsMade === 1 ? 'y' : 'ies'} using the same request. Please try again, or /clear your session if this keeps happening.`);
             giveUpError.status = 502;
-            const errorPayload = createStreamErrorResponse(giveUpError, fromProvider);
+            const errorPayload = createStreamErrorResponse(giveUpError, fromProvider, nextResponseSequenceNumber);
             if (!clientDisconnected.value && !res.writableEnded) {
                 try {
                     if (isKiroStream) await writeStreamRecord(errorPayload);
@@ -1396,14 +1657,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
 
-        const rateLimitRecoveryTime = getRateLimitCooldownRecoveryTime(error, CONFIG, Date.now(), toProvider);
-        if (rateLimitRecoveryTime && providerPoolManager && pooluuid) {
-            logger.info(`[Provider Pool] Applying 429 cooldown for ${toProvider} (${pooluuid}) until ${rateLimitRecoveryTime.toISOString()}`);
-            providerPoolManager.markProviderUnhealthyWithRecoveryTime(toProvider, {
-                uuid: pooluuid
-            }, '429 Too Many Requests - short cooldown', rateLimitRecoveryTime);
-            credentialMarkedUnhealthy = true;
-        }
+        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Stream]');
+        if (cooldown.credentialMarkedUnhealthy) credentialMarkedUnhealthy = true;
         
         // 如果底层未标记，且不跳过错误计数，则在此处标记
         if (!credentialMarkedUnhealthy && !skipErrorCount && providerPoolManager && pooluuid) {
@@ -1424,15 +1679,25 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (shouldSwitchCredential && !credentialMarkedUnhealthy) {
             credentialMarkedUnhealthy = true; // 触发下面的重试逻辑
         }
+
+        // 额度耗尽后交给现有选择逻辑判断。它会同时看当前池、fallback 链和模型映射，
+        // 并排除这次请求里已经确认耗尽的全部账号。手写预查会漏掉模型映射。
+        const exhaustedUuids = cooldown.quotaExhausted
+            ? [...new Set([...(retryContext?.exhaustedUuids || []), pooluuid].filter(Boolean))]
+            : [];
+        const quotaHasAlternate = !cooldown.quotaExhausted || await hasAlternateAfterQuotaExhaustion(providerPoolManager, CONFIG, model, toProvider, exhaustedUuids);
+        if (cooldown.quotaExhausted && !quotaHasAlternate) {
+            logger.info(`[Stream Retry] Quota exhausted for ${toProvider} (${pooluuid}) and no alternate credential exists. Returning immediately.`);
+        }
         
         // 凭证已被标记为不健康后，尝试切换到新凭证重试
         // 不再依赖状态码判断，只要凭证被标记不健康且可以重试，就尝试切换
-        if (credentialMarkedUnhealthy && currentRetry < maxRetries && providerPoolManager && CONFIG) {
-            // 增加10秒内的随机等待时间，避免所有请求同时切换凭证
+        if (credentialMarkedUnhealthy && quotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
+            // 额度耗尽立即换号；其它错误保留抖动，并在等待前释放当前插槽。
             releaseCurrentSlot();
-            const randomDelay = Math.floor(Math.random() * 10000); // 0-10000毫秒
+            const randomDelay = cooldown.quotaExhausted ? 0 : Math.floor(Math.random() * 10000);
             logger.info(`[Stream Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
-            await sleep(randomDelay, undefined, { signal: upstreamAbortController.signal }).catch(() => {});
+            if (randomDelay > 0) await sleep(randomDelay, undefined, { signal: upstreamAbortController.signal }).catch(() => {});
             // 客户端在等待期间断开：不再占用新凭证的并发插槽，也无需写错误响应
             if (upstreamAbortController.signal.aborted) {
                 logger.info('[Stream Retry] Client disconnected during retry delay, skipping credential switch');
@@ -1444,7 +1709,11 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
-                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true, signal: upstreamAbortController.signal });
+                const result = await getApiServiceWithFallback(CONFIG, model, {
+                    acquireSlot: true,
+                    signal: upstreamAbortController.signal,
+                    excludeUuids: exhaustedUuids
+                });
                 
                 if (result && result.service) {
                     logger.info(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -1453,11 +1722,13 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     const newRetryContext = {
                         ...retryContext,
                         slotLease: result.slotLease || null,
+                        exhaustedUuids: cooldown.quotaExhausted ? exhaustedUuids : retryContext?.exhaustedUuids,
                         CONFIG,
                         currentRetry: currentRetry + 1,
                         maxRetries,
                         clientDisconnected,  // 传递断开状态
-                        anyDataSent          // 传递数据发送状态
+                        anyDataSent,         // 传递数据发送状态
+                        claudeStreamState
                     };
                     
                     // 递归调用，使用新的服务
@@ -1484,7 +1755,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
 
         // 使用新方法创建符合 fromProvider 格式的流式错误响应
-        const errorPayload = createStreamErrorResponse(error, fromProvider);
+        const errorPayload = createStreamErrorResponse(error, fromProvider, nextResponseSequenceNumber);
         if (!clientDisconnected.value && !res.writableEnded) {
             try {
                 if (isKiroStream) await writeStreamRecord(errorPayload);
@@ -1532,7 +1803,21 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         // OpenAI Responses 以 response.completed/response.incomplete（或 error）作为结束事件。
                         // 连接关闭即表示流结束；不要再追加 `event: done` + `data: {}`，否则会触发下游类型校验失败（AI_TypeValidationError）。
                     } else if (clientProtocol === MODEL_PROTOCOL_PREFIX.CLAUDE) {
-                        if (!hasMessageStop) {
+                        if (shouldNormalizeClaudeStream) {
+                            const closingChunks = [];
+                            claudeStreamFix({ type: 'message_stop' }, closingChunks);
+                            for (const closingChunk of closingChunks) {
+                                if (isKiroStream) {
+                                    await writeStreamRecord(`event: ${closingChunk.type}\n`, undefined, null);
+                                    await writeStreamRecord(`data: ${JSON.stringify(closingChunk)}\n\n`, undefined, null);
+                                } else {
+                                    res.write(`event: ${closingChunk.type}\n`);
+                                    res.write(`data: ${JSON.stringify(closingChunk)}\n\n`);
+                                }
+                            }
+                            hasMessageStop = claudeStreamState.messageStopSent;
+                        } else if (!hasMessageStop) {
+                            // Native Claude stream: only add the missing outer stop marker.
                             if (isKiroStream) {
                                 await writeStreamRecord('event: message_stop\n', undefined, null);
                                 await writeStreamRecord('data: {"type":"message_stop"}\n\n', undefined, null);
@@ -1707,14 +1992,8 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
 
-        const rateLimitRecoveryTime = getRateLimitCooldownRecoveryTime(error, CONFIG, Date.now(), toProvider);
-        if (rateLimitRecoveryTime && providerPoolManager && pooluuid) {
-            logger.info(`[Provider Pool] Applying 429 cooldown for ${toProvider} (${pooluuid}) until ${rateLimitRecoveryTime.toISOString()}`);
-            providerPoolManager.markProviderUnhealthyWithRecoveryTime(toProvider, {
-                uuid: pooluuid
-            }, '429 Too Many Requests - short cooldown', rateLimitRecoveryTime);
-            credentialMarkedUnhealthy = true;
-        }
+        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Unary]');
+        if (cooldown.credentialMarkedUnhealthy) credentialMarkedUnhealthy = true;
         
         // 如果底层未标记，且不跳过错误计数，则在此处标记
         if (!credentialMarkedUnhealthy && !skipErrorCount && providerPoolManager && pooluuid) {
@@ -1735,22 +2014,34 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         if (shouldSwitchCredential && !credentialMarkedUnhealthy) {
             credentialMarkedUnhealthy = true; // 触发下面的重试逻辑
         }
+
+        const exhaustedUuids = cooldown.quotaExhausted
+            ? [...new Set([...(retryContext?.exhaustedUuids || []), pooluuid].filter(Boolean))]
+            : [];
+        const quotaHasAlternate = !cooldown.quotaExhausted || await hasAlternateAfterQuotaExhaustion(providerPoolManager, CONFIG, model, toProvider, exhaustedUuids);
+        if (cooldown.quotaExhausted && !quotaHasAlternate) {
+            logger.info(`[Unary Retry] Quota exhausted for ${toProvider} (${pooluuid}) and no alternate credential exists. Returning immediately.`);
+        }
         
         // 凭证已被标记为不健康后，尝试切换到新凭证重试
         // 不再依赖状态码判断，只要凭证被标记不健康且可以重试，就尝试切换
-        if (credentialMarkedUnhealthy && currentRetry < maxRetries && providerPoolManager && CONFIG) {
-            // 增加10秒内的随机等待时间，避免所有请求同时切换凭证
+        if (credentialMarkedUnhealthy && quotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
+            // 额度耗尽立即换号；其它错误保留抖动，并在等待前释放当前插槽。
             releaseCurrentSlot();
-            const randomDelay = Math.floor(Math.random() * 10000); // 0-10000毫秒
+            const randomDelay = cooldown.quotaExhausted ? 0 : Math.floor(Math.random() * 10000);
             logger.info(`[Unary Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
-            await sleep(randomDelay, undefined, { signal: retryContext?.upstreamAbortController?.signal }).catch(() => {});
+            if (randomDelay > 0) await sleep(randomDelay, undefined, { signal: retryContext?.upstreamAbortController?.signal }).catch(() => {});
             if (retryContext?.upstreamAbortController?.signal.aborted) return;
             
             try {
                 // 动态导入以避免循环依赖
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
-                const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true, signal: retryContext?.upstreamAbortController?.signal });
+                const result = await getApiServiceWithFallback(CONFIG, model, {
+                    acquireSlot: true,
+                    signal: retryContext?.upstreamAbortController?.signal,
+                    excludeUuids: exhaustedUuids
+                });
                 
                 if (result && result.service) {
                     logger.info(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -1759,6 +2050,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                     const newRetryContext = {
                         ...retryContext,
                         slotLease: result.slotLease || null,
+                        exhaustedUuids: cooldown.quotaExhausted ? exhaustedUuids : retryContext?.exhaustedUuids,
                         CONFIG,
                         currentRetry: currentRetry + 1,
                         maxRetries
@@ -2636,7 +2928,7 @@ function createErrorResponse(error, fromProvider) {
                 error: {
                     message: errorMessage,
                     type: getErrorType(statusCode),
-                    code: getErrorType(statusCode)  // OpenAI 使用 code 字段作为核心判断
+                    code: error.responseFailureCode || getErrorType(statusCode)  // Preserve normalized upstream failure codes
                 }
             };
             
@@ -2646,7 +2938,7 @@ function createErrorResponse(error, fromProvider) {
                 error: {
                     type: getErrorType(statusCode),
                     message: errorMessage,
-                    code: getErrorType(statusCode)
+                    code: error.responseFailureCode || getErrorType(statusCode)
                 }
             };
             
@@ -2686,9 +2978,10 @@ function createErrorResponse(error, fromProvider) {
  * 创建符合 fromProvider 格式的流式错误响应
  * @param {Error} error - 错误对象
  * @param {string} fromProvider - 客户端期望的提供商格式
+ * @param {number} sequenceNumber - Responses API error event sequence after the sent frames.
  * @returns {string} 格式化的流式错误响应字符串
  */
-function createStreamErrorResponse(error, fromProvider) {
+function createStreamErrorResponse(error, fromProvider, sequenceNumber = 0) {
     const protocolPrefix = getProtocolPrefix(fromProvider);
     const rawStatusCode = error.status || error.code || 500;
     const statusCode = ensureValidStatusCode(rawStatusCode);
@@ -2721,7 +3014,7 @@ function createStreamErrorResponse(error, fromProvider) {
                 error: {
                     message: errorMessage,
                     type: getErrorType(statusCode),
-                    code: null
+                    code: error.responseFailureCode || null
                 }
             };
             return `data: ${JSON.stringify(openaiError)}\n\n`;
@@ -2729,14 +3022,11 @@ function createStreamErrorResponse(error, fromProvider) {
         case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
             // OpenAI Responses API 流式错误格式（SSE event + data）
             const responsesError = {
-                id: `resp_${Date.now()}`,
-                object: "error",
-                created: Math.floor(Date.now() / 1000),
-                error: {
-                    type: getErrorType(statusCode),
-                    message: errorMessage,
-                    code: getErrorType(statusCode)
-                }
+                type: 'error',
+                sequence_number: sequenceNumber,
+                code: error.responseFailureCode || getErrorType(statusCode),
+                message: errorMessage,
+                param: null
             };
             return `event: error\ndata: ${JSON.stringify(responsesError)}\n\n`;
             
@@ -2770,7 +3060,7 @@ function createStreamErrorResponse(error, fromProvider) {
                 error: {
                     message: errorMessage,
                     type: getErrorType(statusCode),
-                    code: null
+                    code: error.responseFailureCode || null
                 }
             };
             return `data: ${JSON.stringify(defaultError)}\n\n`;

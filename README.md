@@ -177,6 +177,16 @@
   </tr>
   <tr>
     <td width="25%" align="center" valign="middle">
+      <a href="https://go.apimart.ai/gh-aiclient2api">
+        <img src="static/apimart.png" alt="APIMart Sponsor" width="180">
+      </a>
+    </td>
+    <td width="75%" align="left" valign="middle">
+      Thanks to APIMart for sponsoring this project! APIMart is a low-cost API platform for AI image &amp; video generation — GPT-Image-2 from $0.006/image, 160+ images per dollar. One async API covers both image and video: submit a task, get an ID, fetch results via polling or callback. Batch tens of thousands of images without timeouts, switch models without changing code. Pay-as-you-go with no monthly fee — <a href="https://go.apimart.ai/gh-aiclient2api">sign up here</a> to get started.
+    </td>
+  </tr>
+  <tr>
+    <td width="25%" align="center" valign="middle">
       <a href="https://www.runninghub.ai/call-api?source=github">
         <img src="static/runninghub.png" alt="RunningHub Sponsor" width="180">
       </a>
@@ -467,6 +477,8 @@ In the Web UI management interface, you can complete authorization configuration
 1. **Personal Account**: Personal accounts require separate authorization, application channels have been closed.
 2. **Pro Member**: Antigravity is temporarily open to Pro members, you need to purchase a Pro membership first.
 3. **Organization Account**: Organization accounts require separate authorization, contact the administrator to obtain authorization.
+
+For free-tier model listings, legacy alias compatibility, and differences from upstream documentation, see the [Antigravity free-tier model policy](docs/ANTIGRAVITY_FREE_TIER_MODELS.md).
 
 #### Kiro API Configuration
 1. **Environment Preparation**: [Download and install Kiro client](https://kiro.dev/pricing/)
