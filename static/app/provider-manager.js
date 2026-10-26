@@ -11,8 +11,6 @@ import { updateUsageProviderConfigs } from './usage-manager.js';
 import { updateConfigProviderConfigs } from './config-manager.js';
 import { loadConfigList, updateProviderFilterOptions } from './upload-config-manager.js';
 import { setServiceMode } from './event-handlers.js';
-import { createCopilotQuotaUsageLoader } from './copilot-quota-summary.js';
-import { createCodexQuotaUsageLoader } from './codex-quota-badges.js';
 
 // 保存初始服务器时间和运行时间
 let initialServerTime = null;
@@ -21,10 +19,6 @@ let initialLoadTime = null;
 let isStaticProviderConfigsUpdated = false;
 let cachedSupportedProviders = null;
 let latestProvidersAccessInfo = null;
-const loadCopilotQuotaUsage = createCopilotQuotaUsageLoader({ apiClient: window.apiClient });
-const loadCodexQuotaUsage = createCodexQuotaUsageLoader({
-    apiClient: window.apiClient
-});
 
 function navigateToSection(sectionId) {
     const navItem = document.querySelector(`.nav-item[data-section="${sectionId}"]`);
@@ -454,12 +448,6 @@ function renderProviders(providers, supportedProviders = []) {
                     <span class="provider-stat-label" data-i18n="providers.stat.healthyAccounts">${t('providers.stat.healthyAccounts')}</span>
                     <span class="provider-stat-value">${healthyCount}</span>
                 </div>
-                ${providerType === 'openai-codex-oauth' ? `
-                    <div class="provider-stat">
-                        <span class="provider-stat-label" data-i18n="providers.stat.codexQuotaUsed" title="${t('providers.codexQuota.summaryTitle')}">${t('providers.stat.codexQuotaUsed')}</span>
-                        <span class="provider-stat-value" data-codex-quota-summary>${t('providers.codexQuota.loading')}</span>
-                    </div>
-                ` : ''}
                 <div class="provider-stat">
                     <span class="provider-stat-label" data-i18n="providers.stat.usageCount">${t('providers.stat.usageCount')}</span>
                     <span class="provider-stat-value">${usageCount}</span>
@@ -468,11 +456,6 @@ function renderProviders(providers, supportedProviders = []) {
                     <span class="provider-stat-label" data-i18n="providers.stat.errorCount">${t('providers.stat.errorCount')}</span>
                     <span class="provider-stat-value">${errorCount}</span>
                 </div>
-                ${providerType === 'github-copilot' ? `
-                <div class="provider-stat copilot-quota-stat" title="${t('providers.copilotQuota.summaryTitle')}">
-                    <span class="provider-stat-label" data-i18n="providers.stat.copilotQuotaUsed">${t('providers.stat.copilotQuotaUsed')}</span>
-                    <span class="provider-stat-value copilot-quota-stat-value">${t('providers.copilotQuota.loading')}</span>
-                </div>` : ''}
             </div>
         `;
 
@@ -489,26 +472,6 @@ function renderProviders(providers, supportedProviders = []) {
 
         container.appendChild(providerDiv);
 
-        if (providerType === 'github-copilot') {
-            const quotaValue = providerDiv.querySelector('.copilot-quota-stat-value');
-            loadCopilotQuotaUsage(accounts).then(result => {
-                if (!quotaValue) return;
-                quotaValue.textContent = result.available
-                    ? `${Math.round(result.usedPercent)}% / ${Math.round(result.totalPercent)}%`
-                    : t('providers.copilotQuota.unavailable');
-            });
-        }
-
-        if (providerType === 'openai-codex-oauth') {
-            const quotaSummary = providerDiv.querySelector('[data-codex-quota-summary]');
-            loadCodexQuotaUsage(accounts).then(summary => {
-                if (!quotaSummary?.isConnected) return;
-                quotaSummary.textContent = summary.available
-                    ? `${summary.usedPercent}/${summary.totalPercent}%`
-                    : t('providers.codexQuota.unavailable');
-            });
-        }
-        
         // 为添加分组按钮添加事件监听
         const addGroupBtn = providerDiv.querySelector('.add-group-btn');
         if (addGroupBtn) {

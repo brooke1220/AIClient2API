@@ -388,7 +388,7 @@ async function hasAlternateAfterQuotaExhaustion(providerPoolManager, config, mod
     return Boolean(selected?.config?.uuid && !exhaustedUuids.includes(selected.config.uuid));
 }
 
-function applyCredentialCooldown(error, config, providerPoolManager, providerType, pooluuid, logPrefix) {
+function applyCredentialCooldown(error, config, providerPoolManager, providerType, pooluuid, logPrefix, model = null) {
     const quotaExhausted = error?.quotaExhausted === true;
     const quotaRecoveryTime = error?.quotaRecoveryTime instanceof Date && !Number.isNaN(error.quotaRecoveryTime.getTime())
         ? error.quotaRecoveryTime
@@ -402,9 +402,22 @@ function applyCredentialCooldown(error, config, providerPoolManager, providerTyp
         ? '429 RESOURCE_EXHAUSTED - quota recovery scheduled'
         : '429 Too Many Requests - short cooldown';
     logger.info(`[Provider Pool] ${logPrefix} applying cooldown for ${providerType} (${pooluuid}) until ${rateLimitRecoveryTime.toISOString()}`);
-    providerPoolManager.markProviderUnhealthyWithRecoveryTime(providerType, {
-        uuid: pooluuid
-    }, reason, rateLimitRecoveryTime);
+    // Antigravity Gemini and third-party (Claude/GPT) quotas are independent books.
+    // Quarantine only the exhausted family so the account stays usable for the other.
+    if (quotaExhausted && quotaRecoveryTime && providerType === MODEL_PROVIDER.ANTIGRAVITY &&
+        model && typeof providerPoolManager.markAntigravityQuotaExhausted === 'function') {
+        providerPoolManager.markAntigravityQuotaExhausted(providerType, {
+            uuid: pooluuid
+        }, {
+            model,
+            recoveryTime: quotaRecoveryTime,
+            errorMessage: reason
+        });
+    } else {
+        providerPoolManager.markProviderUnhealthyWithRecoveryTime(providerType, {
+            uuid: pooluuid
+        }, reason, rateLimitRecoveryTime);
+    }
     if (quotaRecoveryTime && !String(error.message || '').includes('Quota is expected to recover')) {
         error.message = `${error.message || 'Quota exhausted.'}${formatQuotaRecovery(quotaRecoveryTime)}`;
     }
@@ -1657,7 +1670,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
 
-        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Stream]');
+        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Stream]', model);
         if (cooldown.credentialMarkedUnhealthy) credentialMarkedUnhealthy = true;
         
         // 如果底层未标记，且不跳过错误计数，则在此处标记
@@ -1992,7 +2005,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
 
-        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Unary]');
+        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Unary]', model);
         if (cooldown.credentialMarkedUnhealthy) credentialMarkedUnhealthy = true;
         
         // 如果底层未标记，且不跳过错误计数，则在此处标记

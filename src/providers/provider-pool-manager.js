@@ -17,6 +17,7 @@ import {
 } from './provider-models.js';
 import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { ENDPOINT_TYPE } from '../utils/common.js';
+import { quotaFamilyForModel } from './gemini/antigravity-quota-family.js';
 
 function kiroPauseSnapshot(provider, config) {
     return JSON.stringify([
@@ -904,6 +905,8 @@ export class ProviderPoolManager {
                         providerConfig.kiroAccountSuspended = true;
                     }
 
+                    this._migrateLegacyAntigravityQuotaCooldown(providerType, providerConfig);
+
                     const slotState = existing ? existing.state : { activeCount: 0, waitingCount: 0, queue: [] };
                     Object.defineProperty(slotState, '_slotConfig', { value: providerConfig, writable: true, configurable: true });
                     const providerStatus = {
@@ -1029,6 +1032,14 @@ export class ProviderPoolManager {
             p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh &&
             !excludedUuids.has(p.config.uuid) && !getKiroAccountUnavailableError(providerType, p.config)
         );
+
+        // Antigravity has independent quota books for Gemini and third-party (Claude/GPT)
+        // models. A Gemini quota exhaustion must not hide the account from Claude requests.
+        if (providerType === MODEL_PROVIDER.ANTIGRAVITY && requestedModel) {
+            availableAndHealthyProviders = availableAndHealthyProviders.filter(provider =>
+                !this._isAntigravityQuotaFamilyExhausted(provider.config, requestedModel, now)
+            );
+        }
 
         // 如果指定了模型，则排除不支持该模型的提供商
         if (requestedModel) {
@@ -1798,6 +1809,79 @@ export class ProviderPoolManager {
     }
 
     /**
+     * Returns true when the requested Antigravity quota family is still cooling down.
+     * Gemini and third-party (Claude/GPT) quota books are independent.
+     * @private
+     */
+    _isAntigravityQuotaFamilyExhausted(providerConfig, model, now = Date.now()) {
+        const exhaustedByFamily = providerConfig?.quotaExhaustionByFamily;
+        if (!exhaustedByFamily || typeof exhaustedByFamily !== 'object') return false;
+        const recoveryAt = Date.parse(exhaustedByFamily[quotaFamilyForModel(model)] || '');
+        return Number.isFinite(recoveryAt) && recoveryAt > now;
+    }
+
+    /**
+     * Older versions quarantined the whole Antigravity account when one quota family
+     * was exhausted. Convert that persisted legacy state to the family-scoped model.
+     * The next real 429 will quarantine only the exhausted family.
+     * @private
+     */
+    _migrateLegacyAntigravityQuotaCooldown(providerType, config) {
+        if (providerType !== MODEL_PROVIDER.ANTIGRAVITY || !config || config.isHealthy ||
+            !config.scheduledRecoveryTime || config.quotaExhaustionByFamily ||
+            !/quota|RESOURCE_EXHAUSTED/i.test(String(config.lastErrorMessage || ''))) {
+            return false;
+        }
+
+        this._log('info', `Migrating legacy Antigravity account-wide quota cooldown for ${this._getDisplayName(config)} to family-scoped quota tracking`);
+        config.isHealthy = true;
+        config.errorCount = 0;
+        config.lastErrorTime = null;
+        config.lastErrorMessage = null;
+        config.scheduledRecoveryTime = null;
+        return true;
+    }
+
+    /**
+     * Records quota exhaustion for one Antigravity model family without marking the
+     * whole account unhealthy. The account stays usable for the other family.
+     * @param {string} providerType - The provider type.
+     * @param {object} providerConfig - The provider config containing the uuid.
+     * @param {object} options - Model or family plus recovery time and optional message.
+     * @returns {boolean} True when the family cooldown was recorded.
+     */
+    markAntigravityQuotaExhausted(providerType, providerConfig, options = {}) {
+        if (!providerConfig?.uuid) {
+            this._log('error', 'Invalid providerConfig in markAntigravityQuotaExhausted');
+            return false;
+        }
+
+        const recoveryDate = options.recoveryTime instanceof Date
+            ? options.recoveryTime
+            : new Date(options.recoveryTime);
+        if (Number.isNaN(recoveryDate.getTime())) return false;
+
+        const provider = this._findProvider(providerType, providerConfig.uuid);
+        if (!provider) return false;
+
+        const family = options.family || quotaFamilyForModel(options.model);
+        const exhaustedByFamily = provider.config.quotaExhaustionByFamily &&
+            typeof provider.config.quotaExhaustionByFamily === 'object'
+            ? { ...provider.config.quotaExhaustionByFamily }
+            : {};
+        exhaustedByFamily[family] = recoveryDate.toISOString();
+        provider.config.quotaExhaustionByFamily = exhaustedByFamily;
+        provider.config.lastErrorTime = new Date().toISOString();
+        if (options.errorMessage) {
+            provider.config.lastErrorMessage = options.errorMessage;
+        }
+
+        this._log('warn', `Marked ${this._getDisplayName(provider.config)} (${providerType}) ${family} quota exhausted until ${recoveryDate.toISOString()}; other quota families remain available.`);
+        this._debouncedSave(providerType);
+        return true;
+    }
+
+    /**
      * Marks a provider as unhealthy with a scheduled recovery time.
      * Used for quota exhaustion errors (402) where the quota will reset at a specific time.
      * @param {string} providerType - The type of the provider.
@@ -2100,6 +2184,13 @@ export class ProviderPoolManager {
                 const config = providerStatus.config;
                 if (isKiroProviderType(type) && (config.isDisabled || config.needsRefresh || isKiroAccountSuspended(config))) continue;
                 
+                // 兼容旧版本：Antigravity 旧逻辑会因单一配额组耗尽把整个账号
+                // 标记为不健康。现在改为按家族冷却，因此把这种遗留的全局配额
+                // 冷却迁移为健康状态；下一次真实 429 会只冷却对应家族。
+                if (this._migrateLegacyAntigravityQuotaCooldown(type, config)) {
+                    this._debouncedSave(type);
+                }
+
                 // 检查是否有 scheduledRecoveryTime 且已到恢复时间
                 if (config.scheduledRecoveryTime && !config.isHealthy) {
                     const recoveryTime = new Date(config.scheduledRecoveryTime);
@@ -2114,6 +2205,26 @@ export class ProviderPoolManager {
                         config.scheduledRecoveryTime = null; // 清除恢复时间
                         
                         // 保存更改
+                        this._debouncedSave(type);
+                    }
+                }
+
+                // 清理已到期的 Antigravity 分家族配额冷却
+                if (config.quotaExhaustionByFamily && typeof config.quotaExhaustionByFamily === 'object') {
+                    let changed = false;
+                    for (const [family, recoveryAt] of Object.entries(config.quotaExhaustionByFamily)) {
+                        const recoveryTime = Date.parse(recoveryAt);
+                        if (!Number.isFinite(recoveryTime) || now.getTime() >= recoveryTime) {
+                            delete config.quotaExhaustionByFamily[family];
+                            changed = true;
+                        }
+                    }
+                    if (Object.keys(config.quotaExhaustionByFamily).length === 0) {
+                        config.quotaExhaustionByFamily = null;
+                        changed = true;
+                    }
+                    if (changed) {
+                        this._log('info', `Cleared expired Antigravity quota cooldowns for ${this._getDisplayName(config)} (${type})`);
                         this._debouncedSave(type);
                     }
                 }
