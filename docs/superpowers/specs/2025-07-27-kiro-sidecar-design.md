@@ -122,44 +122,68 @@ kiro-sidecar/
 ├── Cargo.lock
 ├── .gitignore
 ├── src/
-│   ├── main.rs                 # axum server, CLI/env 配置, signal handling
+│   ├── main.rs                 # axum server, env 配置, signal handling
 │   ├── config.rs               # 端口、超时、UA 字符串等常量
 │   ├── health.rs               # GET /health handler
-│   ├── proxy.rs                # POST /stream: 提取 headers → 发请求 → 流式 NDJSON
-│   ├── client.rs               # hyper + rustls HTTP/2 client, 连接池
-│   ├── upstream_proxy.rs       # SOCKS5 / HTTP CONNECT 代理拨号
+│   ├── proxy.rs                # POST /stream: 提取 headers → reqwest 发请求 → 流式 NDJSON
+│   ├── client.rs               # reqwest Client 构建与 per-proxy 缓存
 │   ├── event_stream/
 │   │   ├── mod.rs
 │   │   ├── decoder.rs          # 增量帧解码器 + 错误恢复
-│   │   ├── crc.rs              # CRC32 校验（IEEE 多项式，与 JS 侧一致）
+│   │   ├── crc.rs              # CRC32 校验（IEEE 多项式，crc crate v3 + SIMD）
 │   │   ├── headers.rs          # AWS Event Stream header 二进制解析
 │   │   └── types.rs            # Frame, Header, DecodeError
 │   └── ndjson.rs               # Frame → JSON + '\n' 序列化
 ├── tests/
 │   ├── integration.rs          # 端到端测试（mock AWS server）
 │   └── fixtures/               # 测试用 Event Stream 二进制样本
+└── build.sh                    # 编译脚本
 ```
+
+> **模块简化说明：** 用 reqwest 后，`client.rs` 从手工构建 hyper client 简化为 reqwest Client 的配置和 per-proxy 缓存。
+> 不再需要 `upstream_proxy.rs`，reqwest 的 `socks` feature 原生支持 SOCKS5/HTTP 代理。
 
 ### 依赖
 
 ```toml
 [dependencies]
+# Server
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
-hyper = { version = "1", features = ["client", "http2"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio"] }
-hyper-rustls = { version = "0.27", features = ["http2", "ring", "logging"] }
-rustls = "0.23"
-http-body-util = "0.1"
+
+# HTTP client — reqwest 内置连接池、HTTP/2、SOCKS5 代理、流式响应
+# 默认 rustls 后端，TLS 指纹与 aws-sdk-rust 一致
+reqwest = { version = "0.12", features = ["stream", "http2", "socks", "rustls-tls"], default-features = false }
+
+# Event Stream 解码
 bytes = "1"
-crc32fast = "1"
+crc = "3"               # 可配置算法，CRC_32_ISO_HDLC 即 IEEE 多项式，支持 SIMD
+
+# 序列化
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio-socks = "0.5"
+futures = "0.3"          # Stream trait + StreamExt
+
+# 工具
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"     # 更高效的 Mutex
+
+[profile.release]
+lto = true               # 链接时优化，更小二进制
+strip = true             # 去除调试符号
 ```
+
+> **依赖选型说明：** 用 `reqwest` 代替手工组装 `hyper` + `hyper-rustls` + `hyper-util` + `http-body-util`。
+> reqwest 已经封装了连接池、HTTP/2 多路复用、SOCKS5/HTTP 代理、流式响应，
+> 省去 `client.rs` 和 `upstream_proxy.rs` 的大量样板代码。
+> 后端使用 rustls，TLS 指纹与直接用 hyper-rustls 一致。
+
+### 参考实现
+
+[hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) — Rust 实现的 Kiro 代理，
+其 `parser/decoder.rs` 的 AWS Event Stream 解码器可作为直接参考。
 
 ### 核心模块设计
 
@@ -366,11 +390,11 @@ axum 和 hyper 的 drop 机制自动处理级联取消，无需额外信号传�
 
 ### Phase 1：Rust 骨架 + HTTP 代理（2 天）
 
-- Cargo.toml + 依赖
+- Cargo.toml + 依赖（reqwest + axum）
 - axum server + health endpoint
 - proxy handler（透传模式，不解码帧）
-- hyper + rustls HTTP/2 client
-- SOCKS5 + HTTP CONNECT 代理支持
+- reqwest client 构建 + per-proxy 缓存
+- SOCKS5 / HTTP 代理支持（reqwest socks feature）
 - 手动验证
 
 ### Phase 2：AWS Event Stream 解码器（2-3 天）
@@ -404,24 +428,38 @@ Phase 1-2 纯 Rust，不影响现有代码。Phase 3 开始改 Node.js，有完�
 
 **总估时：6-8 天**
 
+## 性能预期
+
+| 指标 | Node.js（当前） | Rust Sidecar | 说明 |
+|------|----------------|-------------|------|
+| CRC32 解码 | ~50μs/帧 | ~5μs/帧 | crc crate SIMD 加速 |
+| 内存/流 | ~2-5MB（Buffer + GC） | ~64KB（BytesMut） | 连续内存，无 GC |
+| P99 首字节延迟 | 波动（GC pause） | 稳定 | 无 stop-the-world GC |
+| 连接复用 | 全局 HTTP agent | per-proxy 连接池 + HTTP/2 多路复用 | reqwest 内置 |
+| localhost 开销 | N/A | ~0.1-0.5ms | 可忽略 |
+
 ## 风险与注意事项
 
-### CRC 多项式确认
+### CRC 多项式
 
-现有 JS 代码 `kiro-event-stream.js` 的 `crc32()` 使用多项式 `0xEDB88320`，这是标准 CRC32（IEEE），不是 CRC32C（Castagnoli，多项式 `0x82F63B78`）。AWS Event Stream 规范用的是 CRC32，不是 CRC32C。Rust 侧应使用标准 CRC32 与 JS 侧保持一致。依赖选择用 `crc32fast` crate 而非 `crc32c`。
+现有 JS 代码 `kiro-event-stream.js` 的 `crc32()` 使用多项式 `0xEDB88320`（反射形式），这是标准 CRC32（IEEE / ISO-HDLC），不是 CRC32C。AWS Event Stream 规范用的是 CRC32。Rust 侧使用 `crc` crate v3 的 `CRC_32_ISO_HDLC` 算法，与 JS 侧保持一致。
 
-### hyper HTTP/2 指纹
+### TLS / HTTP/2 指纹
 
-rustls 的 TLS 指纹与真实 aws-sdk-rust 一致。HTTP/2 SETTINGS frame 的参数（如 INITIAL_WINDOW_SIZE、MAX_CONCURRENT_STREAMS）可能有差异，需要对比真实 Q CLI 的行为。可通过 hyper Builder 调整。
+reqwest 默认使用 rustls，TLS 指纹与真实 aws-sdk-rust 一致。HTTP/2 SETTINGS frame 参数（INITIAL_WINDOW_SIZE、MAX_CONCURRENT_STREAMS 等）由 hyper（reqwest 底层）决定，可能与真实 Q CLI 有细微差异。可通过 reqwest 的 ClientBuilder 调整 HTTP/2 参数。
 
-### Alpine + musl + ring
+### Alpine + musl 编译
 
-`hyper-rustls` 依赖的 `ring` crate 需要 C 编译器。`apk add musl-dev` 应该够。如果编译有问题，可切到 `aws-lc-rs` 后端。
+reqwest 的 rustls 后端依赖 `ring` crate，需要 C 编译器。Docker 中 `apk add musl-dev` 应该够。如果有问题，切到 `aws-lc-rs` 后端（reqwest 的 `rustls-tls-aws-lc-rs` feature）。
+
+### 参考实现
+
+[hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 的 AWS Event Stream 解码器可作为直接参考，尤其是 `parser/decoder.rs` 的帧解码逻辑。
 
 ### 不做的事
 
 - 不在 Rust 侧做 token 刷新
 - 不在 Rust 侧做请求体构建（buildCodewhispererRequest）
-- 不在 Rust 侧做事件语义处理（content/reasoning/toolUse 分类）
-- 不在 Rust 侧做重试（涉及换凭证，跟 Node.js 状态耦合）
+- 不在 Rust 侧做事件语义处理（content/reasoning/toolUse 分类留在 Node.js）
+- 不在 Rust 侧做业务层超时和重试（涉及换凭证，跟 Node.js 状态耦合）
 - 不做 Windows/macOS 构建（仅 Linux x86_64）
