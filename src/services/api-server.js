@@ -8,6 +8,7 @@ import { initializeAPIManagement } from './api-manager.js';
 import { createRequestHandler } from '../handlers/request-handler.js';
 import { discoverPlugins, getPluginManager } from '../core/plugin-manager.js';
 import { getTLSSidecar } from '../utils/tls-sidecar.js';
+import { getKiroSidecar } from '../utils/kiro-sidecar.js';
 import { HEALTH_CHECK } from '../utils/constants.js';
 import { initializeAdminPassword } from '../ui-modules/auth.js';
 import { disposeServiceAdapters } from '../providers/adapter.js';
@@ -219,6 +220,11 @@ async function gracefulShutdown() {
         await getTLSSidecar().stop();
     } catch { /* ignore */ }
 
+    // 停止 Kiro sidecar
+    try {
+        await getKiroSidecar().stop();
+    } catch { /* ignore */ }
+
     await serverClosed;
     logger.info('[Server] HTTP server closed');
     process.exit(0);
@@ -286,6 +292,21 @@ async function startServer() {
             logger.info('[Initialization] TLS sidecar started successfully');
         } else {
             logger.warn('[Initialization] TLS sidecar failed to start, falling back to Node.js TLS');
+        }
+    }
+
+    // Start Kiro sidecar if enabled
+    if (CONFIG.KIRO_SIDECAR_ENABLED) {
+        const kiroSidecar = getKiroSidecar();
+        const started = await kiroSidecar.start({
+            port: CONFIG.KIRO_SIDECAR_PORT,
+            binaryPath: CONFIG.KIRO_SIDECAR_PATH || undefined,
+            maxPayloadBytes: CONFIG.KIRO_MAX_PAYLOAD_BYTES,
+        });
+        if (started) {
+            logger.info('[Initialization] Kiro sidecar started successfully');
+        } else {
+            logger.warn('[Initialization] Kiro sidecar failed to start, using existing transport');
         }
     }
 
