@@ -55,18 +55,24 @@ impl ResourceBudget {
     /// On failure, returns the `BusyReason` — no resources are consumed.
     pub fn try_acquire(self: &Arc<Self>, body_bytes: usize) -> Result<ResourceGuard, BusyReason> {
         // Step 1: Atomically increment inflight, check against max.
-        let prev_inflight = self.inflight.fetch_add(1, Ordering::Relaxed);
-        if prev_inflight >= self.max_inflight {
-            // Roll back.
-            self.inflight.fetch_sub(1, Ordering::Relaxed);
-            return Err(BusyReason::TooManyRequests);
-        }
+        self.inflight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(1)
+                    .filter(|next| *next <= self.max_inflight)
+            })
+            .map_err(|_| BusyReason::TooManyRequests)?;
 
         // Step 2: Atomically add body_bytes to buffer_bytes, check against max.
-        let prev_bytes = self.buffer_bytes.fetch_add(body_bytes, Ordering::Relaxed);
-        if prev_bytes + body_bytes > self.max_buffer_bytes {
-            // Roll back both counters.
-            self.buffer_bytes.fetch_sub(body_bytes, Ordering::Relaxed);
+        if self
+            .buffer_bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current
+                    .checked_add(body_bytes)
+                    .filter(|next| *next <= self.max_buffer_bytes)
+            })
+            .is_err()
+        {
             self.inflight.fetch_sub(1, Ordering::Relaxed);
             return Err(BusyReason::BufferFull);
         }
@@ -99,6 +105,16 @@ impl std::fmt::Debug for ResourceGuard {
         f.debug_struct("ResourceGuard")
             .field("body_bytes", &self.body_bytes)
             .finish()
+    }
+}
+
+impl ResourceGuard {
+    /// Release request-body memory once reqwest has finished sending it. The
+    /// in-flight slot remains owned by the downstream response body.
+    pub fn release_buffer(&mut self) {
+        self.budget
+            .buffer_bytes
+            .fetch_sub(std::mem::take(&mut self.body_bytes), Ordering::Relaxed);
     }
 }
 
@@ -186,5 +202,31 @@ mod tests {
         assert_eq!(budget.inflight_count(), 1);
         assert_eq!(budget.buffer_bytes_used(), 0);
         drop(guard);
+    }
+
+    #[test]
+    fn releasing_buffer_retains_slot_and_is_idempotent() {
+        let budget = ResourceBudget::new(1, 256);
+        let mut guard = budget.try_acquire(256).unwrap();
+        guard.release_buffer();
+        guard.release_buffer();
+        assert_eq!(budget.buffer_bytes_used(), 0);
+        assert_eq!(budget.inflight_count(), 1);
+        assert_eq!(
+            budget.try_acquire(0).unwrap_err(),
+            BusyReason::TooManyRequests
+        );
+        drop(guard);
+        assert_eq!(budget.inflight_count(), 0);
+        assert_eq!(budget.buffer_bytes_used(), 0);
+    }
+
+    #[test]
+    fn buffer_reservation_cannot_overflow() {
+        let budget = ResourceBudget::new(2, usize::MAX);
+        let _guard = budget.try_acquire(usize::MAX).unwrap();
+        assert_eq!(budget.try_acquire(1).unwrap_err(), BusyReason::BufferFull);
+        assert_eq!(budget.inflight_count(), 1);
+        assert_eq!(budget.buffer_bytes_used(), usize::MAX);
     }
 }

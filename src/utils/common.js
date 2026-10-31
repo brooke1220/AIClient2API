@@ -202,6 +202,7 @@ export async function getNormalizedErrorResponseText(error, options = {}) {
         signal?.throwIfAborted();
 
         const bodyText = Buffer.concat(chunks, bytesRead).toString('utf8');
+        if (options.rawBody) return bodyText;
         if (!bodyText) return fallbackText;
 
         try {
@@ -389,6 +390,7 @@ async function hasAlternateAfterQuotaExhaustion(providerPoolManager, config, mod
 }
 
 function applyCredentialCooldown(error, config, providerPoolManager, providerType, pooluuid, logPrefix, model = null) {
+    if (error?.isKiroSidecarError) return { recoveryTime: null, credentialMarkedUnhealthy: false, quotaExhausted: false };
     const quotaExhausted = error?.quotaExhausted === true;
     const quotaRecoveryTime = error?.quotaRecoveryTime instanceof Date && !Number.isNaN(error.quotaRecoveryTime.getTime())
         ? error.quotaRecoveryTime
@@ -646,6 +648,7 @@ export const ENDPOINT_TYPE = {
     OPENAI_RESPONSES: 'openai_responses',
     GEMINI_CONTENT: 'gemini_content',
     CLAUDE_MESSAGE: 'claude_message',
+    CLAUDE_CC_MESSAGE: 'claude_cc_message',
     OPENAI_MODEL_LIST: 'openai_model_list',
     GEMINI_MODEL_LIST: 'gemini_model_list',
 };
@@ -875,6 +878,22 @@ export async function logConversation(type, content, logMode, logFilename) {
  * @param {string} REQUIRED_API_KEY - The API key required for authorization.
  * @returns {boolean} True if authorized, false otherwise.
  */
+/**
+ * Constant-time string comparison to prevent timing attacks on API key validation.
+ * Falls back to strict equality when inputs have different lengths (already leaks length, not content).
+ */
+function timingSafeCompare(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    try {
+        const bufA = Buffer.from(a, 'utf8');
+        const bufB = Buffer.from(b, 'utf8');
+        if (bufA.length !== bufB.length) return false;
+        return crypto.timingSafeEqual(bufA, bufB);
+    } catch {
+        return false;
+    }
+}
+
 export function isAuthorized(req, requestUrl, REQUIRED_API_KEY) {
     const authHeader = req.headers['authorization'];
     const queryKey = requestUrl.searchParams.get('key');
@@ -884,23 +903,23 @@ export function isAuthorized(req, requestUrl, REQUIRED_API_KEY) {
     // Check for Bearer token in Authorization header (OpenAI style)
     if (authHeader && authHeader.startsWith('Bearer ')) {
         const token = authHeader.substring(7);
-        if (token === REQUIRED_API_KEY) {
+        if (timingSafeCompare(token, REQUIRED_API_KEY)) {
             return true;
         }
     }
 
     // Check for API key in URL query parameter (Gemini style)
-    if (queryKey === REQUIRED_API_KEY) {
+    if (timingSafeCompare(queryKey, REQUIRED_API_KEY)) {
         return true;
     }
 
     // Check for API key in x-goog-api-key header (Gemini style)
-    if (googApiKey === REQUIRED_API_KEY) {
+    if (timingSafeCompare(googApiKey, REQUIRED_API_KEY)) {
         return true;
     }
 
     // Check for API key in x-api-key header (Claude style)
-    if (claudeApiKey === REQUIRED_API_KEY) {
+    if (timingSafeCompare(claudeApiKey, REQUIRED_API_KEY)) {
         return true;
     }
 
@@ -2273,6 +2292,7 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
             [ENDPOINT_TYPE.OPENAI_CHAT]: MODEL_PROTOCOL_PREFIX.OPENAI,
             [ENDPOINT_TYPE.OPENAI_RESPONSES]: MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES,
             [ENDPOINT_TYPE.CLAUDE_MESSAGE]: MODEL_PROTOCOL_PREFIX.CLAUDE,
+            [ENDPOINT_TYPE.CLAUDE_CC_MESSAGE]: MODEL_PROTOCOL_PREFIX.CLAUDE,
             [ENDPOINT_TYPE.GEMINI_CONTENT]: MODEL_PROTOCOL_PREFIX.GEMINI,
         };
 
@@ -2356,6 +2376,12 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         // 将 requestBaseUrl 注入到 requestBody 中，以便在转换器中使用
         if (CONFIG.requestBaseUrl) {
             processedRequestBody._requestBaseUrl = CONFIG.requestBaseUrl;
+        }
+
+        // Claude Code 缓冲模式：/cc/v1/messages 端点收集全部上游事件后一次性输出，
+        // 以提供精确的 input_tokens（而非估算值）
+        if (endpointType === ENDPOINT_TYPE.CLAUDE_CC_MESSAGE) {
+            processedRequestBody._ccBuffered = true;
         }
 
         // fs.writeFile('originalRequestBody'+Date.now()+'.json', JSON.stringify(originalRequestBody));

@@ -26,11 +26,7 @@ pub struct ClientCache {
 
 impl std::fmt::Debug for ClientCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self
-            .clients
-            .lock()
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let count = self.clients.lock().map(|m| m.len()).unwrap_or(0);
         f.debug_struct("ClientCache")
             .field("cached", &count)
             .field("max_entries", &self.max_entries)
@@ -85,8 +81,8 @@ impl ClientCache {
             .use_rustls_tls()
             .connect_timeout(self.connect_timeout)
             .redirect(Policy::none())
+            .retry(reqwest::retry::never())
             .no_proxy()
-            .http2_prior_knowledge()
             .no_gzip()
             .no_brotli()
             .no_deflate()
@@ -94,7 +90,7 @@ impl ClientCache {
 
         if let Some(proxy_str) = proxy_url {
             let proxy = reqwest::Proxy::all(proxy_str)
-                .map_err(|e| format!("invalid proxy URL '{proxy_str}': {e}"))?;
+                .map_err(|_| "invalid proxy configuration".to_string())?;
             builder = builder.proxy(proxy);
         }
 
@@ -139,9 +135,7 @@ mod tests {
     fn proxy_client_is_separate_from_direct() {
         let cache = ClientCache::new(&test_config());
         let _direct = cache.get_or_create(None).unwrap();
-        let _proxy = cache
-            .get_or_create(Some("http://127.0.0.1:8080"))
-            .unwrap();
+        let _proxy = cache.get_or_create(Some("http://127.0.0.1:8080")).unwrap();
 
         let map = cache.clients.lock().unwrap();
         assert_eq!(map.len(), 2);
@@ -153,14 +147,10 @@ mod tests {
     fn evicts_when_at_capacity() {
         let cache = ClientCache::new(&test_config()); // max_client_cache = 2
         cache.get_or_create(None).unwrap();
-        cache
-            .get_or_create(Some("http://127.0.0.1:8080"))
-            .unwrap();
+        cache.get_or_create(Some("http://127.0.0.1:8080")).unwrap();
 
         // Cache is now full (2). Adding a third should evict one.
-        cache
-            .get_or_create(Some("http://127.0.0.1:9090"))
-            .unwrap();
+        cache.get_or_create(Some("http://127.0.0.1:9090")).unwrap();
 
         let map = cache.clients.lock().unwrap();
         assert_eq!(map.len(), 2);

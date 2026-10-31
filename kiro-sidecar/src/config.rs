@@ -7,6 +7,11 @@ const BUILTIN_ALLOWLIST: &[&str] = &[
     "https://q.eu-west-1.amazonaws.com",
     "https://q.ap-southeast-1.amazonaws.com",
     "https://codewhisperer.us-east-1.amazonaws.com",
+    "https://codewhisperer.eu-west-1.amazonaws.com",
+    "https://codewhisperer.ap-southeast-1.amazonaws.com",
+    "https://runtime.us-east-1.kiro.dev",
+    "https://runtime.eu-west-1.kiro.dev",
+    "https://runtime.ap-southeast-1.kiro.dev",
 ];
 
 /// Sidecar configuration parsed from environment variables.
@@ -35,22 +40,28 @@ impl Config {
         let token = Self::require_env("KIRO_SIDECAR_TOKEN")?;
 
         // Build target allowlist: built-in origins + user-supplied origins
-        let mut target_allowlist: Vec<String> = BUILTIN_ALLOWLIST
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mut target_allowlist: Vec<String> =
+            BUILTIN_ALLOWLIST.iter().map(|s| s.to_string()).collect();
 
         if let Ok(extra) = env::var("KIRO_SIDECAR_TARGET_ALLOWLIST") {
             for origin in extra.split(',') {
                 let origin = origin.trim();
                 if !origin.is_empty() {
-                    // Validate that each entry is a valid HTTPS origin
-                    if !origin.starts_with("https://") {
-                        return Err(format!(
-                            "KIRO_SIDECAR_TARGET_ALLOWLIST: origin must be HTTPS: {origin}"
-                        ));
+                    let url = Url::parse(origin).map_err(|_| "invalid target allowlist origin")?;
+                    if url.scheme() != "https"
+                        || url.host_str().is_none()
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                        || url.fragment().is_some()
+                        || url.query().is_some()
+                        || !matches!(url.path(), "" | "/")
+                    {
+                        return Err("target allowlist entries must be exact HTTPS origins".into());
                     }
-                    target_allowlist.push(origin.to_string());
+                    let origin = url.origin().ascii_serialization();
+                    if !target_allowlist.contains(&origin) {
+                        target_allowlist.push(origin);
+                    }
                 }
             }
         }
@@ -60,12 +71,23 @@ impl Config {
         let max_inflight = Self::parse_optional_env("KIRO_SIDECAR_MAX_INFLIGHT", 128)?;
         let max_buffer_bytes =
             Self::parse_optional_env("KIRO_SIDECAR_MAX_BUFFER_BYTES", 64 * 1024 * 1024)?;
-        let max_client_cache =
-            Self::parse_optional_env("KIRO_SIDECAR_MAX_CLIENT_CACHE", 128)?;
+        let max_client_cache = Self::parse_optional_env("KIRO_SIDECAR_MAX_CLIENT_CACHE", 128)?;
         let connect_timeout_secs =
             Self::parse_optional_env("KIRO_SIDECAR_CONNECT_TIMEOUT_SECS", 10)?;
         let transport_profile = env::var("KIRO_SIDECAR_TRANSPORT_PROFILE")
             .unwrap_or_else(|_| "v1-aws-lc-rs".to_string());
+
+        if max_payload_bytes == 0
+            || max_inflight == 0
+            || max_buffer_bytes == 0
+            || max_client_cache == 0
+            || connect_timeout_secs == 0
+        {
+            return Err("resource limits and connect timeout must be positive".into());
+        }
+        if transport_profile != "v1-aws-lc-rs" {
+            return Err("unsupported transport profile".into());
+        }
 
         Ok(Config {
             port,
@@ -105,12 +127,17 @@ impl Config {
         }
 
         let origin = url.origin().ascii_serialization();
-        self.target_allowlist.iter().any(|allowed| *allowed == origin)
+        self.target_allowlist
+            .iter()
+            .any(|allowed| *allowed == origin)
     }
 
     /// Read a required environment variable, returning an error if missing.
     fn require_env(name: &str) -> Result<String, String> {
-        env::var(name).map_err(|_| format!("{name} is required but not set"))
+        env::var(name)
+            .ok()
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("{name} is required and must not be empty"))
     }
 
     /// Parse an optional environment variable with a default value.
@@ -120,9 +147,7 @@ impl Config {
         T::Err: std::fmt::Display,
     {
         match env::var(name) {
-            Ok(val) => val
-                .parse::<T>()
-                .map_err(|e| format!("{name}: {e}")),
+            Ok(val) => val.parse::<T>().map_err(|e| format!("{name}: {e}")),
             Err(_) => Ok(default),
         }
     }
@@ -147,12 +172,10 @@ mod tests {
             transport_profile: "v1-aws-lc-rs".into(),
         };
 
-        let allowed =
-            Url::parse("https://q.us-east-1.amazonaws.com/some/path").unwrap();
+        let allowed = Url::parse("https://q.us-east-1.amazonaws.com/some/path").unwrap();
         assert!(config.is_target_allowed(&allowed));
 
-        let not_allowed =
-            Url::parse("https://evil.example.com/some/path").unwrap();
+        let not_allowed = Url::parse("https://evil.example.com/some/path").unwrap();
         assert!(!config.is_target_allowed(&not_allowed));
     }
 
@@ -171,8 +194,7 @@ mod tests {
             transport_profile: "v1-aws-lc-rs".into(),
         };
 
-        let http_url =
-            Url::parse("http://q.us-east-1.amazonaws.com/path").unwrap();
+        let http_url = Url::parse("http://q.us-east-1.amazonaws.com/path").unwrap();
         assert!(!config.is_target_allowed(&http_url));
     }
 
@@ -191,8 +213,7 @@ mod tests {
             transport_profile: "v1-aws-lc-rs".into(),
         };
 
-        let url_with_user =
-            Url::parse("https://user:pass@q.us-east-1.amazonaws.com/path").unwrap();
+        let url_with_user = Url::parse("https://user:pass@q.us-east-1.amazonaws.com/path").unwrap();
         assert!(!config.is_target_allowed(&url_with_user));
     }
 
@@ -211,8 +232,7 @@ mod tests {
             transport_profile: "v1-aws-lc-rs".into(),
         };
 
-        let url_with_frag =
-            Url::parse("https://q.us-east-1.amazonaws.com/path#frag").unwrap();
+        let url_with_frag = Url::parse("https://q.us-east-1.amazonaws.com/path#frag").unwrap();
         assert!(!config.is_target_allowed(&url_with_frag));
     }
 }

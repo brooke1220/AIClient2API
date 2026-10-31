@@ -120,6 +120,7 @@ export class ProviderPoolManager {
         
         this.warmupTarget = options.globalConfig?.WARMUP_TARGET || 0; // 默认预热0个节点
         this.refreshingUuids = new Set(); // 正在刷新的节点 UUID 集合
+        this._selfHealTimestamps = {}; // 每个 providerType 上次 self-heal 的时间戳
         
         this.refreshQueues = {}; // 按 providerType 分组的队列
         // 缓冲队列机制：延迟5秒，去重后再执行刷新
@@ -1028,6 +1029,12 @@ export class ProviderPoolManager {
         const minSeq = Math.min(...availableProviders.map(p => p.config._lastSelectionSeq || 0));
 
         const excludedUuids = new Set(Array.isArray(options.excludeUuids) ? options.excludeUuids : []);
+        const supportsRequestedModel = p => {
+            if (!requestedModel) return true;
+            const supportedModels = getConfiguredSupportedModels(providerType, p.config);
+            if (supportedModels.length > 0) return supportedModels.includes(requestedModel);
+            return !Array.isArray(p.config.notSupportedModels) || !p.config.notSupportedModels.includes(requestedModel);
+        };
         let availableAndHealthyProviders = availableProviders.filter(p =>
             p.config.isHealthy && !p.config.isDisabled && !p.config.needsRefresh &&
             !excludedUuids.has(p.config.uuid) && !getKiroAccountUnavailableError(providerType, p.config)
@@ -1043,18 +1050,7 @@ export class ProviderPoolManager {
 
         // 如果指定了模型，则排除不支持该模型的提供商
         if (requestedModel) {
-            let modelFilteredProviders = availableAndHealthyProviders.filter(p => {
-                const supportedModels = getConfiguredSupportedModels(providerType, p.config);
-                if (supportedModels.length > 0) {
-                    return supportedModels.includes(requestedModel);
-                }
-                // 如果提供商没有配置 notSupportedModels，则认为它支持所有模型
-                if (!p.config.notSupportedModels || !Array.isArray(p.config.notSupportedModels)) {
-                    return true;
-                }
-                // 检查 notSupportedModels 数组中是否包含请求的模型，如果包含则排除
-                return !p.config.notSupportedModels.includes(requestedModel);
-            });
+            let modelFilteredProviders = availableAndHealthyProviders.filter(supportsRequestedModel);
 
             if (providerType === MODEL_PROVIDER.ANTIGRAVITY) {
                 const { isAntigravityModelRetired } = await import('./gemini/antigravity-core.js');
@@ -1085,14 +1081,55 @@ export class ProviderPoolManager {
 
             if (modelFilteredProviders.length === 0) {
                 this._log('warn', `No available providers for type: ${providerType} that support model: ${requestedModel}`);
-                return null;
+            } else {
+                this._log('debug', `Filtered ${modelFilteredProviders.length} providers supporting model: ${requestedModel}`);
             }
 
             availableAndHealthyProviders = modelFilteredProviders;
-            this._log('debug', `Filtered ${modelFilteredProviders.length} providers supporting model: ${requestedModel}`);
         }
 
         if (availableAndHealthyProviders.length === 0) {
+            // Self-healing: 当所有凭证都因错误被标记为不健康时，自动重置失败计数并重新启用
+            // 仅重置支持当前模型的失败凭证，保留禁用、暂停、冷却和正在刷新的状态。
+            // 冷却窗口：同一 providerType 30 秒内只 heal 一次，防止高频调用反复重置。
+            const SELF_HEAL_COOLDOWN_MS = 30000;
+            const lastHeal = this._selfHealTimestamps[providerType] || 0;
+            if (!options._selfHealAttempted && availableProviders.length > 0 && now - lastHeal >= SELF_HEAL_COOLDOWN_MS) {
+                const healable = availableProviders.filter(p => {
+                    const c = p.config;
+                    if (!supportsRequestedModel(p)) return false;
+                    // 刷新完成前不能重置其状态或失败计数。
+                    if (c.isDisabled || c.needsRefresh || this.refreshingUuids.has(p.uuid)) return false;
+                    // 跳过账户被暂停的
+                    if (c.kiroAccountSuspended) return false;
+                    // 跳过被 excludeUuids 排除的
+                    if (excludedUuids.has(c.uuid)) return false;
+                    // 跳过有未来恢复时间的（配额耗尽等定时恢复场景）
+                    if (c.scheduledRecoveryTime && new Date(c.scheduledRecoveryTime).getTime() > now) return false;
+                    if (providerType === MODEL_PROVIDER.ANTIGRAVITY && requestedModel &&
+                        this._isAntigravityQuotaFamilyExhausted(c, requestedModel, now)) return false;
+                    // 普通不健康状态是恢复目标；账户暂停和冷却仍由账户检查拦截。
+                    if (getKiroAccountUnavailableError(providerType, c, { allowUnhealthy: true })) return false;
+                    return !c.isHealthy;
+                });
+
+                if (healable.length > 0) {
+                    this._log('warn', `[Self-Healing] All providers unhealthy for ${providerType}, resetting ${healable.length} auto-failed provider(s)`);
+                    this._selfHealTimestamps[providerType] = now;
+                    for (const p of healable) {
+                        p.config.isHealthy = true;
+                        p.config.errorCount = 0;
+                        p.config.needsRefresh = false;
+                        p.config.refreshCount = 0;
+                        p.config.lastErrorTime = null;
+                        p.config.lastErrorMessage = null;
+                    }
+                    this._debouncedSave(providerType);
+                    // 用 _selfHealAttempted 标记防止递归，重新执行一次选择
+                    return this._doSelectProvider(providerType, requestedModel, { ...options, _selfHealAttempted: true });
+                }
+            }
+
             this._log('warn', `No available and healthy providers for type: ${providerType}`);
             return null;
         }

@@ -27,6 +27,8 @@ pub async fn health(
         "protocol_version": 1,
         "instance_id": state.config.instance_id,
         "transport_profile": state.config.transport_profile,
+        "inflight": state.budget.inflight_count(),
+        "buffer_bytes": state.budget.buffer_bytes_used(),
     });
 
     let mut response = axum::Json(body).into_response();

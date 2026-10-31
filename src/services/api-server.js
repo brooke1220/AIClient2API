@@ -8,7 +8,7 @@ import { initializeAPIManagement } from './api-manager.js';
 import { createRequestHandler } from '../handlers/request-handler.js';
 import { discoverPlugins, getPluginManager } from '../core/plugin-manager.js';
 import { getTLSSidecar } from '../utils/tls-sidecar.js';
-import { getKiroSidecar } from '../utils/kiro-sidecar.js';
+import { getKiroSidecar, getKiroSidecarTargetOrigins } from '../utils/kiro-sidecar.js';
 import { HEALTH_CHECK } from '../utils/constants.js';
 import { initializeAdminPassword } from '../ui-modules/auth.js';
 import { disposeServiceAdapters } from '../providers/adapter.js';
@@ -298,11 +298,15 @@ async function startServer() {
     // Start Kiro sidecar if enabled
     if (CONFIG.KIRO_SIDECAR_ENABLED) {
         const kiroSidecar = getKiroSidecar();
-        const started = await kiroSidecar.start({
-            port: CONFIG.KIRO_SIDECAR_PORT,
-            binaryPath: CONFIG.KIRO_SIDECAR_PATH || undefined,
-            maxPayloadBytes: CONFIG.KIRO_MAX_PAYLOAD_BYTES,
-        });
+        let started = false;
+        try {
+            started = await kiroSidecar.start({
+                port: CONFIG.KIRO_SIDECAR_PORT,
+                binaryPath: CONFIG.KIRO_SIDECAR_PATH || undefined,
+                maxPayloadBytes: CONFIG.KIRO_MAX_PAYLOAD_BYTES,
+                targetOrigins: await getKiroSidecarTargetOrigins(CONFIG),
+            });
+        } catch { logger.warn('[Initialization] Invalid Kiro sidecar endpoint configuration'); }
         if (started) {
             logger.info('[Initialization] Kiro sidecar started successfully');
         } else {

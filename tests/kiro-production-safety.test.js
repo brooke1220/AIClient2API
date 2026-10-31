@@ -3,12 +3,34 @@ import { Readable } from 'node:stream';
 import { jest } from '@jest/globals';
 jest.mock('open', () => ({ __esModule: true, default: jest.fn() }));
 jest.mock('../src/utils/logger.js', () => ({ __esModule: true, default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() } }));
-import { crc32, decodeKiroFrames } from '../src/providers/claude/kiro-event-stream.js';
+import { crc32, decodeKiroFrames, decodeKiroFramesResilient } from '../src/providers/claude/kiro-event-stream.js';
 import { KiroApiService } from '../src/providers/claude/claude-kiro.js';
 import { KiroToolAssembler } from '../src/providers/claude/kiro-tool-assembler.js';
 import { buildKiroInferenceConfig, guardKiroPayload } from '../src/providers/claude/kiro-request-guards.js';
 import TLSSidecar from '../src/utils/tls-sidecar.js';
 import { frame, text, tool, request, model, service, collect, openStream, bounded, tick, crc } from './helpers/kiro-safety-fixtures.js';
+
+describe('resilient event prelude scan boundaries', () => {
+    test.each([12, 32])('retains %i corrupt bytes when no complete prelude is available', size => {
+        const bytes = Buffer.alloc(size);
+        expect(decodeKiroFramesResilient(bytes)).toEqual({ frames: [], remaining: bytes, errors: 0 });
+    });
+    test('retains a split prelude and recovers after the remaining bytes arrive', () => {
+        const valid = text('recovered');
+        const first = decodeKiroFramesResilient(Buffer.concat([Buffer.alloc(12), valid.subarray(0, 11)]));
+        expect(first.frames).toEqual([]);
+        const next = decodeKiroFramesResilient(Buffer.concat([first.remaining, valid.subarray(11)]));
+        expect(next.frames.map(event => event.data)).toEqual([{ content: 'recovered' }]);
+        expect(next.errors).toBe(1);
+        expect(next.remaining.length).toBe(0);
+    });
+    test('finds a complete prelude at the final legal offset and waits for its payload', () => {
+        const valid = text('recovered');
+        const prelude = valid.subarray(0, 12);
+        expect(decodeKiroFramesResilient(Buffer.concat([Buffer.alloc(12), prelude])))
+            .toEqual({ frames: [], remaining: prelude, errors: 1 });
+    });
+});
 
 describe('AWS wire integrity and truthful termination', () => {
     test('CRC matches the standard known vector', () => { expect(crc32(Buffer.from('123456789'))).toBe(0xcbf43926); });

@@ -6,6 +6,7 @@ import { buildKiroInferenceConfig, guardKiroPayload, inlineOrphanToolResults, va
 import { decodeKiroFrames, kiroIntegrityError, normalizeKiroStopReason } from './kiro-event-stream.js';
 import { KiroToolAssembler } from './kiro-tool-assembler.js';
 import { KiroBracketToolParser } from './kiro-bracket-tools.js';
+import { markKiroSidecarError, requestViaKiroSidecar } from './kiro-sidecar-transport.js';
 import { atomicWriteFile } from '../../utils/file-lock.js';
 import axios from 'axios';
 import logger from '../../utils/logger.js';
@@ -761,27 +762,62 @@ export class KiroApiService {
         return configureTLSSidecar(axiosConfig, this.config, this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API);
     }
 
-    async _requestWithBuilderEndpointRouting(axiosConfig, requestData) {
+    /**
+     * Apply business routing (Builder ID / API Key runtime) to produce
+     * the final URL, headers, and body — without sending the request.
+     * Returns a new config object; does not mutate the input.
+     */
+    _buildRoutedRequest(axiosConfig, requestData) {
         let routedConfig = { ...axiosConfig, headers: { ...axiosConfig.headers } };
+        let routedData = requestData;
+
         if (shouldRouteBuilderToCodeWhisperer({ authMethod: this.authMethod, profileArn: this.profileArn, requestUrl: axiosConfig.url })) {
-            const data = { ...requestData };
-            delete data.profileArn;
-            routedConfig = { ...routedConfig, url: this.codewhispererBaseUrl, data };
+            routedData = { ...requestData };
+            delete routedData.profileArn;
+            routedConfig = { ...routedConfig, url: this.codewhispererBaseUrl, data: routedData };
             logger.info('[Kiro] Routing profileless Builder ID request through CodeWhisperer.');
         }
+
         const apiKey = this.accessToken?.startsWith('ksk_') || this.apiKey && this.accessToken === this.apiKey;
         if (apiKey && (this.config.KIRO_API_KEY_RUNTIME_ENABLED === true || this.config.KIRO_API_KEY_BASE_URL)) {
-            const data = { ...requestData, conversationState: { ...requestData.conversationState } };
-            delete data.profileArn;
-            data.conversationState.currentMessage = { ...data.conversationState.currentMessage,
-                userInputMessage: { ...data.conversationState.currentMessage?.userInputMessage, origin: 'CLI' } };
-            routedConfig = { ...routedConfig, url: this.config.KIRO_API_KEY_BASE_URL || `https://runtime.${this.region || 'us-east-1'}.kiro.dev/`, data };
+            routedData = { ...requestData, conversationState: { ...requestData.conversationState } };
+            delete routedData.profileArn;
+            routedData.conversationState.currentMessage = { ...routedData.conversationState.currentMessage,
+                userInputMessage: { ...routedData.conversationState.currentMessage?.userInputMessage, origin: 'CLI' } };
+            routedConfig = { ...routedConfig, url: this.config.KIRO_API_KEY_BASE_URL || `https://runtime.${this.region || 'us-east-1'}.kiro.dev/`, data: routedData };
             routedConfig.headers['Content-Type'] = 'application/x-amz-json-1.0';
             routedConfig.headers['TokenType'] = 'API_KEY';
             routedConfig.headers['x-amzn-codewhisperer-optout'] = 'false';
         }
+
+        if (!routedConfig.data) {
+            routedConfig.data = requestData;
+        }
+
+        return routedConfig;
+    }
+
+    async _requestWithBuilderEndpointRouting(axiosConfig, requestData, options = {}) {
+        const routedConfig = this._buildRoutedRequest(axiosConfig, requestData);
+
+        // Kiro sidecar transport path (only when explicitly enabled for this request)
+        if (options.allowKiroSidecar && options._transportContext?.kind === 'kiro-sidecar') {
+            return await this._requestViaKiroSidecar(routedConfig, options._transportContext);
+        }
+
+        // Existing path: tls-sidecar / direct
         this._applySidecar(routedConfig);
         return await this.axiosInstance.request(routedConfig);
+    }
+
+    /**
+     * Send a request through kiro-sidecar. Returns an Axios-compatible response.
+     * Only handles the local transport — the response is a raw stream just like
+     * the existing axios path. On sidecar self-errors (X-Kiro-Response-Source: sidecar),
+     * throws with isKiroSidecarError=true so error handlers don't confuse it with AWS failures.
+     */
+    async _requestViaKiroSidecar(routedConfig, context) {
+        return requestViaKiroSidecar(this.axiosInstance, routedConfig, this.config, context);
     }
 
 /**
@@ -1907,8 +1943,8 @@ async saveCredentialsToFile(filePath, newData) {
      */
     async callApi(method, model, body, isRetry = false, retryCount = 0) {
         if (!this.isInitialized) await this.initialize();
-        const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
-        const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
+        const maxRetries = this.config.REQUEST_MAX_RETRIES ?? 3;
+        const baseDelay = this.config.REQUEST_BASE_DELAY ?? 1000; // 1 second base delay
 
         // 处理不同格式的请求体（messages 或 contents）
         let messages = body.messages;
@@ -2403,8 +2439,8 @@ async saveCredentialsToFile(filePath, newData) {
         const { signal } = options;
         signal?.throwIfAborted();
         if (!this.isInitialized) await waitForKiroOperation(this.initialize(), signal);
-        const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
-        const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
+        const maxRetries = this.config.REQUEST_MAX_RETRIES ?? 3;
+        const baseDelay = this.config.REQUEST_BASE_DELAY ?? 1000;
 
         // 处理不同格式的请求体（messages 或 contents）
         let messages = body.messages;
@@ -2486,8 +2522,22 @@ async saveCredentialsToFile(filePath, newData) {
             const totalMs = timeoutMs('KIRO_STREAM_TOTAL_TIMEOUT_MS', 0);
             if (firstMs > 0) firstTimer = setTimeout(() => expire('first meaningful event'), firstMs);
             if (totalMs > 0) totalTimer = setTimeout(() => expire('stream total'), totalMs);
+            // Transport selection: determine once per request, reuse across retries
+            if (!options._transportContext) {
+                const { getKiroSidecar } = await import('../../utils/kiro-sidecar.js');
+                const kiroSidecar = getKiroSidecar();
+                if (this.config.KIRO_SIDECAR_ENABLED && kiroSidecar.isReady() && axiosConfig.responseType === 'stream') {
+                    options._transportContext = kiroSidecar.getTransportContext();
+                    logger.info('[Kiro Stream] Using kiro-sidecar transport');
+                } else {
+                    options._transportContext = { kind: 'default' };
+                }
+            }
             const upstreamStartedAt = performance.now();
-            const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData);
+            const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData, {
+                allowKiroSidecar: true,
+                _transportContext: options._transportContext,
+            });
 
             stream = response.data;
             signal?.addEventListener('abort', onAbort, { once: true });
@@ -2577,6 +2627,24 @@ async saveCredentialsToFile(filePath, newData) {
             // Cancellation is not an upstream failure and must never retry or
             // switch credentials, even if destroying a socket reports a reset.
             if (signal?.aborted) throw error;
+
+            // A body reset or local-hop failure must never reach AWS account handling.
+            if (options._transportContext?.kind === 'kiro-sidecar' && !error.response
+                && error.code !== 'KIRO_STREAM_INTEGRITY' && !error.isKiroSidecarError) {
+                markKiroSidecarError(error, 'SIDECAR_TRANSPORT_ERROR', isRetryableNetworkError(error));
+            }
+            if (error.isKiroSidecarError) {
+                error.skipErrorCount = true;
+                error.shouldSwitchCredential = false;
+                error.isRetryableUpstreamResponseFailure = false;
+                if (error.retryable && retryCount < maxRetries && !hasYieldedContent) {
+                    transport.abort();
+                    await sleep(baseDelay * Math.pow(2, retryCount), undefined, { signal });
+                    yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1, options);
+                    return;
+                }
+                throw error;
+            }
 
             const status = error.response?.status;
             const errorCode = error.code;
@@ -3226,6 +3294,52 @@ async saveCredentialsToFile(filePath, newData) {
             // Manual next() calls do not forward return() automatically.
             // Close the inner iterator on client cancellation and early exits.
             await rawGenerator.return();
+        }
+    }
+
+    /**
+     * Buffered stream: collects all upstream events before yielding anything,
+     * so message_start carries real input_tokens (from the metadata event)
+     * instead of an estimation. Used by the /cc/v1/messages endpoint.
+     */
+    async * generateContentStreamBuffered(model, requestBody, options = {}) {
+        const rawGenerator = this._generateContentStreamRaw(model, requestBody, options);
+        const events = [];
+        const recovery = this.config.KIRO_TRUNCATION_RECOVERY === false ? null
+            : (this._truncationRecovery ||= new KiroTruncationRecovery());
+        const observation = recovery?.observe(resolveKiroModel(model, this.config), requestBody);
+
+        try {
+            for await (const event of rawGenerator) {
+                events.push(event);
+            }
+        } catch (error) {
+            await rawGenerator.return();
+            throw error;
+        }
+
+        if (events.length === 0) return;
+
+        // Extract real input_tokens from the message_delta usage
+        const messageDelta = events.find(e => e.type === 'message_delta');
+        const realInputTokens = messageDelta?.usage?.input_tokens;
+
+        // Patch message_start with real input_tokens
+        const messageStart = events[0];
+        if (messageStart?.type === 'message_start' && Number.isFinite(realInputTokens) && realInputTokens >= 0) {
+            messageStart.message = {
+                ...messageStart.message,
+                usage: { ...messageStart.message.usage, input_tokens: realInputTokens }
+            };
+        }
+
+        // Feed all events to the truncation recovery observer
+        for (const event of events) {
+            observation?.accept(event);
+        }
+
+        for (const event of events) {
+            yield event;
         }
     }
 

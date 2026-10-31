@@ -167,10 +167,7 @@ pub fn validate_protocol_version(headers: &HeaderMap) -> Result<(), SidecarError
     Ok(())
 }
 
-fn validate_target_url(
-    headers: &HeaderMap,
-    config: &Config,
-) -> Result<Url, SidecarError> {
+fn validate_target_url(headers: &HeaderMap, config: &Config) -> Result<Url, SidecarError> {
     let raw = headers
         .get(H_TARGET_URL)
         .and_then(|v| v.to_str().ok())
@@ -219,15 +216,28 @@ fn validate_proxy_url(headers: &HeaderMap) -> Result<Option<String>, SidecarErro
         _ => return Ok(None),
     };
 
-    // Just validate that it parses as a URL.
-    Url::parse(raw).map_err(|e| SidecarError {
+    let invalid_proxy = || SidecarError {
         status: StatusCode::BAD_REQUEST,
         source: "sidecar",
         code: "INVALID_PROXY",
-        phase: "auth",
-        message: format!("X-Proxy-Url is not a valid URL: {e}"),
+        phase: "proxy",
+        message:
+            "X-Proxy-Url must be an http, https, socks5 or socks5h proxy with a valid host and port"
+                .into(),
         retryable: false,
-    })?;
+    };
+    // reqwest can silently ignore unsupported schemes; reject them before
+    // constructing a client so a configured proxy can never become direct.
+    let url = Url::parse(raw).map_err(|_| invalid_proxy())?;
+    if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || url.host_str().is_none()
+        || url.fragment().is_some()
+        || url.query().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.port() == Some(0)
+    {
+        return Err(invalid_proxy());
+    }
 
     Ok(Some(raw.to_string()))
 }
@@ -238,6 +248,9 @@ fn validate_proxy_url(headers: &HeaderMap) -> Result<Option<String>, SidecarErro
 pub fn build_upstream_headers(incoming: &HeaderMap) -> reqwest::header::HeaderMap {
     let mut out = reqwest::header::HeaderMap::new();
     for &name in FORWARDED_HEADERS {
+        if is_connection_header(incoming, name) {
+            continue;
+        }
         if let Some(value) = incoming.get(name) {
             if let Ok(rval) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
                 if let Ok(rname) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
@@ -249,10 +262,57 @@ pub fn build_upstream_headers(incoming: &HeaderMap) -> reqwest::header::HeaderMa
     out
 }
 
+/// A Connection option makes the named header hop-by-hop, even if allowlisted.
+pub fn is_connection_header(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .any(|value| {
+            value.to_str().is_ok_and(|options| {
+                options
+                    .split(',')
+                    .any(|option| option.trim().eq_ignore_ascii_case(name))
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::HeaderMap;
+
+    #[test]
+    fn connection_options_are_not_forwarded() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer test".parse().unwrap());
+        headers.insert("accept", "application/json".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.append("connection", "keep-alive, AUTHORIZATION".parse().unwrap());
+        headers.append("connection", "Accept".parse().unwrap());
+        let forwarded = build_upstream_headers(&headers);
+        assert!(!forwarded.contains_key("authorization"));
+        assert!(!forwarded.contains_key("accept"));
+        assert_eq!(forwarded["content-type"], "application/json");
+    }
+
+    #[test]
+    fn unsupported_or_malformed_proxies_are_rejected() {
+        for proxy in [
+            "ftp://user:secret@localhost:8080",
+            "socks4://localhost:8080",
+            "http://localhost:8080/path",
+            "http://localhost:8080?query=1",
+            "http://localhost:8080#fragment",
+            "http://localhost:0",
+        ] {
+            let mut headers = valid_headers();
+            headers.insert(H_PROXY_URL, proxy.parse().unwrap());
+            let error = extract_control_headers(&headers, &test_config()).unwrap_err();
+            assert_eq!(error.code, "INVALID_PROXY");
+            assert!(!error.retryable);
+            assert!(!error.message.contains("secret"));
+        }
+    }
 
     /// Helper to build a Config with sensible test defaults.
     fn test_config() -> Config {
@@ -260,9 +320,7 @@ mod tests {
             port: 9091,
             instance_id: "test-instance".into(),
             token: "test-token".into(),
-            target_allowlist: vec![
-                "https://q.us-east-1.amazonaws.com".into(),
-            ],
+            target_allowlist: vec!["https://q.us-east-1.amazonaws.com".into()],
             max_payload_bytes: 10 * 1024 * 1024,
             max_inflight: 128,
             max_buffer_bytes: 64 * 1024 * 1024,
@@ -279,9 +337,7 @@ mod tests {
         h.insert(H_PROTOCOL_VERSION, "1".parse().unwrap());
         h.insert(
             H_TARGET_URL,
-            "https://q.us-east-1.amazonaws.com/invoke"
-                .parse()
-                .unwrap(),
+            "https://q.us-east-1.amazonaws.com/invoke".parse().unwrap(),
         );
         h
     }
@@ -341,9 +397,7 @@ mod tests {
         let mut h = valid_headers();
         h.insert(
             H_TARGET_URL,
-            "http://q.us-east-1.amazonaws.com/path"
-                .parse()
-                .unwrap(),
+            "http://q.us-east-1.amazonaws.com/path".parse().unwrap(),
         );
         let err = extract_control_headers(&h, &cfg).unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
@@ -432,11 +486,19 @@ mod tests {
         let resp = err.into_response();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            resp.headers().get(H_PROTOCOL_VERSION).unwrap().to_str().unwrap(),
+            resp.headers()
+                .get(H_PROTOCOL_VERSION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "1"
         );
         assert_eq!(
-            resp.headers().get(H_RESPONSE_SOURCE).unwrap().to_str().unwrap(),
+            resp.headers()
+                .get(H_RESPONSE_SOURCE)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "sidecar"
         );
     }

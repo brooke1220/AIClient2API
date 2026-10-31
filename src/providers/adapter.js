@@ -377,8 +377,13 @@ export class KiroApiServiceAdapter extends ApiServiceAdapter {
     }
 
     async *generateContentStream(model, requestBody, options = {}) {
-        // Initialization and cancellation are handled together by the service.
-        yield* this.kiroApiService.generateContentStream(model, requestBody, options);
+        // Claude Code 缓冲模式：收集全部事件后用真实 input_tokens 一次性输出
+        if (requestBody?._ccBuffered) {
+            yield* this.kiroApiService.generateContentStreamBuffered(model, requestBody, options);
+        } else {
+            // Initialization and cancellation are handled together by the service.
+            yield* this.kiroApiService.generateContentStream(model, requestBody, options);
+        }
     }
 
     async listModels() {

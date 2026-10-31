@@ -101,6 +101,99 @@ export function decodeKiroFrames(buffer, maxFrameBytes = 32 * 1024 * 1024) {
     return { frames, remaining: buffer.subarray(offset) };
 }
 
+/**
+ * Resilient AWS Event Stream decoder with error recovery.
+ * On prelude CRC mismatch: scans forward byte-by-byte for next valid prelude (one error event).
+ * On message CRC / parse error: skips the entire frame and continues.
+ * Stops after MAX_CONSECUTIVE_ERRORS consecutive unrecoverable failures.
+ * Returns { frames, remaining, errors } — `errors` counts recovered corruptions.
+ */
+const MAX_CONSECUTIVE_ERRORS = 5;
+const MAX_RESYNC_SCAN = 256 * 1024; // scan up to 256 KB for next valid prelude
+
+function scanForNextPrelude(buffer, start, limit) {
+    const end = Math.min(buffer.length - 12, start + MAX_RESYNC_SCAN);
+    for (let pos = start + 1; pos <= end; pos++) {
+        const prelude = buffer.subarray(pos, pos + 12);
+        if (crc32(prelude.subarray(0, 8)) !== prelude.readUInt32BE(8)) continue;
+        const len = prelude.readUInt32BE(0);
+        const hLen = prelude.readUInt32BE(4);
+        if (len >= 16 && len <= limit && hLen <= len - 16) return pos;
+    }
+    return -1;
+}
+
+function tryDecodeOneFrame(buffer, offset, limit) {
+    if (buffer.length - offset < 12) return { status: 'incomplete' };
+    const prelude = buffer.subarray(offset, offset + 12);
+    if (crc32(prelude.subarray(0, 8)) !== prelude.readUInt32BE(8)) return { status: 'prelude_crc' };
+    const length = prelude.readUInt32BE(0);
+    const headersLength = prelude.readUInt32BE(4);
+    if (length < 16 || length > limit || headersLength > length - 16) return { status: 'prelude_crc' };
+    if (buffer.length - offset < length) return { status: 'incomplete' };
+    const frame = buffer.subarray(offset, offset + length);
+    if (crc32(frame.subarray(0, -4)) !== frame.readUInt32BE(length - 4)) return { status: 'message_crc', skip: length };
+    try {
+        const headers = readHeaders(frame.subarray(12, 12 + headersLength));
+        for (const name of [':message-type', ':event-type', ':exception-type', ':error-code', ':error-message']) {
+            if (headers[name] !== undefined && typeof headers[name] !== 'string') return { status: 'parse_error', skip: length };
+        }
+        const payload = utf8(frame.subarray(12 + headersLength, length - 4));
+        const messageType = headers[':message-type'];
+        let data = {};
+        if (payload) { data = JSON.parse(payload); }
+        if (!data || typeof data !== 'object' || Array.isArray(data)) return { status: 'parse_error', skip: length };
+        // Upstream exceptions are still fatal — not recoverable corruption
+        if (messageType === 'error' || messageType === 'exception' || headers[':exception-type'] || headers[':error-code']) {
+            const error = kiroIntegrityError('upstream exception');
+            error.upstreamCode = headers[':exception-type'] || headers[':error-code'];
+            error.message = `Kiro upstream ${error.upstreamCode || messageType}: ${String(headers[':error-message'] || data.message || 'upstream failure').slice(0, 500)}`;
+            return { status: 'fatal', error };
+        }
+        if (messageType && messageType !== 'event') return { status: 'parse_error', skip: length };
+        return { status: 'ok', frame: { headers, data }, advance: length };
+    } catch (e) {
+        if (e.code === 'KIRO_STREAM_INTEGRITY' && e.responseFailureLabel === 'upstream exception') return { status: 'fatal', error: e };
+        return { status: 'parse_error', skip: length };
+    }
+}
+
+export function decodeKiroFramesResilient(buffer, maxFrameBytes = 32 * 1024 * 1024) {
+    const configuredLimit = Number(maxFrameBytes);
+    const limit = Number.isFinite(configuredLimit) && configuredLimit >= 16 ? configuredLimit : 32 * 1024 * 1024;
+    const frames = [];
+    let offset = 0;
+    let consecutiveErrors = 0;
+    let totalErrors = 0;
+
+    while (buffer.length - offset >= 12) {
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) break;
+        const result = tryDecodeOneFrame(buffer, offset, limit);
+        if (result.status === 'ok') {
+            frames.push(result.frame);
+            offset += result.advance;
+            consecutiveErrors = 0;
+        } else if (result.status === 'incomplete') {
+            break;
+        } else if (result.status === 'fatal') {
+            throw result.error;
+        } else if (result.status === 'prelude_crc') {
+            // Scan forward for next valid prelude (counts as one error event)
+            const next = scanForNextPrelude(buffer, offset, limit);
+            if (next < 0) break; // no valid frame ahead, treat rest as remaining
+            offset = next;
+            consecutiveErrors++;
+            totalErrors++;
+        } else {
+            // message_crc or parse_error: skip entire frame
+            offset += result.skip || 1;
+            consecutiveErrors++;
+            totalErrors++;
+        }
+    }
+    return { frames, remaining: buffer.subarray(offset), errors: totalErrors };
+}
+
 export function normalizeKiroStopReason(value) {
     if (!value) return null;
     const normalized = String(value).replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();

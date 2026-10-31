@@ -1,382 +1,317 @@
-/**
- * Kiro Sidecar Manager
- *
- * Manages the Rust kiro-sidecar process lifecycle:
- * - State machine: stopped → starting → ready ↔ unhealthy → backoff → unavailable
- * - Rolling restart budget: max 5 restarts in 10 minutes
- * - Local auth token and instance ID generation per spawn
- * - Parent-pipe monitoring (stdin close → child exits)
- */
-
+/** Owns one authenticated Rust sidecar instance and its bounded restart loop. */
 import { spawn } from 'child_process';
 import { randomBytes, randomUUID } from 'crypto';
 import fs from 'fs';
 import http from 'http';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { setTimeout as sleep } from 'node:timers/promises';
 import logger from './logger.js';
 
-const moduleFilename = fileURLToPath(import.meta.url);
-const moduleDirname = path.dirname(moduleFilename);
-
-const DEFAULT_PORT = 9091;
-const HEALTH_CHECK_INTERVAL = 30000;
-const HEALTH_CHECK_TIMEOUT = 3000;
-const STARTUP_TIMEOUT = 10000;
-const MAX_RESTARTS_IN_WINDOW = 5;
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+export const KIRO_TRANSPORT_PROFILE = 'v1-aws-lc-rs';
 const RESTART_WINDOW_MS = 10 * 60 * 1000;
-const INITIAL_BACKOFF_MS = 2000;
-const MAX_BACKOFF_MS = 30000;
-const STOP_TIMEOUT_MS = 5000;
+const MAX_RESTARTS = 5;
 
-const STATES = {
-    STOPPED: 'stopped',
-    STARTING: 'starting',
-    READY: 'ready',
-    UNHEALTHY: 'unhealthy',
-    BACKOFF: 'backoff',
-    UNAVAILABLE: 'unavailable',
-    STOPPING: 'stopping',
-};
+/** Derive exact origins from explicit configuration, including account endpoints. */
+export async function getKiroSidecarTargetOrigins(config = {}) {
+    const nodes = [config, ...Object.entries(config.providerPools || {})
+        .filter(([type]) => type.startsWith('claude-kiro')).flatMap(([, entries]) => entries)];
+    const origins = new Set();
+    for (const node of nodes) {
+        const regions = new Set(['us-east-1', 'eu-west-1', 'ap-southeast-1']);
+        let credentials;
+        try {
+            if (node.KIRO_OAUTH_CREDS_BASE64) credentials = JSON.parse(Buffer.from(node.KIRO_OAUTH_CREDS_BASE64, 'base64').toString());
+            else {
+                const directory = node.KIRO_OAUTH_CREDS_DIR_PATH || config.KIRO_OAUTH_CREDS_DIR_PATH || path.join(os.homedir(), '.aws', 'sso', 'cache');
+                const file = node.KIRO_OAUTH_CREDS_FILE_PATH || path.join(directory, 'kiro-auth-token.json');
+                credentials = JSON.parse(await fs.promises.readFile(file, 'utf8'));
+            }
+        } catch (err) {
+            // File-not-found is expected when no cached credentials exist yet;
+            // parse failures may indicate a corrupt file and warrant a warning.
+            if (err?.code !== 'ENOENT') logger.warn(`[Kiro-Sidecar] Could not load credential regions: ${err?.message || err}`);
+        }
+        for (const region of [node.region, node.idcRegion, credentials?.region, credentials?.idcRegion]) {
+            if (typeof region === 'string' && /^[a-z]{2}(?:-[a-z]+)+-\d+$/.test(region)) regions.add(region);
+        }
+        for (const region of regions) {
+            for (const endpoint of [
+                `https://q.${region}.amazonaws.com`, `https://codewhisperer.${region}.amazonaws.com`,
+                `https://runtime.${region}.kiro.dev`, node.KIRO_BASE_URL ?? config.KIRO_BASE_URL,
+                node.KIRO_API_KEY_BASE_URL ?? config.KIRO_API_KEY_BASE_URL,
+            ]) {
+                if (!endpoint) continue;
+                const url = new URL(endpoint.replaceAll('{{region}}', region));
+                if (url.protocol !== 'https:' || url.username || url.password || url.hash) throw new Error('Kiro sidecar endpoints must be HTTPS URLs without credentials or fragments');
+                origins.add(url.origin);
+            }
+        }
+    }
+    return [...origins];
+}
 
-class KiroSidecar {
-    constructor() {
+export default class KiroSidecar {
+    constructor(timings = {}) {
+        this.timings = { startup: 10000, healthInterval: 30000, health: 3000, stop: 5000, backoff: 2000, ...timings };
         this.process = null;
-        this.port = DEFAULT_PORT;
+        this.record = null;
+        this.port = 9091;
         this.baseUrl = null;
-        this.state = STATES.STOPPED;
+        this.state = 'stopped';
+        this.startPromise = null;
+        this.stopPromise = null;
         this.healthCheckTimer = null;
         this.backoffTimer = null;
-        this.startPromise = null;
         this.localToken = null;
         this.instanceId = null;
-        this.consecutiveHealthFailures = 0;
         this.restartTimestamps = [];
-        this.currentBackoff = INITIAL_BACKOFF_MS;
+        this.currentBackoff = this.timings.backoff;
+        this.consecutiveHealthFailures = 0;
         this.isShuttingDown = false;
         this.options = {};
         this.httpAgent = new http.Agent({ keepAlive: true });
     }
 
-    /**
-     * Start the sidecar process. Concurrent calls share the same promise.
-     * @param {Object} options
-     * @param {number} [options.port] - 监听端口
-     * @param {string} [options.binaryPath] - 自定义二进制路径
-     * @param {number} [options.maxPayloadBytes] - 请求 body 上限
-     * @returns {Promise<boolean>}
-     */
-    async start(options = {}) {
-        if (this.state === STATES.STOPPING) {
-            logger.warn('[Kiro-Sidecar] Cannot start while stopping');
-            return false;
+    start(options = {}) {
+        if (this.stopPromise || this.state === 'stopping') return Promise.resolve(false);
+        if (this.startPromise) return this.startPromise;
+        if (this.record) return Promise.resolve(this.isReady());
+        clearTimeout(this.backoffTimer);
+        this.backoffTimer = null;
+        if (this.state === 'unavailable') {
+            this.restartTimestamps = [];
+            this.currentBackoff = this.timings.backoff;
         }
-        if (this.state === STATES.READY || this.state === STATES.STARTING) {
-            return this.startPromise || true;
-        }
-
+        this.isShuttingDown = false;
         this.options = options;
-        this.port = options.port || parseInt(process.env.KIRO_SIDECAR_PORT) || DEFAULT_PORT;
+        this.port = options.port || Number(process.env.KIRO_SIDECAR_PORT) || 9091;
         this.baseUrl = `http://127.0.0.1:${this.port}`;
+        return this._launch();
+    }
 
-        const binaryPath = options.binaryPath || this._findBinary();
+    _launch() {
+        const operation = this._doStart();
+        this.startPromise = operation;
+        const clear = () => { if (this.startPromise === operation) this.startPromise = null; };
+        operation.then(clear, clear);
+        return operation;
+    }
+
+    async _doStart() {
+        this.state = 'starting';
+        const binaryPath = this.options.binaryPath || this._findBinary();
         if (!binaryPath) {
+            this.state = 'unavailable';
             logger.error('[Kiro-Sidecar] Binary not found');
             return false;
         }
-
-        this.startPromise = this._doStart(binaryPath);
-        const result = await this.startPromise;
-        this.startPromise = null;
-        return result;
-    }
-    async _doStart(binaryPath) {
-        this.state = STATES.STARTING;
-
-        // Generate fresh credentials for this instance
-        this.localToken = randomBytes(32).toString('hex');
-        this.instanceId = randomUUID();
-
+        let record;
         try {
-            if (process.platform !== 'win32') {
-                try { fs.chmodSync(binaryPath, 0o755); } catch {}
-            }
-
-            this.process = spawn(binaryPath, [], {
+            const token = randomBytes(32).toString('hex');
+            const id = randomUUID();
+            const child = spawn(binaryPath, [], {
                 env: {
                     ...process.env,
-                    KIRO_SIDECAR_PORT: String(this.port),
-                    KIRO_SIDECAR_INSTANCE_ID: this.instanceId,
-                    KIRO_SIDECAR_TOKEN: this.localToken,
+                    KIRO_SIDECAR_PORT: String(this.port), KIRO_SIDECAR_INSTANCE_ID: id, KIRO_SIDECAR_TOKEN: token,
+                    KIRO_SIDECAR_MANAGED: '1', KIRO_SIDECAR_TRANSPORT_PROFILE: KIRO_TRANSPORT_PROFILE,
                     KIRO_SIDECAR_MAX_PAYLOAD_BYTES: String(this.options.maxPayloadBytes || 10 * 1024 * 1024),
+                    KIRO_SIDECAR_TARGET_ALLOWLIST: [process.env.KIRO_SIDECAR_TARGET_ALLOWLIST, ...(this.options.targetOrigins || [])].filter(Boolean).join(','),
                 },
                 stdio: ['pipe', 'pipe', 'pipe'],
             });
-
-            this.process.stdout.on('data', (data) => {
-                const msg = data.toString().trim();
-                if (msg) logger.info(`[Kiro-Sidecar] ${msg}`);
+            let exited;
+            record = { child, token, id, baseUrl: this.baseUrl, port: this.port, controller: new AbortController(), exited: false, stopping: false,
+                exitPromise: new Promise(resolve => { exited = resolve; }) };
+            this.record = record;
+            this.process = child;
+            this.localToken = token;
+            this.instanceId = id;
+            const onExit = () => {
+                if (record.exited) return;
+                record.exited = true;
+                record.controller.abort();
+                exited();
+                if (this.record !== record || record.stopping || this.state === 'starting' || this.isShuttingDown) return;
+                this._detach(record);
+                this._scheduleRestart();
+            };
+            child.once('exit', onExit);
+            child.once('error', error => {
+                logger.error(`[Kiro-Sidecar] Cannot spawn sidecar (${error.code || 'SPAWN_ERROR'})`);
+                onExit();
             });
-
-            this.process.stderr.on('data', (data) => {
-                const msg = data.toString().trim();
-                if (msg) logger.error(`[Kiro-Sidecar] ${msg}`);
-            });
-
-            // Single exit handler — prevents double-scheduling restarts
-            let exitHandled = false;
-            this.process.on('exit', (code, signal) => {
-                if (exitHandled) return;
-                exitHandled = true;
-                logger.warn(`[Kiro-Sidecar] Process exited (code=${code}, signal=${signal})`);
-                this._handleExit();
-            });
-
-            this.process.on('error', (err) => {
-                if (exitHandled) return;
-                exitHandled = true;
-                logger.error(`[Kiro-Sidecar] Spawn error: ${err.message}`);
-                this._handleExit();
-            });
-            const ok = await this._waitForReady();
-            if (ok) {
-                this.state = STATES.READY;
+            child.stdin.on('error', () => {});
+            child.stdout.on('data', data => logger.info(`[Kiro-Sidecar] ${data.toString().trim()}`));
+            child.stderr.on('data', data => logger.error(`[Kiro-Sidecar] ${data.toString().trim()}`));
+            if (await this._waitForReady(record) && this.record === record && !record.exited && !this.isShuttingDown) {
+                this.state = 'ready';
                 this.consecutiveHealthFailures = 0;
-                this.currentBackoff = INITIAL_BACKOFF_MS;
-                this._startHealthCheck();
-                logger.info(`[Kiro-Sidecar] Ready at ${this.baseUrl}, instance=${this.instanceId}`);
+                this._startHealthCheck(record);
                 return true;
-            } else {
-                this._cleanup();
-                this.state = STATES.STOPPED;
-                return false;
             }
-        } catch (err) {
-            logger.error(`[Kiro-Sidecar] Failed to start: ${err.message}`);
-            this._cleanup();
-            this.state = STATES.STOPPED;
-            return false;
+            if (!this.isShuttingDown) logger.warn('[Kiro-Sidecar] Startup readiness check failed');
+            await this._terminate(record);
+            this._detach(record);
+        } catch {
+            logger.error('[Kiro-Sidecar] Failed to start sidecar');
+            if (record) {
+                await this._terminate(record);
+                this._detach(record);
+            }
         }
-    }
-
-    _handleExit() {
-        this._cleanup();
-        if (this.isShuttingDown || this.state === STATES.STOPPING) return;
-
-        this.state = STATES.BACKOFF;
-        if (this._hasRestartBudget()) {
-            this.restartTimestamps.push(Date.now());
-            logger.info(`[Kiro-Sidecar] Scheduling restart in ${this.currentBackoff}ms`);
-            this.backoffTimer = setTimeout(() => {
-                this.backoffTimer = null;
-                if (this.state === STATES.STOPPING || this.isShuttingDown) return;
-                this.start(this.options);
-            }, this.currentBackoff);
-            this.currentBackoff = Math.min(this.currentBackoff * 2, MAX_BACKOFF_MS);
-        } else {
-            this.state = STATES.UNAVAILABLE;
-            logger.error('[Kiro-Sidecar] Restart budget exhausted, entering unavailable state');
-        }
-    }
-
-    _hasRestartBudget() {
-        const now = Date.now();
-        this.restartTimestamps = this.restartTimestamps.filter(t => now - t < RESTART_WINDOW_MS);
-        return this.restartTimestamps.length < MAX_RESTARTS_IN_WINDOW;
-    }
-    /**
-     * 停止 sidecar 进程
-     */
-    async stop() {
-        this.isShuttingDown = true;
-        this.state = STATES.STOPPING;
-        this._stopHealthCheck();
-        if (this.backoffTimer) {
-            clearTimeout(this.backoffTimer);
-            this.backoffTimer = null;
-        }
-
-        if (this.process) {
-            return new Promise((resolve) => {
-                const timeout = setTimeout(() => {
-                    if (this.process) {
-                        logger.warn('[Kiro-Sidecar] Force killing');
-                        this.process.kill('SIGKILL');
-                    }
-                    this._finalCleanup();
-                    resolve();
-                }, STOP_TIMEOUT_MS);
-
-                this.process.once('exit', () => {
-                    clearTimeout(timeout);
-                    this._finalCleanup();
-                    resolve();
-                });
-
-                this.process.kill('SIGTERM');
-            });
-        }
-        this._finalCleanup();
-    }
-
-    _cleanup() {
-        this.process = null;
-        this._stopHealthCheck();
-    }
-
-    _finalCleanup() {
-        this.process = null;
-        this.state = STATES.STOPPED;
-        this.localToken = null;
-        this.instanceId = null;
-        this._stopHealthCheck();
-        if (this.httpAgent) {
-            this.httpAgent.destroy();
-            this.httpAgent = new http.Agent({ keepAlive: true });
-        }
-    }
-    /**
-     * 检查 sidecar 是否就绪
-     * @returns {boolean}
-     */
-    isReady() {
-        return this.state === STATES.READY && this.process !== null;
-    }
-
-    /**
-     * 获取 sidecar base URL
-     * @returns {string|null}
-     */
-    getBaseUrl() { return this.isReady() ? this.baseUrl : null; }
-
-    /**
-     * 获取当前本地认证令牌
-     * @returns {string|null}
-     */
-    getLocalToken() { return this.localToken; }
-
-    /**
-     * 获取当前实例 ID
-     * @returns {string|null}
-     */
-    getInstanceId() { return this.instanceId; }
-
-    /**
-     * 获取 keep-alive HTTP agent
-     * @returns {http.Agent}
-     */
-    getHttpAgent() { return this.httpAgent; }
-
-    // ──── 内部方法 ────
-
-    _findBinary() {
-        const projectRoot = path.resolve(moduleDirname, '..', '..');
-        const isWin = process.platform === 'win32';
-        const ext = isWin ? '.exe' : '';
-        const candidates = [
-            path.join(projectRoot, 'kiro-sidecar', `kiro-sidecar${ext}`),
-            path.join(projectRoot, `kiro-sidecar${ext}`),
-            path.join('/app', 'kiro-sidecar', `kiro-sidecar${ext}`),
-            path.join('/app', `kiro-sidecar${ext}`),
-        ];
-        for (const p of candidates) {
-            try { if (fs.existsSync(p) && fs.statSync(p).isFile()) return p; } catch {}
-        }
-        return null;
-    }
-    async _waitForReady(timeoutMs = STARTUP_TIMEOUT) {
-        const start = Date.now();
-        while (Date.now() - start < timeoutMs) {
-            try {
-                if (await this._healthCheck()) return true;
-            } catch {}
-            await sleep(500);
-        }
-        logger.error('[Kiro-Sidecar] Startup timeout');
+        if (!this.isShuttingDown) this._scheduleRestart();
         return false;
     }
 
-    _healthCheck() {
-        return new Promise((resolve) => {
-            const opts = {
-                hostname: '127.0.0.1',
-                port: this.port,
-                path: '/health',
-                method: 'GET',
-                timeout: HEALTH_CHECK_TIMEOUT,
-                agent: this.httpAgent,
-                headers: {
-                    'X-Kiro-Sidecar-Token': this.localToken || '',
-                    'X-Kiro-Protocol-Version': '1',
-                },
-            };
-            const req = http.request(opts, (res) => {
+    _detach(record) {
+        if (this.record !== record) return;
+        this._stopHealthCheck();
+        this.record = null;
+        this.process = null;
+        this.localToken = null;
+        this.instanceId = null;
+    }
+
+    _scheduleRestart() {
+        if (this.isShuttingDown || this.backoffTimer) return;
+        this.restartTimestamps = this.restartTimestamps.filter(t => Date.now() - t < RESTART_WINDOW_MS);
+        if (this.restartTimestamps.length >= MAX_RESTARTS) {
+            this.state = 'unavailable';
+            return;
+        }
+        this.state = 'backoff';
+        this.backoffTimer = setTimeout(() => {
+            this.backoffTimer = null;
+            if (this.isShuttingDown) return;
+            this.restartTimestamps.push(Date.now());
+            this._launch();
+        }, this.currentBackoff);
+        this.currentBackoff = Math.min(this.currentBackoff * 2, 30000);
+        this.backoffTimer.unref?.();
+    }
+
+    _terminate(record) {
+        if (record.stopPromise) return record.stopPromise;
+        record.stopping = true;
+        record.controller.abort();
+        record.stopPromise = (async () => {
+            if (record.exited) return;
+            const force = setTimeout(() => { if (!record.exited) record.child.kill('SIGKILL'); }, this.timings.stop);
+            try {
+                record.child.kill('SIGTERM');
+                await record.exitPromise;
+            } finally { clearTimeout(force); }
+        })();
+        return record.stopPromise;
+    }
+
+    stop() {
+        if (this.stopPromise) return this.stopPromise;
+        this.isShuttingDown = true;
+        this.state = 'stopping';
+        clearTimeout(this.backoffTimer);
+        this.backoffTimer = null;
+        this._stopHealthCheck();
+        const record = this.record;
+        const starting = this.startPromise;
+        const operation = (async () => {
+            if (record) await this._terminate(record);
+            // _terminate aborts the record's controller, which interrupts
+            // _waitForReady; add a deadline in case _doStart is blocked elsewhere.
+            if (starting) await Promise.race([starting, sleep(this.timings.stop + this.timings.startup)]);
+            if (record) this._detach(record);
+            this.httpAgent.destroy();
+            this.httpAgent = new http.Agent({ keepAlive: true });
+            this.state = 'stopped';
+        })();
+        this.stopPromise = operation;
+        const clear = () => { if (this.stopPromise === operation) this.stopPromise = null; };
+        operation.then(clear, clear);
+        return operation;
+    }
+
+    async _waitForReady(record) {
+        const deadline = Date.now() + this.timings.startup;
+        while (!record.controller.signal.aborted && Date.now() < deadline) {
+            if (await this._healthCheck(record, Math.min(this.timings.health, deadline - Date.now()))) return true;
+            try { await sleep(Math.min(100, Math.max(0, deadline - Date.now())), undefined, { signal: record.controller.signal }); }
+            catch { return false; }
+        }
+        return false;
+    }
+
+    _healthCheck(record, timeout = this.timings.health) {
+        return new Promise(resolve => {
+            let settled = false;
+            let timer;
+            const finish = ok => { if (!settled) { settled = true; clearTimeout(timer); resolve(ok); } };
+            const req = http.request({ hostname: '127.0.0.1', port: record.port, path: '/health', agent: this.httpAgent,
+                signal: record.controller.signal,
+                headers: { 'X-Kiro-Sidecar-Token': record.token, 'X-Kiro-Protocol-Version': '1' },
+            }, res => {
                 let body = '';
-                res.on('data', (chunk) => body += chunk);
+                res.on('data', chunk => {
+                    body += chunk;
+                    if (body.length > 4096) { finish(false); res.destroy(); }
+                });
+                res.on('error', () => finish(false));
+                res.on('aborted', () => finish(false));
                 res.on('end', () => {
-                    if (res.statusCode !== 200) return resolve(false);
                     try {
                         const data = JSON.parse(body);
-                        // Verify instance identity
-                        if (data.instance_id !== this.instanceId) {
-                            logger.warn('[Kiro-Sidecar] Instance ID mismatch in health check');
-                            return resolve(false);
-                        }
-                        resolve(true);
-                    } catch {
-                        resolve(false);
-                    }
+                        finish(res.statusCode === 200 && res.headers['x-kiro-protocol-version'] === '1'
+                            && res.headers['x-kiro-response-source'] === 'sidecar' && data.status === 'ok'
+                            && data.service === 'kiro-sidecar' && data.protocol_version === 1
+                            && data.instance_id === record.id && data.transport_profile === KIRO_TRANSPORT_PROFILE);
+                    } catch { finish(false); }
                 });
             });
-            req.on('error', () => resolve(false));
-            req.on('timeout', () => { req.destroy(); resolve(false); });
+            timer = setTimeout(() => { finish(false); req.destroy(); }, Math.max(1, timeout));
+            req.on('error', () => finish(false));
             req.end();
         });
     }
 
-    _startHealthCheck() {
+    _startHealthCheck(record) {
         this._stopHealthCheck();
-        this.healthCheckTimer = setInterval(async () => {
-            const ok = await this._healthCheck();
-            if (!ok) {
-                this.consecutiveHealthFailures++;
-                if (this.state === STATES.READY) {
-                    this.state = STATES.UNHEALTHY;
-                    logger.warn('[Kiro-Sidecar] Health check failed, marking unhealthy');
-                }
-                if (this.consecutiveHealthFailures >= 3 && this.process) {
-                    logger.warn('[Kiro-Sidecar] 3 consecutive health failures, restarting');
-                    this._stopHealthCheck();
-                    this.process.kill('SIGTERM');
-                    // Exit handler will schedule restart
-                }
-            } else {
-                if (this.state === STATES.UNHEALTHY) {
-                    this.state = STATES.READY;
-                    logger.info('[Kiro-Sidecar] Health recovered');
-                }
-                this.consecutiveHealthFailures = 0;
-            }
-        }, HEALTH_CHECK_INTERVAL);
+        this.healthCheckTimer = setTimeout(async () => {
+            const ok = await this._healthCheck(record);
+            if (this.record !== record || record.stopping || this.isShuttingDown) return;
+            this.consecutiveHealthFailures = ok ? 0 : this.consecutiveHealthFailures + 1;
+            this.state = ok ? 'ready' : 'unhealthy';
+            if (this.consecutiveHealthFailures >= 3) {
+                await this._terminate(record);
+                this._detach(record);
+                this._scheduleRestart();
+            } else this._startHealthCheck(record);
+        }, this.timings.healthInterval);
         this.healthCheckTimer.unref?.();
     }
 
-    _stopHealthCheck() {
-        if (this.healthCheckTimer) {
-            clearInterval(this.healthCheckTimer);
-            this.healthCheckTimer = null;
+    _stopHealthCheck() { clearTimeout(this.healthCheckTimer); this.healthCheckTimer = null; }
+    isReady() { return this.state === 'ready' && this.record !== null && !this.record.exited; }
+    getBaseUrl() { return this.isReady() ? this.baseUrl : null; }
+    getLocalToken() { return this.localToken; }
+    getInstanceId() { return this.instanceId; }
+    getHttpAgent() { return this.httpAgent; }
+    getTransportContext() {
+        if (!this.isReady()) return null;
+        return Object.freeze({ kind: 'kiro-sidecar', baseUrl: this.baseUrl, localToken: this.localToken,
+            instanceId: this.instanceId, agent: this.httpAgent });
+    }
+
+    _findBinary() {
+        const ext = process.platform === 'win32' ? '.exe' : '';
+        for (const candidate of [path.join(projectRoot, 'kiro-sidecar', `kiro-sidecar${ext}`),
+            path.join(projectRoot, `kiro-sidecar${ext}`), `/app/kiro-sidecar/kiro-sidecar${ext}`]) {
+            try { if (fs.statSync(candidate).isFile()) return candidate; } catch {}
         }
+        return null;
     }
 }
 
-function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-
-// 单例
-let instance = null;
-
-export function getKiroSidecar() {
-    if (!instance) instance = new KiroSidecar();
-    return instance;
-}
-
-export default KiroSidecar;
+let instance;
+export function getKiroSidecar() { return instance ??= new KiroSidecar(); }

@@ -1,26 +1,25 @@
 //! Streaming proxy handler for kiro-sidecar.
 //!
 //! Receives requests from the IDE client, validates control headers, enforces
-//! resource budgets, and streams the upstream response back. The
-//! `ResourceGuard` RAII handle is held until the handler function returns;
-//! since axum captures the response body stream before the handler's future
-//! completes, this is safe — but it means the budget counters reflect "request
-//! accepted" rather than "response fully consumed". This is an intentional
-//! tradeoff for simplicity; precise tracking would require wrapping the body
-//! stream to own the guard, adding complexity for marginal benefit.
+//! resource budgets, and streams the upstream response back.
+//! Request memory is reserved before reading. The downstream body owns the
+//! in-flight guard until EOF, an error, or cancellation.
 
+use std::error::Error as _;
 use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
-use futures_util::TryStreamExt;
+use futures_util::{stream, StreamExt};
 
 use crate::client::ClientCache;
 use crate::config::Config;
 use crate::lifecycle::{BusyReason, ResourceBudget};
-use crate::protocol::{self, SidecarError, H_PROTOCOL_VERSION, H_RESPONSE_SOURCE, PROTOCOL_VERSION};
+use crate::protocol::{
+    self, SidecarError, H_PROTOCOL_VERSION, H_RESPONSE_SOURCE, PROTOCOL_VERSION,
+};
 
 /// Shared application state available to all handlers.
 #[derive(Debug)]
@@ -65,23 +64,32 @@ async fn handle_stream_inner(
     let (parts, body) = req.into_parts();
     let control = protocol::extract_control_headers(&parts.headers, &state.config)?;
 
-    // 2. Read request body with size limit.
-    let body_bytes = axum::body::to_bytes(body, state.config.max_payload_bytes)
-        .await
-        .map_err(|_| SidecarError {
-            status: StatusCode::PAYLOAD_TOO_LARGE,
-            source: "sidecar",
-            code: "REQUEST_TOO_LARGE",
-            phase: "local",
-            message: format!(
-                "request body exceeds {} byte limit",
-                state.config.max_payload_bytes
-            ),
-            retryable: false,
-        })?;
+    let too_large = || SidecarError {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        source: "sidecar",
+        code: "REQUEST_TOO_LARGE",
+        phase: "local",
+        message: format!(
+            "request body exceeds {} byte limit",
+            state.config.max_payload_bytes
+        ),
+        retryable: false,
+    };
+
+    // Known framing reserves exactly Content-Length. For chunked requests,
+    // reserve the payload limit up front rather than buffering outside budget.
+    let reserved_bytes = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(state.config.max_payload_bytes);
+    if reserved_bytes > state.config.max_payload_bytes {
+        return Err(too_large());
+    }
 
     // 3. Acquire resource budget (concurrency + buffer).
-    let _guard = state.budget.try_acquire(body_bytes.len()).map_err(|reason| {
+    let mut guard = state.budget.try_acquire(reserved_bytes).map_err(|reason| {
         let message = match &reason {
             BusyReason::TooManyRequests => "too many concurrent requests".to_string(),
             BusyReason::BufferFull => "total buffered bytes limit exceeded".to_string(),
@@ -95,6 +103,10 @@ async fn handle_stream_inner(
             retryable: true,
         }
     })?;
+
+    let body_bytes = axum::body::to_bytes(body, reserved_bytes)
+        .await
+        .map_err(|_| too_large())?;
 
     // 4. Get or create reqwest client for the (optional) proxy.
     let client = state
@@ -117,7 +129,7 @@ async fn handle_stream_inner(
         .body(body_bytes)
         .send()
         .await
-        .map_err(|e| classify_reqwest_error(&e))?;
+        .map_err(|e| classify_reqwest_error(e, control.proxy_url.is_some()))?;
 
     // 6. Build response with sidecar headers and streamed body.
     let status = upstream_resp.status();
@@ -125,9 +137,17 @@ async fn handle_stream_inner(
 
     // Map the reqwest byte stream, converting reqwest::Error → io::Error
     // so that axum's Body::from_stream can consume it.
-    let body_stream = upstream_resp
-        .bytes_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e));
+    guard.release_buffer();
+    let body_stream = stream::unfold(
+        (Box::pin(upstream_resp.bytes_stream()), guard),
+        |(mut upstream, guard)| async move {
+            upstream.next().await.map(|chunk| {
+                let chunk =
+                    chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e));
+                (chunk, (upstream, guard))
+            })
+        },
+    );
 
     let mut response = Response::builder()
         .status(status)
@@ -145,6 +165,9 @@ async fn handle_stream_inner(
 
     // Forward selected upstream response headers.
     for &name in FORWARDED_RESPONSE_HEADERS {
+        if protocol::is_connection_header(&upstream_headers, name) {
+            continue;
+        }
         if let Some(val) = upstream_headers.get(name) {
             if let Ok(hname) = axum::http::header::HeaderName::from_bytes(name.as_bytes()) {
                 if let Ok(hval) = HeaderValue::from_bytes(val.as_bytes()) {
@@ -154,18 +177,34 @@ async fn handle_stream_inner(
         }
     }
 
-    // _guard is dropped here, releasing the resource budget.
-    // The body stream has been moved into the Response and will be consumed
-    // by axum's connection layer after this future completes.
     Ok(response)
 }
 
 // ── Error classification ──────────────────────────────────────────────
 
 /// Classify a reqwest send error into a structured `SidecarError`.
-fn classify_reqwest_error(err: &reqwest::Error) -> SidecarError {
-    let (code, phase, retryable) = if err.is_timeout() {
+fn classify_reqwest_error(err: reqwest::Error, proxied: bool) -> SidecarError {
+    let mut details = String::new();
+    let mut source = err.source();
+    let mut tls_error = false;
+    while let Some(cause) = source {
+        tls_error |= cause.downcast_ref::<rustls::Error>().is_some();
+        details.push_str(&cause.to_string().to_lowercase());
+        source = cause.source();
+    }
+    let (code, phase, retryable) = if details.contains("proxy authentication required")
+        || details.contains("proxy authorization required")
+        || details.contains("407")
+    {
+        ("PROXY_AUTH_FAILED", "proxy", false)
+    } else if tls_error || details.contains("certificate") || details.contains("tls handshake") {
+        ("TLS_ERROR", "tls", false)
+    } else if err.is_timeout() {
         ("CONNECT_TIMEOUT", "connect", true)
+    } else if details.contains("dns error") || details.contains("failed to lookup address") {
+        ("DNS_ERROR", "dns", true)
+    } else if err.is_connect() && proxied {
+        ("PROXY_CONNECT_ERROR", "proxy", true)
     } else if err.is_connect() {
         ("CONNECT_ERROR", "connect", true)
     } else if err.is_builder() {
@@ -179,7 +218,8 @@ fn classify_reqwest_error(err: &reqwest::Error) -> SidecarError {
         source: "sidecar",
         code,
         phase,
-        message: format!("{err}"),
+        // Do not return URLs, proxy credentials, or provider-generated strings.
+        message: code.to_string(),
         retryable,
     }
 }
