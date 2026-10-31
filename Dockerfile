@@ -1,4 +1,4 @@
-# ── Stage 1: 编译 Go TLS sidecar ──
+# ── Stage 1a: 编译 Go TLS sidecar ──
 FROM golang:1.22-alpine AS sidecar-builder
 
 ARG HTTP_PROXY
@@ -15,6 +15,21 @@ RUN go mod download || true
 COPY tls-sidecar/ ./
 RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o tls-sidecar .
 
+# ── Stage 1b: 编译 Rust kiro-sidecar ──
+FROM rust:1.88-alpine AS kiro-builder
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY
+ENV HTTPS_PROXY=$HTTPS_PROXY
+
+RUN apk add --no-cache build-base cmake perl
+
+WORKDIR /build
+COPY kiro-sidecar/Cargo.toml kiro-sidecar/Cargo.lock kiro-sidecar/rust-toolchain.toml ./
+COPY kiro-sidecar/src ./src
+RUN cargo build --release --locked
+
 # ── Stage 2: Node.js 应用 ──
 # 使用官方Node.js运行时作为基础镜像
 # 选择20-alpine版本以满足undici包的要求（需要Node.js >=20.18.1）
@@ -28,8 +43,8 @@ LABEL description="Docker image for AIClient2API server"
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
 
-# 安装必要的系统工具（tar 用于更新功能，git 用于版本检查，procps 用于系统监控）
-RUN apk add --no-cache tar git procps
+# 安装必要的系统工具（tar 用于更新功能，git 用于版本检查，procps 用于系统监控，ca-certificates 用于 TLS）
+RUN apk add --no-cache tar git procps ca-certificates
 
 # 设置工作目录
 WORKDIR /app
@@ -47,6 +62,10 @@ COPY . .
 # 放在 COPY . . 之后是为了确保不会被本地的空目录或旧二进制文件覆盖
 COPY --from=sidecar-builder /build/tls-sidecar /app/tls-sidecar/tls-sidecar
 RUN chmod +x /app/tls-sidecar/tls-sidecar
+
+# 复制 kiro-sidecar 二进制（可选，仅在 KIRO_SIDECAR_ENABLED=true 时使用）
+COPY --from=kiro-builder /build/target/release/kiro-sidecar /app/kiro-sidecar/kiro-sidecar
+RUN chmod +x /app/kiro-sidecar/kiro-sidecar
 
 USER root
 
