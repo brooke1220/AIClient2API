@@ -13,7 +13,9 @@ use axum::Router;
 use tokio::signal;
 use tracing_subscriber::EnvFilter;
 
+use client::ClientCache;
 use config::Config;
+use lifecycle::ResourceBudget;
 use proxy::AppState;
 
 #[tokio::main]
@@ -40,6 +42,8 @@ async fn main() {
     let instance_id = config.instance_id.clone();
 
     let state = Arc::new(AppState {
+        client_cache: ClientCache::new(&config),
+        budget: ResourceBudget::new(config.max_inflight, config.max_buffer_bytes),
         config: Arc::new(config),
     });
 
