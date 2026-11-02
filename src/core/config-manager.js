@@ -127,6 +127,11 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         RATE_LIMIT_COOLDOWN_MAX_MS: 300000, // Retry-After 允许的最大冷却时间（毫秒）
         CRON_NEAR_MINUTES: 15,
         CRON_REFRESH_TOKEN: false,
+        KIRO_DYNAMIC_MODELS: false,
+        KIRO_MODEL_CACHE_TTL_MS: 300000,
+        KIRO_REFRESH_AHEAD_MINUTES: 10, // 有效凭证提前续期，不暂停正常请求
+        KIRO_REFRESH_JITTER_MS: 30000, // 按凭据错开提前续期时间
+        KIRO_REFRESH_WAIT_TIMEOUT_MS: 15000, // 无可用账号时等待共享刷新的上限
         LOGIN_EXPIRY: 3600, // 登录过期时间（秒），默认1小时
         LOGIN_MAX_ATTEMPTS: 5, // 最大失败重试次数
         LOGIN_LOCKOUT_DURATION: 1800, // 锁定持续时间（秒），默认30分钟

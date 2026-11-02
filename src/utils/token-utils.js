@@ -1,5 +1,28 @@
-import { countTokens } from '@anthropic-ai/tokenizer';
+import { getTokenizer } from '@anthropic-ai/tokenizer';
 import logger from './logger.js';
+
+// Encoding is synchronous, so one encoder can serve all requests in this process.
+// Retain the vocabulary only; never cache request text or encoded results.
+let sharedTokenizer;
+
+function tokenizer() {
+    return sharedTokenizer ||= getTokenizer();
+}
+
+export function disposeTokenizer() {
+    const previous = sharedTokenizer;
+    sharedTokenizer = undefined;
+    try { previous?.free(); } catch { /* A failed encoder must still be replaceable. */ }
+}
+
+export function warmupTokenizer() {
+    try {
+        tokenizer();
+    } catch (error) {
+        disposeTokenizer();
+        logger.warn('[TokenUtils] Tokenizer warmup failed; will retry on use:', error.message);
+    }
+}
 
 // A heuristic, not provider-reported usage; actual image tokens depend on size/model.
 export const ESTIMATED_IMAGE_TOKENS = 1600;
@@ -91,8 +114,10 @@ export function processContent(content) {
 export function countTextTokens(text) {
     if (!text) return 0;
     try {
-        return countTokens(text);
+        // Match the package's countTokens normalization and special-token policy.
+        return tokenizer().encode(text.normalize('NFKC'), 'all').length;
     } catch (error) {
+        disposeTokenizer();
         // Fallback to estimation if tokenizer fails
         logger.warn('[TokenUtils] Tokenizer error, falling back to estimation:', error.message);
         return Math.ceil((text || '').length / 4);

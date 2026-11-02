@@ -12,6 +12,8 @@ import '../src/converters/register-converters.js';
 import { acquireProviderSlot } from '../src/providers/provider-slot-lease.js';
 import { ProviderPoolManager } from '../src/providers/provider-pool-manager.js';
 import * as services from '../src/services/service-manager.js';
+import logger from '../src/utils/logger.js';
+import { performance } from 'node:perf_hooks';
 
 const KIRO = 'claude-kiro-oauth';
 const MODEL = 'claude-sonnet-4-5';
@@ -95,11 +97,35 @@ function runStream(res, backend, manager, extra = {}) {
 describe('Kiro public stream handler write deadlines', () => {
     afterEach(() => jest.restoreAllMocks());
 
+    test('each combined SSE event preserves exact bytes and waits for drain before fetching more', async () => {
+        const chunks = [startChunk(), textChunk(), { type: 'message_stop' }];
+        let consumed = 0, first = true;
+        const res = response(() => { if (!first) return false; first = false; return true; });
+        const backend = { generateContentStream: async function* () {
+            for (const chunk of chunks) { consumed++; yield chunk; }
+        } };
+        const pending = runStream(res, backend, pool(), {
+            CONFIG: { KIRO_DOWNSTREAM_WRITE_TIMEOUT_MS: 500, SSE_HEARTBEAT_INTERVAL_MS: 0 }
+        });
+        try {
+            await tick();
+            expect(consumed).toBe(1);
+            expect(res.write.mock.calls).toEqual([[`event: message_start\ndata: ${JSON.stringify(chunks[0])}\n\n`]]);
+            res.writableNeedDrain = false; res.emit('drain');
+            await settles(pending, res);
+            expect(res.write.mock.calls.map(([value]) => value)).toEqual(chunks.map(chunk => `event: ${chunk.type}\ndata: ${JSON.stringify(chunk)}\n\n`));
+            expect(consumed).toBe(3);
+        } finally {
+            if (!res.writableEnded && !res.destroyed) res.destroy();
+            await pending;
+        }
+    });
+
     test.each(['event', 'data'])('a stalled %s record cancels upstream and frees its actual lease without fetching another event', async kind => {
         const node = { type: KIRO, config: { uuid: 'node', concurrencyLimit: 1, isHealthy: true }, state: { activeCount: 0, waitingCount: 0, queue: [] } };
         const acquired = await acquireProviderSlot(node);
         const manager = pool();
-        const res = response(chunk => chunk.startsWith(`${kind}:`));
+        const res = response(chunk => chunk.split('\n').some(line => line.startsWith(`${kind}:`)));
         let signal, closed = false, consumed = 0;
         const backend = { generateContentStream: async function* (_, __, options) {
             signal = options.signal;
@@ -165,7 +191,7 @@ describe('Kiro public stream handler write deadlines', () => {
 
     test.each(['event', 'data'])('a stalled synthesized Claude terminal %s cannot keep the handler open', async kind => {
         const manager = pool();
-        const res = response(chunk => kind === 'event' ? chunk === 'event: message_stop\n' : chunk === 'data: {"type":"message_stop"}\n\n');
+        const res = response(chunk => chunk.split('\n').includes(kind === 'event' ? 'event: message_stop' : 'data: {"type":"message_stop"}'));
         const backend = { generateContentStream: async function* () { yield textChunk(); } };
         await waitsForDeadline(runStream(res, backend, manager), res);
         expect(manager.releaseSlot).toHaveBeenCalledTimes(1);
@@ -214,6 +240,48 @@ describe('Kiro public stream handler write deadlines', () => {
             if (!res.writableEnded && !res.destroyed) res.destroy();
             await pending;
         }
+    });
+});
+
+describe('Kiro request timing covers account selection', () => {
+    afterEach(() => jest.restoreAllMocks());
+
+    test('a queued selection remains in the shared baseline through the first accepted text', async () => {
+        logger.info.mockClear();
+        const req = new EventEmitter(), res = response(); req.headers = {};
+        let enterSelection, finishSelection, options, sentBody;
+        const entered = new Promise(resolve => { enterSelection = resolve; });
+        const gate = new Promise(resolve => { finishSelection = resolve; });
+        const backend = { generateContentStream: async function* (_, body, received) {
+            options = received; sentBody = body;
+            yield startChunk(); yield textChunk(); yield { type: 'message_stop' };
+        } };
+        jest.spyOn(services, 'getApiServiceWithFallback').mockImplementation(async () => {
+            enterSelection(); await gate;
+            return { service: backend, actualProviderType: KIRO, uuid: 'node' };
+        });
+        const before = performance.now();
+        const pending = handleContentGenerationRequest(req, res, null, ENDPOINT_TYPE.CLAUDE_MESSAGE,
+            { MODEL_PROVIDER: KIRO, PROMPT_LOG_MODE: 'none', SSE_HEARTBEAT_INTERVAL_MS: 0 }, null, pool(), null);
+        req.emit('data', Buffer.from(JSON.stringify({ model: MODEL, ...body(), stream: true })));
+        req.emit('end');
+        await entered;
+        const waitStarted = performance.now();
+        await delay(25);
+        const waitedMs = performance.now() - waitStarted;
+        finishSelection();
+        await settles(pending, res);
+        expect(options.kiroTiming.startedAt).toBeGreaterThanOrEqual(before);
+        expect(options.kiroTiming.startedAt).toBeLessThanOrEqual(waitStarted);
+        expect(sentBody).not.toHaveProperty('kiroTiming');
+        const logs = logger.info.mock.calls.map(([message]) => message).filter(message => message.startsWith('[Kiro Timing]'));
+        const preparation = logs.find(message => message.includes('Request preparation:'));
+        expect(Number(preparation.match(/account selection: (\d+)ms/)[1])).toBeGreaterThanOrEqual(Math.floor(waitedMs));
+        expect(logs.filter(message => message.includes('First downstream event accepted:'))).toHaveLength(1);
+        const textLogs = logs.filter(message => message.includes('First downstream text accepted:'));
+        expect(textLogs).toHaveLength(1);
+        expect(Number(textLogs[0].match(/accepted: (\d+)ms/)[1])).toBeGreaterThanOrEqual(Math.floor(waitedMs));
+        expect(logs.join(' ')).not.toContain('hello');
     });
 });
 

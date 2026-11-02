@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as http from 'http'; // Add http for IncomingMessage and ServerResponse types
 import * as crypto from 'crypto'; // Import crypto for MD5 hashing
 import { setTimeout as sleep } from 'node:timers/promises';
+import { performance } from 'node:perf_hooks';
 import logger from './logger.js';
 import { convertData, getOpenAIStreamChunkStop, releaseStreamState } from '../convert/convert.js';
 import { ProviderStrategyFactory } from './provider-strategies.js';
@@ -1076,6 +1077,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     // maxRetries: 凭证切换最大次数（跨凭证），默认 5 次
     const CONFIG = retryContext?.CONFIG;
     const isKiroStream = isKiroProviderType(toProvider);
+    const kiroTiming = isKiroStream
+        ? (retryContext.kiroTiming ||= { startedAt: performance.now() }) : null;
     const maxRetries = isKiroStream
         ? kiroRetryCount(CONFIG?.CREDENTIAL_SWITCH_MAX_RETRIES ?? retryContext?.maxRetries, 5)
         : retryContext?.maxRetries ?? 5;
@@ -1145,6 +1148,26 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         });
         writeChain = operation.catch(() => {});
         return operation;
+    };
+
+    const onModelEventWritten = chunk => {
+        anyDataSent = true;
+        if (!kiroTiming) return;
+        // res.write accepted the record; this does not measure client receipt.
+        if (!kiroTiming.firstEventWritten) {
+            kiroTiming.firstEventWritten = true;
+            logger.info(`[Kiro Timing] First downstream event accepted: ${Math.round(performance.now() - kiroTiming.startedAt)}ms elapsed`);
+        }
+        if (!kiroTiming.firstTextWritten) {
+            const text = chunk.delta?.type === 'text_delta' ? chunk.delta.text
+                : chunk.type === 'response.output_text.delta' ? chunk.delta
+                : chunk.choices?.[0]?.delta?.content
+                    ?? chunk.candidates?.[0]?.content?.parts?.filter(part => !part.thought).map(part => part.text || '').join('');
+            if (typeof text === 'string' && text.trim()) {
+                kiroTiming.firstTextWritten = true;
+                logger.info(`[Kiro Timing] First downstream text accepted: ${Math.round(performance.now() - kiroTiming.startedAt)}ms elapsed`);
+            }
+        }
     };
 
     let heartbeat;
@@ -1412,9 +1435,12 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         requestBody.model = model;
         const generationOptions = { signal: upstreamAbortController.signal };
         if (isKiroStream) {
-            retryContext?.slotLease?.assertUsable?.();
-            providerPoolManager?.assertProviderAvailable?.(toProvider, pooluuid);
+            generationOptions.kiroWaitForCredentialRefresh = currentRetry >= maxRetries;
+            const availability = { allowNeedsRefresh: generationOptions.kiroWaitForCredentialRefresh };
+            retryContext?.slotLease?.assertUsable?.(availability);
+            providerPoolManager?.assertProviderAvailable?.(toProvider, pooluuid, availability);
             if (retryContext?.slotLease?.assertUsable) generationOptions.kiroAccountLease = retryContext.slotLease;
+            generationOptions.kiroTiming = kiroTiming;
         }
         const nativeStream = await service.generateContentStream(model, requestBody, generationOptions);
         
@@ -1532,7 +1558,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     hasMessageStop = true;
                 }
 
-                if (addEvent) {
+                if (addEvent && !isKiroStream) {
                     // fullOldResponseJson += chunk.type+"\n";
                     // fullResponseJson += chunk.type+"\n";
                     if (!clientDisconnected.value && !res.writableEnded) {
@@ -1553,7 +1579,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 // fullResponseJson += JSON.stringify(chunk)+"\n\n";
                 if (!clientDisconnected.value && !res.writableEnded) {
                     try {
-                        await writeStreamRecord(`data: ${JSON.stringify(chunk)}\n\n`, () => { anyDataSent = true; });
+                        const eventHeader = isKiroStream && addEvent ? `event: ${chunk.type}\n` : '';
+                        await writeStreamRecord(`${eventHeader}data: ${JSON.stringify(chunk)}\n\n`, () => onModelEventWritten(chunk));
                         if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES) {
                             const sequence = chunk?.sequence_number;
                             nextResponseSequenceNumber = Number.isInteger(sequence) && sequence >= 0
@@ -1599,7 +1626,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             return;
         }
 
-        logger.error('\n[Server] Error during stream processing:', error.stack);
+        if (error.isKiroAccountUnavailable) logger.info(`[Stream] Kiro account unavailable (${error.kiroUnavailableReason}); evaluating recovery`);
+        else logger.error('\n[Server] Error during stream processing:', error.stack);
 
         // 如果已经发送了数据（包括 metadata），不进行重试（避免响应数据损坏或顺序错误）
         if (anyDataSent) {
@@ -1685,6 +1713,10 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         const skipErrorCount = error.skipErrorCount === true;
         // 检查是否应该切换凭证（用于 429/5xx/402/403 等情况）
         const shouldSwitchCredential = error.shouldSwitchCredential === true;
+        const isCredentialRefresh = isKiroStream && (error.kiroCredentialRefresh === true || error.kiroUnavailableReason === 'refresh');
+        const refreshTriedUuids = isCredentialRefresh
+            ? [...new Set([...(retryContext?.refreshTriedUuids || []), pooluuid, error.kiroRefreshUuid].filter(Boolean))]
+            : retryContext?.refreshTriedUuids;
         
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
@@ -1727,7 +1759,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (credentialMarkedUnhealthy && quotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             // 额度耗尽立即换号；其它错误保留抖动，并在等待前释放当前插槽。
             releaseCurrentSlot();
-            const randomDelay = cooldown.quotaExhausted ? 0 : Math.floor(Math.random() * 10000);
+            const randomDelay = cooldown.quotaExhausted || isCredentialRefresh ? 0 : Math.floor(Math.random() * 10000);
             logger.info(`[Stream Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
             if (randomDelay > 0) await sleep(randomDelay, undefined, { signal: upstreamAbortController.signal }).catch(() => {});
             // 客户端在等待期间断开：不再占用新凭证的并发插槽，也无需写错误响应
@@ -1744,7 +1776,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 const result = await getApiServiceWithFallback(CONFIG, model, {
                     acquireSlot: true,
                     signal: upstreamAbortController.signal,
-                    excludeUuids: exhaustedUuids
+                    excludeUuids: exhaustedUuids,
+                    preferOtherUuids: refreshTriedUuids
                 });
                 
                 if (result && result.service) {
@@ -1754,6 +1787,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     const newRetryContext = {
                         ...retryContext,
                         slotLease: result.slotLease || null,
+                        refreshTriedUuids,
                         exhaustedUuids: cooldown.quotaExhausted ? exhaustedUuids : retryContext?.exhaustedUuids,
                         CONFIG,
                         currentRetry: currentRetry + 1,
@@ -1783,6 +1817,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 }
             } catch (retryError) {
                 logger.error(`[Stream Retry] Failed to get alternative service:`, retryError.message);
+                if (retryError.code === 'KIRO_CREDENTIAL_REFRESH_FAILED' || retryError.code === 'KIRO_CREDENTIAL_REFRESH_TIMEOUT') error = retryError;
             }
         }
 
@@ -1840,8 +1875,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                             claudeStreamFix({ type: 'message_stop' }, closingChunks);
                             for (const closingChunk of closingChunks) {
                                 if (isKiroStream) {
-                                    await writeStreamRecord(`event: ${closingChunk.type}\n`, undefined, null);
-                                    await writeStreamRecord(`data: ${JSON.stringify(closingChunk)}\n\n`, undefined, null);
+                                    await writeStreamRecord(`event: ${closingChunk.type}\ndata: ${JSON.stringify(closingChunk)}\n\n`, undefined, null);
                                 } else {
                                     res.write(`event: ${closingChunk.type}\n`);
                                     res.write(`data: ${JSON.stringify(closingChunk)}\n\n`);
@@ -1851,8 +1885,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                         } else if (!hasMessageStop) {
                             // Native Claude stream: only add the missing outer stop marker.
                             if (isKiroStream) {
-                                await writeStreamRecord('event: message_stop\n', undefined, null);
-                                await writeStreamRecord('data: {"type":"message_stop"}\n\n', undefined, null);
+                                await writeStreamRecord('event: message_stop\ndata: {"type":"message_stop"}\n\n', undefined, null);
                             } else {
                                 res.write('event: message_stop\n');
                                 res.write('data: {"type":"message_stop"}\n\n');
@@ -1907,8 +1940,10 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         requestBody.model = model;
         const generationOptions = { signal: retryContext?.upstreamAbortController?.signal };
         if (isKiroRequest) {
-            retryContext?.slotLease?.assertUsable?.();
-            providerPoolManager?.assertProviderAvailable?.(toProvider, pooluuid);
+            generationOptions.kiroWaitForCredentialRefresh = currentRetry >= maxRetries;
+            const availability = { allowNeedsRefresh: generationOptions.kiroWaitForCredentialRefresh };
+            retryContext?.slotLease?.assertUsable?.(availability);
+            providerPoolManager?.assertProviderAvailable?.(toProvider, pooluuid, availability);
             if (retryContext?.slotLease?.assertUsable) generationOptions.kiroAccountLease = retryContext.slotLease;
         }
         // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
@@ -2020,6 +2055,10 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         const skipErrorCount = error.skipErrorCount === true;
         // 检查是否应该切换凭证（用于 429/5xx/402/403 等情况）
         const shouldSwitchCredential = error.shouldSwitchCredential === true;
+        const isCredentialRefresh = isKiroRequest && (error.kiroCredentialRefresh === true || error.kiroUnavailableReason === 'refresh');
+        const refreshTriedUuids = isCredentialRefresh
+            ? [...new Set([...(retryContext?.refreshTriedUuids || []), pooluuid, error.kiroRefreshUuid].filter(Boolean))]
+            : retryContext?.refreshTriedUuids;
         
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
@@ -2060,7 +2099,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         if (credentialMarkedUnhealthy && quotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             // 额度耗尽立即换号；其它错误保留抖动，并在等待前释放当前插槽。
             releaseCurrentSlot();
-            const randomDelay = cooldown.quotaExhausted ? 0 : Math.floor(Math.random() * 10000);
+            const randomDelay = cooldown.quotaExhausted || isCredentialRefresh ? 0 : Math.floor(Math.random() * 10000);
             logger.info(`[Unary Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
             if (randomDelay > 0) await sleep(randomDelay, undefined, { signal: retryContext?.upstreamAbortController?.signal }).catch(() => {});
             if (retryContext?.upstreamAbortController?.signal.aborted) return;
@@ -2072,7 +2111,8 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                 const result = await getApiServiceWithFallback(CONFIG, model, {
                     acquireSlot: true,
                     signal: retryContext?.upstreamAbortController?.signal,
-                    excludeUuids: exhaustedUuids
+                    excludeUuids: exhaustedUuids,
+                    preferOtherUuids: refreshTriedUuids
                 });
                 
                 if (result && result.service) {
@@ -2082,6 +2122,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                     const newRetryContext = {
                         ...retryContext,
                         slotLease: result.slotLease || null,
+                        refreshTriedUuids,
                         exhaustedUuids: cooldown.quotaExhausted ? exhaustedUuids : retryContext?.exhaustedUuids,
                         CONFIG,
                         currentRetry: currentRetry + 1,
@@ -2108,6 +2149,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                 }
             } catch (retryError) {
                 logger.error(`[Unary Retry] Failed to get alternative service:`, retryError.message);
+                if (retryError.code === 'KIRO_CREDENTIAL_REFRESH_FAILED' || retryError.code === 'KIRO_CREDENTIAL_REFRESH_TIMEOUT') error = retryError;
             }
         }
 
@@ -2278,11 +2320,13 @@ export async function handleModelListRequest(req, res, service, endpointType, CO
  * @param {string} PROMPT_LOG_FILENAME - The prompt log filename.
  */
 export async function handleContentGenerationRequest(req, res, service, endpointType, CONFIG, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, requestPath = null) {
+    const requestStartedAt = performance.now();
     const cancellation = clientRequestCancellation(req, res);
     let ownedSlotLease = null;
     try {
         cancellation.controller.signal.throwIfAborted();
         const originalRequestBody = await getRequestBody(req, { maxBytes: CONFIG.REQUEST_BODY_MAX_BYTES });
+        const bodyReadFinishedAt = performance.now();
 
         if (!originalRequestBody) {
             throw new Error("Request body is missing for content generation.");
@@ -2340,6 +2384,7 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         // - 使用号池/AUTO 时按模型重选并支持 fallback
         // 注意：仅在号池场景开启 acquireSlot，占用并发名额或进入队列
         const shouldSelectByPool = providerPoolManager && (CONFIG.MODEL_PROVIDER === MODEL_PROVIDER.AUTO || (CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER]));
+        const selectionStartedAt = performance.now();
         if (!service || shouldSelectByPool) {
             const { getApiServiceWithFallback } = await import('../services/service-manager.js');
             const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: shouldSelectByPool, signal: cancellation.controller.signal });
@@ -2364,6 +2409,8 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
             }
         }
 
+        const selectionMs = performance.now() - selectionStartedAt;
+        const preprocessingStartedAt = performance.now();
         // 1. Convert request body from client format to backend format, if necessary.
         // 使用浅拷贝以避免直接变异 originalRequestBody，保持原始数据的纯净性以供后续钩子使用
         let processedRequestBody = { ...originalRequestBody };
@@ -2430,7 +2477,10 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         const credentialSwitchMaxRetries = isKiroProviderType(toProvider)
             ? kiroRetryCount(CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES, 5)
             : CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
-        const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, slotLease: ownedSlotLease, upstreamAbortController: cancellation.controller };
+        const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, slotLease: ownedSlotLease, upstreamAbortController: cancellation.controller, kiroTiming: { startedAt: requestStartedAt } };
+        if (isStream && isKiroProviderType(toProvider)) {
+            logger.info(`[Kiro Timing] Request preparation: body: ${Math.round(bodyReadFinishedAt - requestStartedAt)}ms; account selection: ${Math.round(selectionMs)}ms; preprocessing: ${Math.round(performance.now() - preprocessingStartedAt)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
+        }
     
         if (isStream) {
             await handleStreamRequest(res, service, model, processedRequestBody, fromProvider, toProvider, CONFIG.PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, actualUuid, actualCustomName, retryContext);

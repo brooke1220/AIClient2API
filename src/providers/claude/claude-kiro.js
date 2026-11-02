@@ -30,6 +30,7 @@ import {
 import { configureAxiosProxy, configureTLSSidecar, isTLSSidecarEnabledForProvider, resolveProxyUrlForProvider } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog, getNormalizedErrorResponseText, buildHttpErrorReason, normalizeProviderErrorMessage, createEmptyUpstreamResponseError } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
+import { getKiroRefreshAheadMs, kiroRefreshError, waitForKiroRefresh } from '../kiro-credential-refresh.js';
 import { buildKiroAdditionalModelRequestFields, resolveKiroRequestedEffort } from './kiro-effort.js';
 import {
     resolveKiroRequestProfileArn,
@@ -811,6 +812,11 @@ export class KiroApiService {
 
     async _requestWithBuilderEndpointRouting(axiosConfig, requestData, options = {}) {
         const routedConfig = this._buildRoutedRequest(axiosConfig, requestData);
+        // A shared refresh may finish while this attempt waits for its start slot.
+        if (routedConfig.headers.Authorization && this.accessToken) routedConfig.headers.Authorization = `Bearer ${this.accessToken}`;
+        options._kiroIsStaleCredentialAttempt = getProviderPoolManager()?.captureKiroCredentialAttempt?.(
+            this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, this.uuid, this.accessToken
+        );
 
         // Kiro sidecar transport path (only when explicitly enabled for this request)
         if (options.allowKiroSidecar && options._transportContext?.kind === 'kiro-sidecar') {
@@ -1055,7 +1061,7 @@ async _discoverProfileArn() {
     }
 }
 
-async initializeAuth(forceRefresh = false) {
+async initializeAuth(forceRefresh = false, options = {}) {
     if (this.accessToken && !forceRefresh) {
         logger.debug('[Kiro Auth] Access token already available and not forced refresh.');
         return;
@@ -1081,7 +1087,7 @@ async initializeAuth(forceRefresh = false) {
             }
 
             const tokenFilePath = this.credsFilePath || path.join(this.credPath, KIRO_AUTH_TOKEN_FILE);
-            await this._doTokenRefresh(this.saveCredentialsToFile.bind(this), tokenFilePath);
+            await this._doTokenRefresh(this.saveCredentialsToFile.bind(this), tokenFilePath, options);
         }
 
         if (!this.accessToken) {
@@ -1144,7 +1150,7 @@ async saveCredentialsToFile(filePath, newData) {
      * @param {Function} saveCredentialsToFile - 保存凭证的函数
      * @param {string} tokenFilePath - 凭证文件路径
      */
-    async _doTokenRefresh(saveCredentialsToFile, tokenFilePath) {
+    async _doTokenRefresh(saveCredentialsToFile, tokenFilePath, options = {}) {
         try {
             const requestBody = {
                 refreshToken: this.refreshToken,
@@ -1211,7 +1217,7 @@ async saveCredentialsToFile(filePath, newData) {
 
                 // 刷新成功，重置 PoolManager 中的刷新状态并标记为健康
                 const poolManager = getProviderPoolManager();
-                if (poolManager && this.uuid) {
+                if (poolManager && this.uuid && !options.managedByPool) {
                     poolManager.resetProviderRefreshStatus(this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, this.uuid);
                 }
             } else {
@@ -1966,6 +1972,7 @@ async saveCredentialsToFile(filePath, newData) {
 
         const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.output_config, body.reasoning_effort, body);
 
+        const requestOptions = {};
         try {
             const token = this.accessToken; // Use the already initialized token
             const headers = {
@@ -1988,7 +1995,7 @@ async saveCredentialsToFile(filePath, newData) {
                 headers
             };
             await waitForKiroRequestSlot(this.config);
-            const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData);
+            const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData, requestOptions);
             response._kiroToolNameMaps = requestData._kiroToolNameMaps;
             return response;
         } catch (error) {
@@ -2009,15 +2016,7 @@ async saveCredentialsToFile(filePath, newData) {
                     suffix: 'triggering auto-refresh'
                 });
                 
-                // 1. 先刷新 UUID
-                const newUuid = this._refreshUuid();
-                if (newUuid) {
-                    logger.info(`[Kiro] UUID refreshed: ${this.uuid} -> ${newUuid}`);
-                    this.uuid = newUuid;
-                }
-                
-                // 标记当前凭证为不健康（会自动进入刷新队列）
-                this._markCredentialNeedRefresh('401 Unauthorized - Triggering auto-refresh');
+                this._handleUnauthorizedCredential(error, '401 Unauthorized - Triggering auto-refresh', requestOptions);
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
@@ -2183,6 +2182,22 @@ async saveCredentialsToFile(filePath, newData) {
         }
     }
 
+    _handleUnauthorizedCredential(error, reason, options = {}) {
+        if (options._kiroIsStaleCredentialAttempt?.()) {
+            logger.info('[Kiro] Ignoring a credential rejection from before the completed refresh.');
+            error.credentialMarkedUnhealthy = true;
+            error.kiroCredentialRefresh = true;
+            error.kiroRefreshUuid = this.uuid;
+            return;
+        }
+        const newUuid = this._refreshUuid();
+        if (newUuid) {
+            logger.info(`[Kiro] UUID refreshed: ${this.uuid} -> ${newUuid}`);
+            this.uuid = newUuid;
+        }
+        this._markCredentialNeedRefresh(reason, error);
+    }
+
     /**
      * Helper method to mark the current credential as unhealthy
      * @param {string} reason - The reason for marking unhealthy
@@ -2201,6 +2216,8 @@ async saveCredentialsToFile(filePath, newData) {
             // Attach marker to error object to prevent duplicate marking in upper layers
             if (error) {
                 error.credentialMarkedUnhealthy = true;
+                error.kiroCredentialRefresh = true;
+                error.kiroRefreshUuid = this.uuid;
             }
             return true;
         } else {
@@ -2444,6 +2461,8 @@ async saveCredentialsToFile(filePath, newData) {
         // Keep request-local routing state private while passing its pinned
         // transport through retries. Callers may reuse or freeze their options.
         options = { ...options };
+        const attemptStartedAt = performance.now();
+        const requestStartedAt = options.kiroTiming?.startedAt ?? attemptStartedAt;
         const { signal } = options;
         signal?.throwIfAborted();
         if (!this.isInitialized) await waitForKiroOperation(this.initialize(), signal);
@@ -2464,7 +2483,9 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
+        const buildStartedAt = performance.now();
         const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.output_config, body.reasoning_effort, body);
+        const buildMs = performance.now() - buildStartedAt;
         signal?.throwIfAborted();
         const toolNameMaps = requestData._kiroToolNameMaps;
 
@@ -2544,7 +2565,7 @@ async saveCredentialsToFile(filePath, newData) {
             stream = response.data;
             signal?.addEventListener('abort', onAbort, { once: true });
             signal?.throwIfAborted();
-            logger.info(`[Kiro Stream] Upstream headers: ${Math.round(performance.now() - upstreamStartedAt)}ms; queue: ${Math.round(upstreamStartedAt - queuedAt)}ms`);
+            logger.info(`[Kiro Stream] Upstream headers: ${Math.round(performance.now() - upstreamStartedAt)}ms; queue: ${Math.round(upstreamStartedAt - queuedAt)}ms; build: ${Math.round(buildMs)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
             let firstEventLogged = false;
             let buffer = Buffer.alloc(0);
 
@@ -2571,7 +2592,7 @@ async saveCredentialsToFile(filePath, newData) {
                         event.type === 'toolUse'
                     )) {
                         firstEventLogged = true;
-                        logger.info(`[Kiro Stream] First upstream ${event.type} event: ${Math.round(performance.now() - upstreamStartedAt)}ms`);
+                        logger.info(`[Kiro Stream] First upstream ${event.type} event: ${Math.round(performance.now() - upstreamStartedAt)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
                     }
                     if (event.type === 'content' && event.data) {
                         hasYieldedContent = true;
@@ -2666,14 +2687,7 @@ async saveCredentialsToFile(filePath, newData) {
                     suffix: 'triggering auto-refresh'
                 });
                 
-                // 1. 先刷新 UUID
-                const newUuid = this._refreshUuid();
-                if (newUuid) {
-                    logger.info(`[Kiro] UUID refreshed: ${this.uuid} -> ${newUuid}`);
-                    this.uuid = newUuid;
-                }
-                // 标记当前凭证为不健康（会自动进入刷新队列）
-                this._markCredentialNeedRefresh('401 Unauthorized in stream - Triggering auto-refresh');
+                this._handleUnauthorizedCredential(error, '401 Unauthorized in stream - Triggering auto-refresh', options);
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
@@ -2770,6 +2784,8 @@ async saveCredentialsToFile(filePath, newData) {
     // 完全空的响应并抛错，调用方也从未收到过任何数据，可以安全地整体重试。
     async * _generateContentStreamRaw(model, requestBody, options = {}) {
         const streamStartedAt = performance.now();
+        options = { ...options, kiroTiming: options.kiroTiming || { startedAt: streamStartedAt } };
+        const requestStartedAt = options.kiroTiming.startedAt;
         const { signal } = options;
         signal?.throwIfAborted();
         validateKiroGenerationRequest(model, requestBody);
@@ -2786,11 +2802,14 @@ async saveCredentialsToFile(filePath, newData) {
             delete requestBody._requestBaseUrl;
         }
         
-        await waitForKiroOperation(this._prepareAccessTokenForRequest('generateContentStream'), signal);
+        const authStartedAt = performance.now();
+        await waitForKiroOperation(this._prepareAccessTokenForRequest('generateContentStream', options), signal);
         signal?.throwIfAborted();
+        const authFinishedAt = performance.now();
         
         const finalModel = resolveKiroModel(model, this.config);
-        const capabilities = this.config.KIRO_DYNAMIC_MODELS === true ? await this.listModels({ signal }) : null;
+        const capabilities = this.config.KIRO_DYNAMIC_MODELS === true ? await this.listModels(options) : null;
+        const modelsFinishedAt = performance.now();
         const modelInfo = capabilities?.models.find(item => item.name === finalModel || item.name === model);
         const outputLimit = modelInfo?.tokenLimits?.maxOutputTokens;
         if (Number.isFinite(outputLimit) && requestBody.max_tokens > outputLimit) {
@@ -2874,7 +2893,7 @@ async saveCredentialsToFile(filePath, newData) {
             streamState.hasTextOutput = true;
             if (!isWhitespaceOnly(text)) {
                 if (!streamState.hasVisibleText) {
-                    logger.info(`[Kiro Stream] First visible text: ${Math.round(performance.now() - streamStartedAt)}ms; prior thinking: ${streamState.hasThinkingContent}`);
+                    logger.info(`[Kiro Stream] First visible text: ${Math.round(performance.now() - streamStartedAt)}ms; prior thinking: ${streamState.hasThinkingContent}; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
                 }
                 streamState.hasVisibleText = true;
             }
@@ -3003,7 +3022,9 @@ async saveCredentialsToFile(filePath, newData) {
             const ignoredToolUseIds = new Set();
             let ignoredLegacyTool = false;
 
+            const inputCountStartedAt = performance.now();
             const estimatedInputTokens = this.estimateInputTokens(requestBody);
+            logger.info(`[Kiro Timing] Provider preparation: initialize: ${Math.round(authStartedAt - streamStartedAt)}ms; auth: ${Math.round(authFinishedAt - authStartedAt)}ms; models: ${Math.round(modelsFinishedAt - authFinishedAt)}ms; input count: ${Math.round(performance.now() - inputCountStartedAt)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
 
             // 1. 先发送 message_start 事件
             yield {
@@ -3205,33 +3226,33 @@ async saveCredentialsToFile(filePath, newData) {
 
             yield* pushEvents(stopBlock(streamState.textBlockIndex));
 
-            // Count only emitted text/thinking and validated tool arguments,
-            // not legacy wire wrappers or duplicate representations.
-            outputTokens = this.countTextTokens(textForTokenCount.join(''));
-
-            for (const tc of toolCalls) {
-                outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
-            }
-
-            // 计算 input tokens
-            // contextUsagePercentage 是包含输入和输出的总使用量百分比
-            // 总 token = TOTAL_CONTEXT_TOKENS * contextUsagePercentage / 100
-            // input token = 总 token - output token
-            if (contextUsagePercentage !== null && contextUsagePercentage > 0) {
-                const configuredContext = normalizeContextLength(findCustomModelConfigForModel(model, this.config)?.contextLength);
-                const contextTokens = configuredContext || normalizeContextLength(modelInfo?.tokenLimits?.maxInputTokens) || getContextTokensForModel(model, this.config, finalModel);
-                const totalTokens = Math.round(contextTokens * contextUsagePercentage / 100);
-                inputTokens = Math.max(0, totalTokens - outputTokens);
-                logger.info(`[Kiro] Token calculation from contextUsagePercentage: total=${totalTokens}, output=${outputTokens}, input=${inputTokens}`);
-            } else {
-                logger.warn('[Kiro Stream] contextUsagePercentage not received, using estimation');
-                inputTokens = estimatedInputTokens;
-            }
-
             const actualInput = upstreamUsage.inputTokens ?? upstreamUsage.input_tokens;
             const actualOutput = upstreamUsage.outputTokens ?? upstreamUsage.output_tokens;
-            if (Number.isFinite(actualInput) && actualInput >= 0) inputTokens = actualInput;
-            if (Number.isFinite(actualOutput) && actualOutput >= 0) outputTokens = actualOutput;
+            if (Number.isFinite(actualInput) && actualInput >= 0 && Number.isFinite(actualOutput) && actualOutput >= 0) {
+                // All integrity/tool checks have already completed. With both
+                // actual counts present, the local estimate would be discarded.
+                inputTokens = actualInput;
+                outputTokens = actualOutput;
+            } else {
+                // Preserve the fallback arithmetic for partial/invalid usage,
+                // including subtracting LOCAL output from the context total.
+                outputTokens = this.countTextTokens(textForTokenCount.join(''));
+                for (const tc of toolCalls) {
+                    outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
+                }
+                if (contextUsagePercentage !== null && contextUsagePercentage > 0) {
+                    const configuredContext = normalizeContextLength(findCustomModelConfigForModel(model, this.config)?.contextLength);
+                    const contextTokens = configuredContext || normalizeContextLength(modelInfo?.tokenLimits?.maxInputTokens) || getContextTokensForModel(model, this.config, finalModel);
+                    const totalTokens = Math.round(contextTokens * contextUsagePercentage / 100);
+                    inputTokens = Math.max(0, totalTokens - outputTokens);
+                    logger.info(`[Kiro] Token calculation from contextUsagePercentage: total=${totalTokens}, output=${outputTokens}, input=${inputTokens}`);
+                } else {
+                    logger.warn('[Kiro Stream] contextUsagePercentage not received, using estimation');
+                    inputTokens = estimatedInputTokens;
+                }
+                if (Number.isFinite(actualInput) && actualInput >= 0) inputTokens = actualInput;
+                if (Number.isFinite(actualOutput) && actualOutput >= 0) outputTokens = actualOutput;
+            }
 
             // 4. 发送 message_delta 事件
             yield {
@@ -3251,7 +3272,7 @@ async saveCredentialsToFile(filePath, newData) {
             yield { type: "message_stop" };
 
         } catch (error) {
-            if (!signal?.aborted && !error.isEmptyUpstreamResponse) {
+            if (!signal?.aborted && !error.isEmptyUpstreamResponse && !error.isKiroAccountUnavailable) {
                 logger.error('[Kiro] Error in streaming generation:', error?.stack || error?.message || String(error));
             }
             throw error;
@@ -3581,7 +3602,7 @@ async saveCredentialsToFile(filePath, newData) {
         const { signal } = options;
         signal?.throwIfAborted();
         if (!this.isInitialized) await waitForKiroOperation(this.initialize(), signal);
-        await waitForKiroOperation(this._prepareAccessTokenForRequest('listModels'), signal);
+        await waitForKiroOperation(this._prepareAccessTokenForRequest('listModels', options), signal);
         const apiKey = this.accessToken?.startsWith('ksk_') || this.apiKey && this.accessToken === this.apiKey;
         // CLI model-list contracts differ. Require a verified configured endpoint.
         if (apiKey && !this.config.KIRO_MODELS_URL) return fallback;
@@ -3671,27 +3692,52 @@ async saveCredentialsToFile(filePath, newData) {
         }
     }
 
-    async _prepareAccessTokenForRequest(context) {
-        if (this.isTokenExpired()) {
-            logger.info(`[Kiro] Token expired before ${context}, refreshing synchronously...`);
-            await this.initializeAuth(true);
+    async _prepareAccessTokenForRequest(context, options = {}) {
+        if (this.accessToken?.startsWith('ksk_') || this.apiKey && this.accessToken === this.apiKey) return;
+        const pool = getProviderPoolManager();
+        const providerType = this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API;
+        pool?.assertProviderAvailable?.(providerType, this.uuid, {
+            allowNeedsRefresh: true,
+            allowUnhealthy: options.kiroHealthCheck === true,
+            manualRecovery: options.kiroManualRecovery === true
+        });
+        const pendingRefresh = pool?.getPendingKiroCredentialRefresh?.(providerType, this.uuid);
+        if (pendingRefresh || this.isTokenExpired()) {
+            const operation = pendingRefresh || pool?.requestKiroCredentialRefresh?.(providerType, { uuid: this.uuid }, { blocking: true });
+            if (operation && context === 'generateContentStream' && !options.kiroWaitForCredentialRefresh && !options.kiroHealthCheck) {
+                // The outer handler can use another account immediately, or wait
+                // for this shared task when the entire pool is refreshing.
+                pool.assertProviderAvailable(providerType, this.uuid);
+            }
+            logger.info(`[Kiro] Credentials require refresh before ${context}, waiting for credential refresh...`);
+            try {
+                await waitForKiroRefresh(operation || this.initializeAuth(true), {
+                    signal: options.signal, timeoutMs: this.config.KIRO_REFRESH_WAIT_TIMEOUT_MS
+                });
+                if (operation) {
+                    await waitForKiroOperation(this.loadCredentials(), options.signal);
+                    this._assertKiroAccountAvailable(options);
+                }
+            } catch (error) {
+                if (options.signal?.aborted || error.code === 'KIRO_CREDENTIAL_REFRESH_TIMEOUT') throw error;
+                throw kiroRefreshError('Kiro credential refresh failed before request', undefined, error);
+            }
             return;
         }
 
         if (this.isExpiryDateNear()) {
-            logger.info('[Kiro] Token is near expiry, marking credential as need refresh...');
-            this._markCredentialNeedRefresh(`Token near expiry in ${context}`);
+            const operation = pool?.requestKiroCredentialRefresh?.(providerType, { uuid: this.uuid });
+            if (operation === undefined) this.triggerBackgroundRefresh();
         }
     }
 
     /**
-     * Checks if the given expiresAt timestamp is within 10 minutes from now (needs refresh soon).
-     * @returns {boolean} - True if expiresAt is less than 10 minutes from now, false otherwise.
+     * Uses the same configurable refresh window as the pool's scheduled check.
      */
     isExpiryDateNear() {
         try {
             const expirationTime = new Date(this.expiresAt);
-            const nearMinutes = 30;
+            const nearMinutes = getKiroRefreshAheadMs(this.config) / 60000;
             const { message, isNearExpiry } = formatExpiryLog('Kiro', expirationTime.getTime(), nearMinutes);
             logger.info(message);
             return isNearExpiry;
@@ -3705,6 +3751,8 @@ async saveCredentialsToFile(filePath, newData) {
      * 后台异步刷新 token（不阻塞当前请求）
      */
     triggerBackgroundRefresh() {
+        if (this._tokenRefreshPromise || Date.now() - (this._lastBackgroundRefreshAt || 0) < 30000) return;
+        this._lastBackgroundRefreshAt = Date.now();
         logger.info('[Kiro] Background token refresh started...');
         this.initializeAuth(true).then(() => {
             logger.info('[Kiro] Background token refresh completed successfully');

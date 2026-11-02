@@ -1,5 +1,6 @@
 import { acquireProviderSlot, releaseProviderSlot, rejectUnavailableProviderWaiters } from './provider-slot-lease.js';
 import { getKiroAccountUnavailableError, isKiroAccountSuspended, isKiroProviderType, isKiroSuspensionMessage } from './kiro-account-state.js';
+import { getKiroRefreshAheadMs, kiroCredentialFingerprint, kiroRefreshError, waitForKiroRefresh } from './kiro-credential-refresh.js';
 import * as fs from 'fs';
 import { getServiceAdapter, getRegisteredProviders, invalidateServiceAdapter } from './adapter.js';
 import logger from '../utils/logger.js';
@@ -196,7 +197,9 @@ export class ProviderPoolManager {
                             const parsedDate = Date.parse(rawExpiryTime);
                             expiryTime = Number.isNaN(parsedDate) ? Number(rawExpiryTime) : parsedDate;
                         }
-                        const nearExpiryMs = (this.globalConfig?.CRON_NEAR_MINUTES || 10) * 60 * 1000;
+                        const nearExpiryMs = isKiroProviderType(providerType)
+                            ? getKiroRefreshAheadMs({ ...this.globalConfig, ...config })
+                            : (this.globalConfig?.CRON_NEAR_MINUTES || 10) * 60 * 1000;
                         if (!Number.isFinite(expiryTime)) {
                             // 凭据文件缺少 expiry 字段，无法判断是否快过期，作为安全措施强制刷新
                             this._log('warn', `Node ${this._getDisplayName(config)} (${providerType}) has no expiry field. Forcing refresh as safety measure...`);
@@ -265,6 +268,7 @@ export class ProviderPoolManager {
     _enqueueRefresh(providerType, providerStatus, force = false) {
         const uuid = providerStatus.uuid;
         if (getKiroAccountUnavailableError(providerType, providerStatus.config, { allowUnhealthy: true, allowNeedsRefresh: true })) return;
+        if (providerStatus.state._refreshTask) return providerStatus.state._refreshTask.promise;
         
         // 如果节点被禁用，不进行刷新
         if (providerStatus.config.isDisabled) {
@@ -278,12 +282,13 @@ export class ProviderPoolManager {
             return;
         }
 
+        const task = this._createKiroRefreshTask(providerType, providerStatus);
+
         // 判断提供商池内的总可用节点数，小于5个时，不等待缓冲，直接加入刷新队列
         const healthyCount = this.getHealthyCount(providerType);
-        if (healthyCount < 5) {
-            this._log('info', `Provider ${providerType} has only ${healthyCount} healthy nodes. Bypassing buffer and enqueuing refresh for ${this._getDisplayName(providerStatus.config)} immediately.`);
-            this._enqueueRefreshImmediate(providerType, providerStatus, force);
-            return;
+        if (healthyCount < 5 || isKiroProviderType(providerType) && force && providerStatus.config.needsRefresh) {
+            this._log('info', `Bypassing refresh buffer for ${this._getDisplayName(providerStatus.config)} (${providerType}; healthy nodes: ${healthyCount}).`);
+            return this._enqueueRefreshImmediate(providerType, providerStatus, force);
         }
 
         // 初始化缓冲队列
@@ -322,6 +327,132 @@ export class ProviderPoolManager {
                 this._flushRefreshBuffer(providerType);
             }, this.bufferDelay);
         }
+        return task?.promise;
+    }
+
+    _createKiroRefreshTask(providerType, provider) {
+        if (!isKiroProviderType(providerType)) return null;
+        if (provider.state._refreshTask) return provider.state._refreshTask;
+        const task = { started: false };
+        task.promise = new Promise((resolve, reject) => Object.assign(task, { resolve, reject }));
+        // Most callers only schedule background work; waiters still see rejection.
+        task.promise.catch(() => {});
+        provider.state._refreshTask = task;
+        return task;
+    }
+
+    getPendingKiroCredentialRefresh(providerType, uuid) {
+        if (!isKiroProviderType(providerType)) return undefined;
+        const provider = this._findProvider(providerType, uuid);
+        return provider?.config.needsRefresh ? provider.state._refreshTask?.promise : undefined;
+    }
+
+    /** Detect superseded attempts using account state retained across UUID rotation/reload. */
+    captureKiroCredentialAttempt(providerType, uuid, accessToken) {
+        if (!isKiroProviderType(providerType)) return undefined;
+        const state = this._findProvider(providerType, uuid)?.state;
+        if (!state) return undefined;
+        const version = state._kiroCredentialVersion || 0;
+        const fingerprint = kiroCredentialFingerprint(accessToken);
+        // The fresh token may already have been sent while its refresh was
+        // still finishing persistence. A version change alone is not enough.
+        return () => (state._kiroCredentialVersion || 0) > version &&
+            (!state._kiroCredentialFingerprint || state._kiroCredentialFingerprint !== fingerprint);
+    }
+
+    /** Proactive refresh keeps a valid token usable; blocking refresh pauses it. */
+    requestKiroCredentialRefresh(providerType, providerConfig, { blocking = false } = {}) {
+        const provider = this._findProvider(providerType, providerConfig?.uuid);
+        if (!isKiroProviderType(providerType) || !provider) return undefined;
+        if (getKiroAccountUnavailableError(providerType, provider.config, { allowUnhealthy: true, allowNeedsRefresh: true })) return null;
+        if (blocking && !provider.config.needsRefresh) {
+            provider.config.needsRefresh = true;
+            this._recordKiroAccountFailure(providerType, provider);
+            this._debouncedSave(providerType);
+        }
+        if (provider.state._refreshTask) {
+            if (blocking && !provider.state._refreshTask.started) {
+                const buffer = this.refreshBufferQueues[providerType];
+                for (const [uuid, entry] of buffer || []) {
+                    if (entry.providerStatus.state === provider.state) buffer.delete(uuid);
+                }
+                if (buffer?.size === 0) {
+                    clearTimeout(this.refreshBufferTimers[providerType]);
+                    delete this.refreshBufferTimers[providerType];
+                }
+                return this._enqueueRefreshImmediate(providerType, provider, true);
+            }
+            return provider.state._refreshTask.promise;
+        }
+        if (!blocking && Date.now() - (provider.config.lastRefreshTime || 0) < 30000) return null;
+        this._log('info', `${blocking ? 'Required' : 'Proactive'} credential refresh queued for ${this._getDisplayName(provider.config)} (${providerType})`);
+        return this._enqueueRefresh(providerType, provider, true);
+    }
+
+    /** Called only after usable primary/fallback accounts have been exhausted. */
+    async waitForPendingKiroRefreshes(providerType, requestedModel, options = {}) {
+        if (options.waitForRefresh === false) return false;
+        const routes = [[providerType, requestedModel]];
+        if (options.includeFallbacks !== false) {
+            for (const type of this.fallbackChain[providerType] || []) {
+                if (getProtocolPrefix(type) === getProtocolPrefix(providerType) &&
+                    (!requestedModel || !getProviderModels(type).length || getProviderModels(type).includes(requestedModel))) routes.push([type, requestedModel]);
+            }
+            const mapping = this.modelFallbackMapping?.[requestedModel];
+            if (mapping?.targetProviderType && mapping.targetModel) {
+                routes.push([mapping.targetProviderType, mapping.targetModel]);
+                for (const type of this.fallbackChain[mapping.targetProviderType] || []) {
+                    if (getProtocolPrefix(type) === getProtocolPrefix(mapping.targetProviderType) &&
+                        (!getProviderModels(type).length || getProviderModels(type).includes(mapping.targetModel))) routes.push([type, mapping.targetModel]);
+                }
+            }
+        }
+        const excluded = new Set(options.excludeUuids || []);
+        const seen = new Set();
+        const pending = [];
+        let recentFailure;
+        for (const [type, model] of routes) {
+            if (!isKiroProviderType(type)) continue;
+            for (const provider of this.providerStatus[type] || []) {
+                const config = provider.config;
+                const task = provider.state._refreshTask;
+                if (excluded.has(config.uuid)) continue;
+                const supported = getConfiguredSupportedModels(type, config);
+                if (model && (supported.length ? !supported.includes(model) : config.notSupportedModels?.includes(model))) continue;
+                const unavailable = getKiroAccountUnavailableError(type, config, { allowUnhealthy: true, allowNeedsRefresh: true });
+                if (unavailable) {
+                    // A fast failure can finish before selection reaches this
+                    // point. Preserve the refresh outcome instead of reporting
+                    // the earlier "awaiting refresh" error to the client.
+                    if (unavailable.kiroUnavailableReason === 'cooldown' && config.lastErrorMessage?.startsWith('Refresh failed:')) {
+                        recentFailure = provider.state._lastKiroRefreshError;
+                    }
+                    continue;
+                }
+                if (!task || !config.needsRefresh || seen.has(task)) continue;
+                seen.add(task);
+                pending.push(task.promise.then(() => {
+                    const current = provider.state._slotConfig || provider.config;
+                    const error = getKiroAccountUnavailableError(type, current);
+                    if (error) throw error;
+                }));
+            }
+        }
+        if (!pending.length) {
+            if (recentFailure) throw kiroRefreshError('Kiro credential refresh failed; no usable account is available', undefined, recentFailure);
+            return false;
+        }
+        this._log('info', `Waiting for ${pending.length} pending Kiro credential refresh task(s)`);
+        try {
+            await waitForKiroRefresh(Promise.any(pending), {
+                signal: options.signal,
+                timeoutMs: this.globalConfig.KIRO_REFRESH_WAIT_TIMEOUT_MS
+            });
+            return true;
+        } catch (error) {
+            if (options.signal?.aborted || error.code === 'KIRO_CREDENTIAL_REFRESH_TIMEOUT') throw error;
+            throw kiroRefreshError('Kiro credential refresh failed; no usable account is available', undefined, error);
+        }
     }
 
     /**
@@ -356,14 +487,18 @@ export class ProviderPoolManager {
      */
     _enqueueRefreshImmediate(providerType, providerStatus, force = false) {
         const uuid = providerStatus.uuid;
+        const existingTask = providerStatus.state._refreshTask;
+        if (existingTask?.started) return existingTask.promise;
         
         // 再次检查是否已经在刷新中（防止并发问题）
         if (this.refreshingUuids.has(uuid)) {
             this._log('debug', `Node ${this._getDisplayName(providerStatus.config)} is already in refresh queue (immediate check).`);
-            return;
+            return existingTask?.promise;
         }
 
+        const task = this._createKiroRefreshTask(providerType, providerStatus);
         this.refreshingUuids.add(uuid);
+        if (task) task.started = true;
 
         // 初始化提供商队列
         if (!this.refreshQueues[providerType]) {
@@ -380,10 +515,15 @@ export class ProviderPoolManager {
         const runTask = async () => {
             try {
                 await this._refreshNodeToken(providerType, providerStatus, force);
+                task?.resolve();
             } catch (err) {
+                if (task) providerStatus.state._lastKiroRefreshError = err;
+                task?.reject(err);
                 this._log('error', `Failed to process refresh for node ${this._getDisplayName(providerStatus.config)}: ${err.message}`);
             } finally {
                 this.refreshingUuids.delete(uuid);
+                if (task) this.refreshingUuids.delete((providerStatus.state._slotConfig || providerStatus.config).uuid);
+                if (task && providerStatus.state._refreshTask === task) delete providerStatus.state._refreshTask;
 
                 // 再次获取当前队列引用
                 const currentQueue = this.refreshQueues[providerType];
@@ -475,6 +615,7 @@ export class ProviderPoolManager {
                 tryStartProviderQueue();
             });
         }
+        return task?.promise;
     }
 
     /**
@@ -482,7 +623,9 @@ export class ProviderPoolManager {
      * @private
      */
     async _refreshNodeToken(providerType, providerStatus, force = false) {
-        const config = providerStatus.config;
+        const currentConfig = () => isKiroProviderType(providerType)
+            ? providerStatus.state._slotConfig || providerStatus.config : providerStatus.config;
+        let config = currentConfig();
         if (getKiroAccountUnavailableError(providerType, config, { allowUnhealthy: true, allowNeedsRefresh: true })) return;
         
         // 检查刷新次数是否已达上限（最大5次）
@@ -515,18 +658,20 @@ export class ProviderPoolManager {
             // 调用适配器的 refreshToken 方法（内部封装了具体的刷新逻辑）
             if (typeof serviceAdapter.refreshToken === 'function') {
                 const startTime = Date.now();
+                const refreshArgs = isKiroProviderType(providerType) ? [{ managedByPool: true }] : [];
                 let refreshOperation;
                 if (force) {
                     if (typeof serviceAdapter.forceRefreshToken === 'function') {
-                        refreshOperation = serviceAdapter.forceRefreshToken();
+                        refreshOperation = serviceAdapter.forceRefreshToken(...refreshArgs);
                     } else {
                         this._log('warn', `forceRefreshToken not implemented for ${providerType}, falling back to refreshToken`);
-                        refreshOperation = serviceAdapter.refreshToken();
+                        refreshOperation = serviceAdapter.refreshToken(...refreshArgs);
                     }
                 } else {
-                    refreshOperation = serviceAdapter.refreshToken();
+                    refreshOperation = serviceAdapter.refreshToken(...refreshArgs);
                 }
                 const refreshResult = await this._awaitRefreshWithTimeout(refreshOperation, providerType, this._getDisplayName(config));
+                config = currentConfig();
                 // An older refresh must not undo a pause reported while it ran.
                 if (getKiroAccountUnavailableError(providerType, config, { allowUnhealthy: true, allowNeedsRefresh: true })) return;
 
@@ -537,6 +682,10 @@ export class ProviderPoolManager {
                 if (refreshResult === true) {
                     this._log('info', `Token refresh successful for node ${this._getDisplayName(config)} (Duration: ${duration}ms)`);
                     config.lastRefreshTime = Date.now(); // 记录最后实际刷新成功时间
+                    if (isKiroProviderType(providerType)) {
+                        providerStatus.state._kiroCredentialVersion = (providerStatus.state._kiroCredentialVersion || 0) + 1;
+                        providerStatus.state._kiroCredentialFingerprint = kiroCredentialFingerprint(serviceAdapter.kiroApiService?.accessToken);
+                    }
                 } else {
                     this._log('info', `Token refresh no-op for node ${this._getDisplayName(config)} (Already valid)`);
                 }
@@ -545,6 +694,7 @@ export class ProviderPoolManager {
                 config.needsRefresh = false;
                 config.refreshCount = 0;
                 config.errorCount = 0; // 成功/无操作也重置错误计数
+                if (isKiroProviderType(providerType)) this.resetProviderRefreshStatus(providerType, config.uuid);
                 
                 this._debouncedSave(providerType);
             } else {
@@ -552,19 +702,30 @@ export class ProviderPoolManager {
             }
 
         } catch (error) {
+            config = currentConfig();
+            if (isKiroProviderType(providerType) && getKiroAccountUnavailableError(providerType, config, { allowUnhealthy: true, allowNeedsRefresh: true })) throw error;
             this._log('error', `Token refresh failed for node ${this._getDisplayName(config)}: ${error.message}`);
             
             // 记录错误信息
             config.lastErrorTime = new Date().toISOString();
             config.lastErrorMessage = `Refresh failed: ${error.message}`;
             this._recordKiroAccountFailure(providerType, providerStatus, config.lastErrorMessage);
+            if (getKiroAccountUnavailableError(providerType, config, { allowUnhealthy: true, allowNeedsRefresh: true })) throw error;
             
             // 增加错误计数（用于普通的健康检查参考，虽然刷新错误主要参考 refreshCount）
             config.errorCount = (config.errorCount || 0) + 1;
 
             // 只有当刷新重试次数达到上限（5次）时，才标记为不健康
             // 注意：refreshCount 在进入本方法后的 try 块前已经自增（L466）
-            if (config.refreshCount >= 5) {
+            if (isKiroProviderType(providerType) && config.needsRefresh) {
+                // A proven invalid credential must not re-enter the pool on a
+                // transient refresh failure. Retry after a short recovery pause.
+                this.markProviderUnhealthyWithRecoveryTime(providerType, config, config.lastErrorMessage, new Date(Date.now() + 30000));
+            } else if (isKiroProviderType(providerType)) {
+                // Proactive rotation failures do not invalidate the current token.
+                config.lastRefreshTime = Date.now();
+                this._debouncedSave(providerType);
+            } else if (config.refreshCount >= 5) {
                 this.markProviderUnhealthyImmediately(providerType, config, `Refresh failed after maximum attempts (5): ${error.message}`);
             } else {
                 // 关键修复：重置 needsRefresh 为 false，允许该节点回到池中
@@ -1134,6 +1295,12 @@ export class ProviderPoolManager {
             return null;
         }
 
+        if (isKiroProviderType(providerType) && options.preferOtherUuids?.length) {
+            const previous = new Set(options.preferOtherUuids);
+            const alternatives = availableAndHealthyProviders.filter(provider => !previous.has(provider.config.uuid));
+            if (alternatives.length) availableAndHealthyProviders = alternatives;
+        }
+
         // 改进：使用统一的评分策略进行选择
         // 传入当前时间戳 now 确保一致性
         const selected = availableAndHealthyProviders.sort((a, b) => {
@@ -1271,6 +1438,9 @@ export class ProviderPoolManager {
             }
         }
 
+        if (!options._kiroRefreshWaited && await this.waitForPendingKiroRefreshes(providerType, requestedModel, options)) {
+            return this.acquireSlotWithFallback(providerType, requestedModel, { ...options, _kiroRefreshWaited: true });
+        }
         return null;
     }
 
@@ -1427,6 +1597,9 @@ export class ProviderPoolManager {
             }
         }
 
+        if (!options._kiroRefreshWaited && await this.waitForPendingKiroRefreshes(providerType, requestedModel, options)) {
+            return this.selectProviderWithFallback(providerType, requestedModel, { ...options, _kiroRefreshWaited: true });
+        }
         this._log('warn', `None available provider found for ${providerType} (Model: ${requestedModel}) after checking fallback chain and model mapping.`);
         return null;
     }
@@ -1706,6 +1879,10 @@ export class ProviderPoolManager {
      * @param {object} providerConfig - 提供商配置（包含 uuid）
      */
     markProviderNeedRefresh(providerType, providerConfig) {
+
+        if (isKiroProviderType(providerType)) {
+            return this.requestKiroCredentialRefresh(providerType, providerConfig, { blocking: true });
+        }
 
         if (!providerConfig?.uuid) {
             this._log('error', 'Invalid providerConfig in markProviderNeedRefresh');
@@ -2184,6 +2361,7 @@ export class ProviderPoolManager {
             // 更新 provider 的 UUID
             provider.uuid = newUuid;
             provider.config.uuid = newUuid;
+            if (isKiroProviderType(providerType) && this.refreshingUuids.delete(oldUuid)) this.refreshingUuids.add(newUuid);
             invalidateServiceAdapter(providerType, oldUuid);
             invalidateServiceAdapter(providerType, newUuid);
             

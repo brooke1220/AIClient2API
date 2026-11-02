@@ -19,27 +19,34 @@ export function getKiroAccountUnavailableError(providerType, config, options = {
     const { allowUnhealthy = false, allowNeedsRefresh = false, manualRecovery = false, now = Date.now() } = options;
     const recoveryAt = new Date(config.scheduledRecoveryTime || 0).getTime();
     let reason;
+    let reasonCode;
     let status = 429;
     if (config.isDisabled === true) {
         reason = 'disabled';
+        reasonCode = 'disabled';
         status = 403;
     } else if (!manualRecovery && isKiroAccountSuspended(config)) {
         reason = 'suspended; manual recovery is required';
+        reasonCode = 'suspended';
         status = 403;
     } else if (!allowNeedsRefresh && config.needsRefresh === true) {
         reason = 'awaiting credential refresh';
+        reasonCode = 'refresh';
     } else if (!manualRecovery && recoveryAt > now) {
         reason = 'cooling down until the scheduled recovery time';
+        reasonCode = 'cooldown';
     } else if (!allowUnhealthy && config.isHealthy === false) {
         reason = 'unhealthy';
+        reasonCode = 'unhealthy';
     }
     if (!reason) return null;
     const error = new Error(`Kiro account is unavailable: ${reason}`);
     error.code = 'KIRO_ACCOUNT_UNAVAILABLE';
     error.status = status;
     error.isKiroAccountUnavailable = true;
+    error.kiroUnavailableReason = reasonCode;
     error.skipErrorCount = true;
-    error.shouldSwitchCredential = false;
+    error.shouldSwitchCredential = error.kiroUnavailableReason === 'refresh';
     if (recoveryAt > now) error.retryAfterMs = recoveryAt - now;
     return error;
 }

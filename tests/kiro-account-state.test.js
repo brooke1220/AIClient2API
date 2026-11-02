@@ -54,7 +54,7 @@ describe('Kiro account availability uses authoritative pool state', () => {
         const { node } = createPool(state);
         // Startup intentionally clears stale refresh flags; exercise a live pause.
         if (state.needsRefresh) node.config.needsRefresh = true;
-        await expect(acquireProviderSlot(node)).rejects.toMatchObject({ code: 'KIRO_ACCOUNT_UNAVAILABLE', skipErrorCount: true, shouldSwitchCredential: false });
+        await expect(acquireProviderSlot(node)).rejects.toMatchObject({ code: 'KIRO_ACCOUNT_UNAVAILABLE', skipErrorCount: true, shouldSwitchCredential: state.needsRefresh === true });
         expect(node.state.activeCount).toBe(0);
     });
 

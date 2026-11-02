@@ -39,6 +39,9 @@ describe('Kiro Sidecar configuration persistence', () => {
         originalConfig = { ...CONFIG };
         tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kiro-sidecar-config-'));
         await fs.mkdir(path.join(tempDir, 'configs'));
+        const readFile = fs.readFile;
+        jest.spyOn(fs, 'readFile').mockImplementation((filePath, ...args) =>
+            readFile(filePath === 'configs/config.json' ? path.join(tempDir, filePath) : filePath, ...args));
         const atomicWriteFile = fileOperations.atomicWriteFile;
         // Keep real atomic file writes and locking, but isolate the production config path.
         jest.spyOn(fileOperations, 'atomicWriteFile').mockImplementation((filePath, data, options) =>

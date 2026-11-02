@@ -514,10 +514,12 @@ describe('SSE cancellation reaches the Kiro transport', () => {
         }));
         expect(serviceManager.getApiServiceWithFallback).toHaveBeenCalledTimes(1);
         expect(response.flushHeaders).toHaveBeenCalledTimes(1);
-        expect(response.write.mock.calls.filter(([text]) => text === 'event: message_start\n')).toHaveLength(1);
+        expect(response.write.mock.calls.filter(([text]) => text.startsWith('event: message_start\n'))).toHaveLength(1);
         expect(response.write.mock.calls.some(([text]) => text.includes('retried answer'))).toBe(true);
         expect(signals).toHaveLength(2);
         expect(firstRaw.mock.calls[0][2].signal).toBe(secondRaw.mock.calls[0][2].signal);
+        expect(firstRaw.mock.calls[0][2].kiroTiming).toBe(secondRaw.mock.calls[0][2].kiroTiming);
+        expect(logger.info.mock.calls.filter(([message]) => message.includes('First downstream event accepted:'))).toHaveLength(1);
         expect(signals.every(signal => signal.aborted)).toBe(true);
         expect(signals[0].aborted).toBe(true);
     });

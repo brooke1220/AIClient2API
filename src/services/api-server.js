@@ -12,6 +12,7 @@ import { getKiroSidecar, getKiroSidecarTargetOrigins } from '../utils/kiro-sidec
 import { HEALTH_CHECK } from '../utils/constants.js';
 import { initializeAdminPassword } from '../ui-modules/auth.js';
 import { disposeServiceAdapters } from '../providers/adapter.js';
+import { warmupTokenizer, disposeTokenizer } from '../utils/token-utils.js';
 
 /**
  * @license
@@ -226,6 +227,7 @@ async function gracefulShutdown() {
     } catch { /* ignore */ }
 
     await serverClosed;
+    disposeTokenizer();
     logger.info('[Server] HTTP server closed');
     process.exit(0);
 }
@@ -276,6 +278,8 @@ async function startServer() {
 
     // Ensure every installation starts with a unique admin password.
     await initializeAdminPassword();
+    // Pay vocabulary initialization once, before accepting generation requests.
+    warmupTokenizer();
     
     // 自动关联 configs 目录中的配置文件到对应的提供商
     // logger.info('[Initialization] Checking for unlinked provider configs...');

@@ -18,6 +18,47 @@ function parseBooleanConfig(value) {
     return Boolean(value);
 }
 
+function parseKiroSettings(config) {
+    const settings = {};
+    if (config.KIRO_DYNAMIC_MODELS !== undefined) {
+        const value = config.KIRO_DYNAMIC_MODELS;
+        if (typeof value !== 'boolean' && !(typeof value === 'string' && /^(true|false)$/i.test(value))) {
+            throw new Error('KIRO_DYNAMIC_MODELS must be a boolean');
+        }
+        settings.KIRO_DYNAMIC_MODELS = parseBooleanConfig(value);
+    }
+    for (const [field, allowZero, integer, max] of [
+        ['KIRO_MODEL_CACHE_TTL_MS', true, true, Number.MAX_SAFE_INTEGER],
+        ['KIRO_REFRESH_AHEAD_MINUTES', false, false, Number.MAX_SAFE_INTEGER / 60000],
+        ['KIRO_REFRESH_JITTER_MS', true, true, Number.MAX_SAFE_INTEGER],
+        ['KIRO_REFRESH_WAIT_TIMEOUT_MS', false, true, 2147483647]
+    ]) {
+        if (config[field] === undefined) continue;
+        const raw = config[field];
+        const value = Number(raw);
+        if (!['number', 'string'].includes(typeof raw) || String(raw).trim() === '' ||
+            !Number.isFinite(value) || (allowZero ? value < 0 : value <= 0) ||
+            (integer && !Number.isInteger(value)) || value > max) {
+            throw new Error(`${field} must be a ${allowZero ? 'non-negative' : 'positive'} ${integer ? 'integer' : 'number'} no greater than ${max}`);
+        }
+        settings[field] = value;
+    }
+    return settings;
+}
+
+async function readPersistedConfig(configPath) {
+    try {
+        const config = JSON.parse(await fs.readFile(configPath, 'utf8'));
+        if (!config || typeof config !== 'object' || Array.isArray(config)) {
+            throw new Error('Configuration file must contain a JSON object');
+        }
+        return config;
+    } catch (error) {
+        if (error.code === 'ENOENT') return {};
+        throw error;
+    }
+}
+
 /**
  * 重载配置文件
  */
@@ -89,6 +130,11 @@ export async function handleGetConfig(req, res, currentConfig) {
         RATE_LIMIT_COOLDOWN_MAX_MS: currentConfig.RATE_LIMIT_COOLDOWN_MAX_MS,
         CRON_NEAR_MINUTES: currentConfig.CRON_NEAR_MINUTES,
         CRON_REFRESH_TOKEN: currentConfig.CRON_REFRESH_TOKEN,
+        KIRO_DYNAMIC_MODELS: currentConfig.KIRO_DYNAMIC_MODELS === true,
+        KIRO_MODEL_CACHE_TTL_MS: currentConfig.KIRO_MODEL_CACHE_TTL_MS ?? 300000,
+        KIRO_REFRESH_AHEAD_MINUTES: currentConfig.KIRO_REFRESH_AHEAD_MINUTES ?? 10,
+        KIRO_REFRESH_JITTER_MS: currentConfig.KIRO_REFRESH_JITTER_MS ?? 30000,
+        KIRO_REFRESH_WAIT_TIMEOUT_MS: currentConfig.KIRO_REFRESH_WAIT_TIMEOUT_MS ?? 15000,
         LOGIN_EXPIRY: currentConfig.LOGIN_EXPIRY,
         TRUST_PROXY: currentConfig.TRUST_PROXY,
         TRUSTED_PROXY_IPS: currentConfig.TRUSTED_PROXY_IPS,
@@ -144,8 +190,20 @@ export async function handleUpdateConfig(req, res, currentConfig) {
 async function _handleUpdateConfig(req, res, currentConfig, body) {
     try {
         const newConfig = body;
+        let kiroSettings;
+        try {
+            kiroSettings = parseKiroSettings(newConfig);
+        } catch (error) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: error.message } }));
+            return true;
+        }
+        // Read under the existing file lock, before changing memory or other files.
+        // A broken or unreadable config must never be replaced with a partial one.
+        const persistedConfig = await readPersistedConfig('configs/config.json');
 
         // Update config values in memory（含类型校验）
+        Object.assign(currentConfig, kiroSettings);
         if (newConfig.REQUIRED_API_KEY !== undefined) {
             if (typeof newConfig.REQUIRED_API_KEY === 'string') {
                 // 如果是脱敏后的字符串，则忽略更新，保留原值
@@ -367,6 +425,7 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
                 PROMPT_LOG_MODE: currentConfig.PROMPT_LOG_MODE,
                 REQUEST_MAX_RETRIES: currentConfig.REQUEST_MAX_RETRIES,
                 REQUEST_BASE_DELAY: currentConfig.REQUEST_BASE_DELAY,
+                MODEL_FALLBACK_ENABLED: currentConfig.MODEL_FALLBACK_ENABLED,
                 CREDENTIAL_SWITCH_MAX_RETRIES: currentConfig.CREDENTIAL_SWITCH_MAX_RETRIES,
                 RATE_LIMIT_COOLDOWN_ENABLED: currentConfig.RATE_LIMIT_COOLDOWN_ENABLED,
                 RATE_LIMIT_COOLDOWN_MS: currentConfig.RATE_LIMIT_COOLDOWN_MS,
@@ -374,6 +433,11 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
                 RATE_LIMIT_COOLDOWN_MAX_MS: currentConfig.RATE_LIMIT_COOLDOWN_MAX_MS,
                 CRON_NEAR_MINUTES: currentConfig.CRON_NEAR_MINUTES,
                 CRON_REFRESH_TOKEN: currentConfig.CRON_REFRESH_TOKEN,
+                KIRO_DYNAMIC_MODELS: currentConfig.KIRO_DYNAMIC_MODELS,
+                KIRO_MODEL_CACHE_TTL_MS: currentConfig.KIRO_MODEL_CACHE_TTL_MS,
+                KIRO_REFRESH_AHEAD_MINUTES: currentConfig.KIRO_REFRESH_AHEAD_MINUTES,
+                KIRO_REFRESH_JITTER_MS: currentConfig.KIRO_REFRESH_JITTER_MS,
+                KIRO_REFRESH_WAIT_TIMEOUT_MS: currentConfig.KIRO_REFRESH_WAIT_TIMEOUT_MS,
                 LOGIN_EXPIRY: currentConfig.LOGIN_EXPIRY,
                 TRUST_PROXY: currentConfig.TRUST_PROXY,
                 TRUSTED_PROXY_IPS: currentConfig.TRUSTED_PROXY_IPS,
@@ -404,7 +468,15 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
                 SCHEDULED_HEALTH_CHECK: currentConfig.SCHEDULED_HEALTH_CHECK
             };
 
-            await atomicWriteFile(configPath, JSON.stringify(configToSave, null, 2), { encoding: 'utf-8', mode: 0o600 });
+            // Preserve file-only settings without copying runtime state or arbitrary
+            // request fields. Omitted managed fields retain their latest disk value.
+            const mergedConfig = { ...persistedConfig };
+            for (const [key, value] of Object.entries(configToSave)) {
+                if (value !== undefined && (Object.hasOwn(newConfig, key) || !Object.hasOwn(mergedConfig, key))) {
+                    mergedConfig[key] = value;
+                }
+            }
+            await atomicWriteFile(configPath, JSON.stringify(mergedConfig, null, 2), { encoding: 'utf-8', mode: 0o600 });
             logger.info('[UI API] Configuration saved to configs/config.json');
             
             // 广播更新事件

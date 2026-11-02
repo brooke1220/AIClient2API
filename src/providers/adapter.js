@@ -395,24 +395,24 @@ export class KiroApiServiceAdapter extends ApiServiceAdapter {
         return this.kiroApiService.listModels();
     }
 
-    async refreshToken() {
+    async refreshToken(options) {
         if (!this.kiroApiService.isInitialized) {
             await this.kiroApiService.initialize();
         }
         if(this.isExpiryDateNear()===true){
             logger.info(`[Kiro] Expiry date is near, refreshing token...`);
-            await this.kiroApiService.initializeAuth(true);
+            await this.kiroApiService.initializeAuth(true, options);
             return true;
         }
         return false;
     }
 
-    async forceRefreshToken() {
+    async forceRefreshToken(options) {
         if (!this.kiroApiService.isInitialized) {
             await this.kiroApiService.initialize();
         }
         logger.info(`[Kiro] Force refreshing token...`);
-        await this.kiroApiService.initializeAuth(true);
+        await this.kiroApiService.initializeAuth(true, options);
         return true;
     }
 

@@ -93,6 +93,67 @@ describe('AWS wire integrity and truthful termination', () => {
     });
 });
 
+describe('upstream usage avoids only redundant local output counts', () => {
+    test.each([
+        [{ inputTokens: 31, outputTokens: 9 }, 31, 9],
+        [{ input_tokens: 31, output_tokens: 9 }, 31, 9],
+        [{ inputTokens: 0, outputTokens: 0 }, 0, 0],
+        [{ input_tokens: 0, output_tokens: 0 }, 0, 0],
+        [{ inputTokens: null, input_tokens: 31, output_tokens: 9 }, 31, 9],
+        [{ inputTokens: 0, input_tokens: 31, outputTokens: 0, output_tokens: 9 }, 0, 0]
+    ])('complete valid usage %p preserves content/tools and skips discarded counts', async (usage, input, output) => {
+        const backend = service([text('answer'), tool({ name: 'read', toolUseId: 'a', input: { path: '中文' }, stop: true }),
+            frame('metadataEvent', { stopReason: 'end_turn', usage })]);
+        const counter = jest.spyOn(backend, 'countTextTokens');
+        const events = await collect(backend.generateContentStream(model, request()));
+        expect(counter).not.toHaveBeenCalled();
+        expect(events.filter(e => e.delta?.text).map(e => e.delta.text).join('')).toBe('answer');
+        expect(events.filter(e => e.delta?.partial_json).map(e => e.delta.partial_json).join('')).toBe('{"path":"中文"}');
+        expect(events.find(e => e.type === 'message_delta')).toMatchObject({
+            delta: { stop_reason: 'tool_use' }, usage: { input_tokens: input, output_tokens: output }
+        });
+        expect(events.at(-1)).toEqual({ type: 'message_stop' });
+    });
+
+    test.each([
+        [{ inputTokens: 31 }, 31, 6], [{ outputTokens: 9 }, 12, 9],
+        [{ inputTokens: -1, outputTokens: 9 }, 12, 9], [{ inputTokens: '31', outputTokens: 9 }, 12, 9],
+        [{ inputTokens: 31, outputTokens: -1 }, 31, 6], [{ inputTokens: 31, outputTokens: '9' }, 31, 6],
+        [{ inputTokens: 'bad', input_tokens: 31, outputTokens: 9 }, 12, 9], [{}, 12, 6]
+    ])('partial or invalid usage %p keeps the original fallback and precedence', async (usage, input, output) => {
+        const backend = service([text('answer'), frame('metadataEvent', { usage })]);
+        const counter = jest.spyOn(backend, 'countTextTokens');
+        const events = await collect(backend.generateContentStream(model, request()));
+        expect(counter).toHaveBeenCalledWith('answer');
+        expect(events.find(e => e.type === 'message_delta').usage).toMatchObject({ input_tokens: input, output_tokens: output });
+    });
+
+    test('output-only actual usage still subtracts local output from the context total', async () => {
+        const frames = [text('answer'), frame('contextUsageEvent', { contextUsagePercentage: 1 })];
+        const baseline = await collect(service(frames).generateContentStream(model, request()));
+        const changed = await collect(service([...frames, frame('metadataEvent', { usage: { outputTokens: 99 } })]).generateContentStream(model, request()));
+        expect(changed.find(e => e.type === 'message_delta').usage).toMatchObject({
+            input_tokens: baseline.find(e => e.type === 'message_delta').usage.input_tokens, output_tokens: 99
+        });
+    });
+
+    test('fallback still counts each validated tool independently', async () => {
+        const backend = service([text('answer'), tool({ name: 'a', toolUseId: 'a', input: { x: 1 }, stop: true }),
+            tool({ name: 'b', toolUseId: 'b', input: { y: 2 }, stop: true })]);
+        const counter = jest.spyOn(backend, 'countTextTokens');
+        const events = await collect(backend.generateContentStream(model, request()));
+        expect(counter.mock.calls).toEqual([['answer'], ['{"x":1}'], ['{"y":2}']]);
+        expect(events.find(e => e.type === 'message_delta').usage.output_tokens).toBe(20);
+    });
+
+    test.each(['malformed tool', 'truncated frame'])('complete usage cannot bypass %s validation', async kind => {
+        const invalid = kind === 'malformed tool' ? tool({ name: 'write', toolUseId: 'a', input: '{"cut":', stop: true })
+            : text('cut').subarray(0, -3);
+        const backend = service([text('answer'), frame('metadataEvent', { usage: { inputTokens: 31, outputTokens: 9 } }), invalid]);
+        await expect(collect(backend.generateContentStream(model, request()))).rejects.toThrow(kind === 'malformed tool' ? /tool argument/ : /truncated/);
+    });
+});
+
 describe('tool isolation and validation before completion', () => {
     test('interleaved A/B arguments retain their IDs and emit non-overlapping Claude blocks', async () => {
         const backend = service([

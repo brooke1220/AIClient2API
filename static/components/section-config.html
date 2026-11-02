@@ -258,6 +258,44 @@
                 <small class="form-text" data-i18n="config.proxy.kiroSidecarNote">Kiro 生成请求通过 Rust Sidecar 转发；同时开启 TLS Sidecar 并选中 Kiro 时，使用 Rust → Go uTLS 串联出站。上游代理仍按 Kiro Sidecar 配置解析（需重启服务）。</small>
             </div>
 
+            <!-- Kiro 模型与凭证 -->
+            <div class="config-group-section">
+                <h3><i class="fas fa-key"></i> <span data-i18n="config.kiroSettings.title">Kiro 模型与凭证</span></h3>
+                <div class="config-row">
+                    <div class="form-group">
+                        <label for="kiroDynamicModels" data-i18n="config.kiroSettings.dynamicModels">动态获取可用模型</label>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="kiroDynamicModels" aria-describedby="kiroDynamicModelsNote">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <small id="kiroDynamicModelsNote" class="form-text" data-i18n="config.kiroSettings.dynamicModelsNote">按账号获取上游可用模型及能力信息；关闭时使用内置模型列表。API Key 模式需先在配置文件中设置模型查询地址 KIRO_MODELS_URL。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="kiroModelCacheTtlMs" data-i18n="config.kiroSettings.modelCacheTtl">模型信息缓存时间（毫秒）</label>
+                        <input type="number" id="kiroModelCacheTtlMs" class="form-control" min="0" max="9007199254740991" step="1" value="300000" required aria-describedby="kiroModelCacheTtlNote">
+                        <small id="kiroModelCacheTtlNote" class="form-text" data-i18n="config.kiroSettings.modelCacheTtlNote">默认 300000 毫秒（5 分钟）；0 关闭缓存。</small>
+                    </div>
+                </div>
+                <div class="config-row">
+                    <div class="form-group">
+                        <label for="kiroRefreshAheadMinutes" data-i18n="config.kiroSettings.refreshAhead">凭证提前刷新时间（分钟）</label>
+                        <input type="number" id="kiroRefreshAheadMinutes" class="form-control" min="0" step="any" value="10" required aria-describedby="kiroRefreshAheadNote">
+                        <small id="kiroRefreshAheadNote" class="form-text" data-i18n="config.kiroSettings.refreshAheadNote">必须大于 0，支持小数；有效凭证提前续期期间仍可处理请求。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="kiroRefreshJitterMs" data-i18n="config.kiroSettings.refreshJitter">刷新时间错开范围（毫秒）</label>
+                        <input type="number" id="kiroRefreshJitterMs" class="form-control" min="0" max="9007199254740991" step="1" value="30000" required aria-describedby="kiroRefreshJitterNote">
+                        <small id="kiroRefreshJitterNote" class="form-text" data-i18n="config.kiroSettings.refreshJitterNote">在提前刷新时间上，按账号额外增加 0 到此值的提前量，避免集中刷新；0 关闭。</small>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="kiroRefreshWaitTimeoutMs" data-i18n="config.kiroSettings.refreshWaitTimeout">等待凭证刷新上限（毫秒）</label>
+                    <input type="number" id="kiroRefreshWaitTimeoutMs" class="form-control" min="1" max="2147483647" step="1" value="15000" required aria-describedby="kiroRefreshWaitTimeoutNote">
+                    <small id="kiroRefreshWaitTimeoutNote" class="form-text" data-i18n="config.kiroSettings.refreshWaitTimeoutNote">没有可用账号时，等待正在进行的凭证刷新；默认 15000 毫秒（15 秒）。</small>
+                </div>
+                <small class="form-text" data-i18n="config.kiroSettings.scopeNote">保存后自动重载并生效；节点单独设置的同名配置优先。</small>
+            </div>
+
             <!-- 服务治理与高可用 -->
             <div class="config-group-section">
                 <h3><i class="fas fa-shield-alt"></i> <span data-i18n="config.governance.title">服务治理</span></h3>

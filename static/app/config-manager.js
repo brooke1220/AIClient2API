@@ -9,6 +9,13 @@ import { loadSectionIfActive } from './navigation.js';
 let currentProviderConfigs = null;
 let isCurrentPasswordDefault = false;
 
+const kiroNumberFields = [
+    { key: 'KIRO_MODEL_CACHE_TTL_MS', id: 'kiroModelCacheTtlMs', label: 'modelCacheTtl', defaultValue: 300000, allowZero: true, integer: true, max: Number.MAX_SAFE_INTEGER },
+    { key: 'KIRO_REFRESH_AHEAD_MINUTES', id: 'kiroRefreshAheadMinutes', label: 'refreshAhead', defaultValue: 10, allowZero: false, integer: false, max: Number.MAX_SAFE_INTEGER / 60000 },
+    { key: 'KIRO_REFRESH_JITTER_MS', id: 'kiroRefreshJitterMs', label: 'refreshJitter', defaultValue: 30000, allowZero: true, integer: true, max: Number.MAX_SAFE_INTEGER },
+    { key: 'KIRO_REFRESH_WAIT_TIMEOUT_MS', id: 'kiroRefreshWaitTimeoutMs', label: 'refreshWaitTimeout', defaultValue: 15000, allowZero: false, integer: true, max: 2147483647 }
+];
+
 function getSelectedModelProviders() {
     const modelProviderEl = document.getElementById('modelProvider');
     if (!modelProviderEl) {
@@ -414,6 +421,13 @@ async function loadConfiguration() {
 
         const data = await window.apiClient.get('/config');
 
+        const kiroDynamicModelsEl = document.getElementById('kiroDynamicModels');
+        if (kiroDynamicModelsEl) kiroDynamicModelsEl.checked = data.KIRO_DYNAMIC_MODELS === true;
+        for (const { key, id, defaultValue } of kiroNumberFields) {
+            const input = document.getElementById(id);
+            if (input) input.value = data[key] ?? defaultValue;
+        }
+
         // 初始化替换规则 UI
         initReplacementsUI();
         const replacementsContainer = document.getElementById('systemPromptReplacementsContainer');
@@ -685,6 +699,21 @@ async function saveConfiguration(options = {}) {
         MODEL_PROVIDER: selectedProviders.length > 0 ? selectedProviders.join(',') : 'gemini-cli-oauth',
         systemPrompt: document.getElementById('systemPrompt')?.value || '',
     };
+
+    const kiroDynamicModelsEl = document.getElementById('kiroDynamicModels');
+    if (kiroDynamicModelsEl) config.KIRO_DYNAMIC_MODELS = kiroDynamicModelsEl.checked;
+    for (const { key, id, label, allowZero, integer, max } of kiroNumberFields) {
+        const input = document.getElementById(id);
+        if (!input) continue;
+        const value = Number(input.value);
+        if (String(input.value).trim() === '' || !Number.isFinite(value) ||
+            (allowZero ? value < 0 : value <= 0) || (integer && !Number.isInteger(value)) || value > max) {
+            showToast(t('common.error'), t('config.kiroSettings.invalidNumber', { field: t(`config.kiroSettings.${label}`) }), 'error');
+            input.focus();
+            return;
+        }
+        config[key] = value;
+    }
 
     // 获取后台登录密码（如果有输入）
     const adminPassword = document.getElementById('adminPassword')?.value || '';

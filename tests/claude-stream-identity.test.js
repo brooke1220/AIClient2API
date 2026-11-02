@@ -263,10 +263,9 @@ describe('real streaming handler preserves message boundaries and clears state',
 
     test.each(['openai', 'openaiResponses'])('SSE %s keeps split words in their original message', async protocol => {
         const response = await runHandler(adjacentText, protocol);
-        const payloads = response.write.mock.calls.flatMap(([value]) => {
-            if (!value.startsWith('data: ') || value.includes('[DONE]')) return [];
-            return [JSON.parse(value.slice(6))];
-        });
+        const payloads = response.write.mock.calls.map(([value]) => value).join('').split('\n')
+            .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
+            .map(line => JSON.parse(line.slice(6)));
         if (protocol === 'openai') {
             expect(new Set(payloads.map(event => event.id)).size).toBe(1);
             expect(payloads.map(event => event.choices[0].delta.content || '').join('')).toBe(joinedText);
@@ -294,10 +293,9 @@ describe('real streaming handler preserves message boundaries and clears state',
         const adapter = Object.create(KiroApiServiceAdapter.prototype);
         adapter.kiroApiService = service;
         const response = await runHandler([], protocol, mockResponse(), adapter);
-        const payloads = response.write.mock.calls.flatMap(([value]) => {
-            if (!value.startsWith('data: ') || value.includes('[DONE]')) return [];
-            return [JSON.parse(value.slice(6))];
-        });
+        const payloads = response.write.mock.calls.map(([value]) => value).join('').split('\n')
+            .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
+            .map(line => JSON.parse(line.slice(6)));
         if (protocol === 'openai') {
             expect(new Set(payloads.map(event => event.id)).size).toBe(1);
             expect(payloads.map(event => event.choices[0].delta.content || '').join('')).toBe('Checking the test harness first.');
