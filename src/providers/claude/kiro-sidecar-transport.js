@@ -25,7 +25,7 @@ function outboundHeaders(instance, routed) {
 
 function prepareRequest(instance, routed, config, context) {
     const headers = outboundHeaders(instance, routed);
-    const proxy = resolveProxyUrlForProvider(config, config.MODEL_PROVIDER || 'claude-kiro-oauth', { forSidecar: true });
+    const proxy = resolveProxyUrlForProvider(config, config.MODEL_PROVIDER || 'claude-kiro-oauth', { forSidecar: 'kiro' });
     const data = Buffer.isBuffer(routed.data) ? routed.data
         : Buffer.from((typeof routed.data === 'string' ? routed.data : JSON.stringify(routed.data)) ?? '');
     const limit = Number(config.KIRO_MAX_PAYLOAD_BYTES) > 0 ? Number(config.KIRO_MAX_PAYLOAD_BYTES) : 10 * 1024 * 1024;

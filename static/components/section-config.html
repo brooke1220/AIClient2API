@@ -226,7 +226,7 @@
                 <div class="form-group">
                     <label for="tlsSidecarProxyUrl" data-i18n="config.proxy.tlsSidecarProxyUrl">Sidecar 上游代理</label>
                     <input type="text" id="tlsSidecarProxyUrl" class="form-control" data-i18n-placeholder="config.proxy.urlPlaceholder" placeholder="例如: http://127.0.0.1:7890">
-                    <small class="form-text" data-i18n="config.proxy.urlNote">TLS Sidecar 专用上游代理，留空则不使用代理</small>
+                    <small class="form-text" data-i18n="config.proxy.tlsSidecarProxyUrlNote">支持 HTTP、HTTPS 和 SOCKS5。优先级：节点代理 > 插件绑定代理 > TLS Sidecar 上游代理 > 全局代理 > 直连；留空继承全局代理，不受全局提供商勾选限制。</small>
                 </div>
                 <div class="form-group pool-section">
                     <label data-i18n="config.proxy.tlsSidecarEnabledProviders">启用 TLS Sidecar 的提供商</label>
@@ -249,6 +249,11 @@
                         <label for="kiroSidecarPort" data-i18n="config.proxy.kiroSidecarPort">Sidecar 端口</label>
                         <input type="number" id="kiroSidecarPort" class="form-control" min="1024" max="65535" value="9091">
                     </div>
+                </div>
+                <div class="form-group">
+                    <label for="kiroSidecarProxyUrl" data-i18n="config.proxy.kiroSidecarProxyUrl">Kiro Sidecar 上游代理</label>
+                    <input type="text" id="kiroSidecarProxyUrl" class="form-control" data-i18n-placeholder="config.proxy.urlPlaceholder" placeholder="例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080">
+                    <small class="form-text" data-i18n="config.proxy.kiroSidecarProxyUrlNote">支持 HTTP、HTTPS 和 SOCKS5。优先级：节点代理 > 插件绑定代理 > Kiro Sidecar 上游代理 > 全局代理 > 直连；留空继承全局代理，不受全局提供商勾选限制。</small>
                 </div>
                 <small class="form-text" data-i18n="config.proxy.kiroSidecarNote">启用后 Kiro 请求将通过 Rust kiro-sidecar 传输代理转发（需重启服务）</small>
             </div>

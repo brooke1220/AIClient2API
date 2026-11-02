@@ -178,9 +178,12 @@ export function resolveProxyUrlForProvider(config = {}, providerType, options = 
     const boundProxyUrl = getNodeProxyUrlFromBinding(config, providerType);
     if (boundProxyUrl) return boundProxyUrl;
 
-    // Preserve the existing Sidecar-specific upstream fallback.
+    // Both Sidecars share the same precedence, with separate upstream settings.
+    // `true` preserves the TLS Sidecar contract; `kiro` selects the Rust transport.
     if (options.forSidecar) {
-        return config?.TLS_SIDECAR_PROXY_URL || config?.PROXY_URL || null;
+        const sidecarProxyUrl = options.forSidecar === 'kiro'
+            ? config?.KIRO_SIDECAR_PROXY_URL : config?.TLS_SIDECAR_PROXY_URL;
+        return sidecarProxyUrl || config?.PROXY_URL || null;
     }
 
     const enabledProviders = config?.PROXY_ENABLED_PROVIDERS;

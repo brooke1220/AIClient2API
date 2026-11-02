@@ -159,6 +159,7 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         KIRO_SIDECAR_ENABLED: false,    // 启用 Rust kiro-sidecar 传输代理
         KIRO_SIDECAR_PORT: 9091,        // kiro-sidecar 监听端口
         KIRO_SIDECAR_PATH: null,        // 自定义二进制路径（默认自动搜索）
+        KIRO_SIDECAR_PROXY_URL: null,   // Kiro Sidecar 专用的上游代理地址
         UI_ENABLED: true           // 是否启用前端管理界面
     };
 

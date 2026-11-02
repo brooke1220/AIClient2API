@@ -74,13 +74,25 @@ describe('per-account proxy precedence', () => {
         expect(binding).not.toHaveBeenCalled();
     });
 
-    test('Sidecar fallback remains compatible but an explicit node always wins', () => {
-        const config = { ...globalConfig, PROXY_ENABLED_PROVIDERS: [], TLS_SIDECAR_PROXY_URL: 'http://127.0.0.1:8006' };
-        expect(resolveProxyUrlForProvider(config, provider, { forSidecar: true })).toBe(config.TLS_SIDECAR_PROXY_URL);
-        expect(resolveProxyUrlForProvider({ ...config, TLS_SIDECAR_PROXY_URL: '' }, provider, { forSidecar: true }))
+    test.each([[true, 'TLS_SIDECAR_PROXY_URL'], ['kiro', 'KIRO_SIDECAR_PROXY_URL']])
+    ('Sidecar %p uses its own upstream with the same node, binding and global priority', (forSidecar, key) => {
+        const config = {
+            ...globalConfig, PROXY_ENABLED_PROVIDERS: [],
+            TLS_SIDECAR_PROXY_URL: 'http://127.0.0.1:8006', KIRO_SIDECAR_PROXY_URL: 'http://127.0.0.1:8010'
+        };
+        const options = { forSidecar };
+        expect(resolveProxyUrlForProvider(config, provider, options)).toBe(config[key]);
+        expect(resolveProxyUrlForProvider({ ...config, [key]: '' }, provider, options))
             .toBe(globalConfig.PROXY_URL);
-        expect(resolveProxyUrlForProvider({ ...config, NODE_PROXY_URL: 'socks5://127.0.0.1:8007' }, provider, { forSidecar: true }))
-            .toBe('socks5://127.0.0.1:8007');
+        expect(resolveProxyUrlForProvider({ ...config, [key]: null, PROXY_URL: null }, provider, options)).toBeNull();
+        expect(resolveProxyUrlForProvider(config, provider)).toBeNull();
+        const binding = jest.fn(() => 'http://127.0.0.1:8011');
+        requestContext.run({ ipNodeProxy: { getProxyUrl: binding } }, () => {
+            expect(resolveProxyUrlForProvider({ ...config, NODE_PROXY_URL: 'socks5://127.0.0.1:8007' }, provider, options))
+                .toBe('socks5://127.0.0.1:8007');
+            expect(binding).not.toHaveBeenCalled();
+            expect(resolveProxyUrlForProvider(config, provider, options)).toBe('http://127.0.0.1:8011');
+        });
     });
 
     test('logs never include proxy username or password', () => {

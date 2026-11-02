@@ -150,6 +150,7 @@ export default class KiroSidecar {
                 this.state = 'ready';
                 this.consecutiveHealthFailures = 0;
                 this._startHealthCheck(record);
+                logger.info(`[Kiro-Sidecar] Ready at ${record.baseUrl} (health check passed)`);
                 return true;
             }
             if (!this.isShuttingDown) logger.warn('[Kiro-Sidecar] Startup readiness check failed');

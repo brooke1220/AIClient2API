@@ -601,9 +601,11 @@ async function loadConfiguration() {
         // Kiro Sidecar 配置
         const kiroSidecarEnabledEl = document.getElementById('kiroSidecarEnabled');
         const kiroSidecarPortEl = document.getElementById('kiroSidecarPort');
+        const kiroSidecarProxyUrlEl = document.getElementById('kiroSidecarProxyUrl');
 
         if (kiroSidecarEnabledEl) kiroSidecarEnabledEl.checked = data.KIRO_SIDECAR_ENABLED || false;
         if (kiroSidecarPortEl) kiroSidecarPortEl.value = data.KIRO_SIDECAR_PORT || 9091;
+        if (kiroSidecarProxyUrlEl) kiroSidecarProxyUrlEl.value = data.KIRO_SIDECAR_PROXY_URL || '';
 
         // 定时健康检查配置
         const scheduledHealthCheckEnabledEl = document.getElementById('scheduledHealthCheckEnabled');
@@ -783,6 +785,7 @@ async function saveConfiguration(options = {}) {
     // Kiro Sidecar 配置
     config.KIRO_SIDECAR_ENABLED = document.getElementById('kiroSidecarEnabled')?.checked || false;
     config.KIRO_SIDECAR_PORT = parseInt(document.getElementById('kiroSidecarPort')?.value || 9091);
+    config.KIRO_SIDECAR_PROXY_URL = document.getElementById('kiroSidecarProxyUrl')?.value?.trim() || null;
 
     // 定时健康检查配置
     const scheduledHealthCheckProvidersEl = document.getElementById('scheduledHealthCheckProviders');

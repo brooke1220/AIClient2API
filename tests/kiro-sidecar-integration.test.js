@@ -12,6 +12,7 @@ jest.mock('../src/utils/logger.js', () => ({ __esModule: true, default: { info: 
 
 import { KiroApiService } from '../src/providers/claude/claude-kiro.js';
 import KiroSidecar, { getKiroSidecar, getKiroSidecarTargetOrigins } from '../src/utils/kiro-sidecar.js';
+import logger from '../src/utils/logger.js';
 import { createFixture, binary, freePort, waitFor, readBody, localRequest, listen } from './helpers/kiro-sidecar-fixture.js';
 import { service, collect, frame, text, request, model } from './helpers/kiro-safety-fixtures.js';
 
@@ -217,10 +218,34 @@ test('reserves body memory before receiving a slow upload', async () => {
     await waitFor(async () => (await health()).buffer_bytes === 0, 3000, 'Slow upload cancellation release');
 });
 
+test.each([
+    ['node', proxy => ({ NODE_PROXY_URL: proxy, ipNodeProxy: { getProxyUrl: () => 'http://127.0.0.1:0' } })],
+    ['binding', proxy => ({ ipNodeProxy: { getProxyUrl: () => proxy } })],
+    ['kiro', proxy => ({ KIRO_SIDECAR_PROXY_URL: proxy })],
+    ['global', proxy => ({ KIRO_SIDECAR_PROXY_URL: null, PROXY_URL: proxy })],
+    ['direct', () => ({ KIRO_SIDECAR_PROXY_URL: null, PROXY_URL: null })],
+])('Kiro Sidecar routes through the selected %s upstream', async (source, overrides) => {
+    const proxy = `http://${source}:secret@127.0.0.1:${fixture.proxyPort}`;
+    const value = backend({
+        PROXY_ENABLED_PROVIDERS: [], PROXY_URL: 'http://127.0.0.1:0',
+        TLS_SIDECAR_PROXY_URL: 'http://127.0.0.1:0', KIRO_SIDECAR_PROXY_URL: 'http://127.0.0.1:0',
+        ...overrides(proxy)
+    });
+    expect((await collect(generate(value))).some(event => event.type === 'content')).toBe(true);
+    expect(fixture.requests).toHaveLength(1);
+    if (source === 'direct') {
+        expect(fixture.connects).toHaveLength(0);
+    } else {
+        expect(fixture.connects.map(headers => headers['proxy-authorization']))
+            .toEqual([`Basic ${Buffer.from(`${source}:secret`).toString('base64')}`]);
+    }
+});
+
 test.each(['ftp://user:secret@127.0.0.1:1', 'socks4://127.0.0.1:1', 'http://127.0.0.1:1/path'])('rejects invalid proxy %s without direct fallback', async proxy => {
-    const value = backend({ TLS_SIDECAR_PROXY_URL: proxy });
+    const value = backend({ KIRO_SIDECAR_PROXY_URL: proxy, PROXY_URL: `http://127.0.0.1:${fixture.proxyPort}` });
     await expect(collect(generate(value))).rejects.toMatchObject({ code: 'INVALID_PROXY', retryable: false, shouldSwitchCredential: false });
     expect(fixture.requests).toHaveLength(0);
+    expect(fixture.connects).toHaveLength(0);
 });
 
 test('proxy credentials remain isolated when only the password changes', async () => {
@@ -337,14 +362,26 @@ test('does not follow upstream redirects', async () => {
     expect(fixture.requests).toHaveLength(1);
 });
 
+test('successful managed startup logs the ready address and port without the local token', async () => {
+    const manager = new KiroSidecar();
+    managers.add(manager);
+    const port = await freePort();
+    logger.info.mockClear();
+    expect(await manager.start({ binaryPath: binary, port })).toBe(true);
+    expect(logger.info).toHaveBeenCalledWith(`[Kiro-Sidecar] Ready at http://127.0.0.1:${port} (health check passed)`);
+    expect(JSON.stringify(logger.info.mock.calls)).not.toContain(manager.getLocalToken());
+});
+
 test('startup timeout reaps the child before scheduling a restart', async () => {
     const manager = new KiroSidecar({ startup: 80, health: 20, stop: 100, backoff: 10000 });
     managers.add(manager);
+    logger.info.mockClear();
     const pending = manager.start({ binaryPath: '/bin/cat', port: await freePort() });
     const child = manager.process;
     expect(await pending).toBe(false);
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
     expect(manager.process).toBeNull();
+    expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining('[Kiro-Sidecar] Ready at'));
     await manager.stop();
     expect(manager.state).toBe('stopped');
     expect(manager.backoffTimer).toBeNull();

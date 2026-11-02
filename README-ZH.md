@@ -655,7 +655,11 @@ Claude 强度来源的优先级为 `reasoning_effort` > `output_config.effort` >
 
    以上仅展示代理字段，请保留节点原有凭据和其他配置。填写后该账号优先使用独立代理，无需在全局勾选该提供商；省略、留空或设为 `null` 时继承原有全局设置（包括提供商勾选状态）。清空并保存即可恢复继承，无需重启。无效的独立代理地址会被拒绝，不会自动回退到全局代理或直连。
 
-4. **提供商自带代理端点**：某些提供商（如 OpenAI、Claude）支持配置已代理的 API 端点
+4. **Sidecar 上游代理**：在 Web UI 的“配置管理 → 代理设置”中，可分别填写 TLS Sidecar 和 Kiro Sidecar 的上游代理；也可在 `configs/config.json` 中设置 `TLS_SIDECAR_PROXY_URL` 和 `KIRO_SIDECAR_PROXY_URL`，支持 HTTP、HTTPS 和 SOCKS5。
+
+   两者使用相同的优先级：**节点独立代理 > 插件绑定代理 > 各自的 Sidecar 上游代理 > 全局代理 > 直连**。Sidecar 上游代理留空时继承全局 `PROXY_URL`，不受 `PROXY_ENABLED_PROVIDERS` 勾选限制；两种 Sidecar 的专用代理配置彼此独立。需先启用对应 Sidecar；开关和端口变更需重启服务。
+
+5. **提供商自带代理端点**：某些提供商（如 OpenAI、Claude）支持配置已代理的 API 端点
 
    - **Web UI 配置**：在"配置管理"页面的各提供商配置区域，修改对应的 Base URL
    - **配置文件**：在 `configs/config.json` 中配置

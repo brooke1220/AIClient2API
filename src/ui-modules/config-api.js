@@ -105,6 +105,9 @@ export async function handleGetConfig(req, res, currentConfig) {
         TLS_SIDECAR_ENABLED_PROVIDERS: currentConfig.TLS_SIDECAR_ENABLED_PROVIDERS,
         TLS_SIDECAR_PORT: currentConfig.TLS_SIDECAR_PORT,
         TLS_SIDECAR_PROXY_URL: currentConfig.TLS_SIDECAR_PROXY_URL,
+        KIRO_SIDECAR_ENABLED: currentConfig.KIRO_SIDECAR_ENABLED,
+        KIRO_SIDECAR_PORT: currentConfig.KIRO_SIDECAR_PORT,
+        KIRO_SIDECAR_PROXY_URL: currentConfig.KIRO_SIDECAR_PROXY_URL,
         LOG_ENABLED: currentConfig.LOG_ENABLED,
         LOG_OUTPUT_MODE: currentConfig.LOG_OUTPUT_MODE,
         LOG_LEVEL: currentConfig.LOG_LEVEL,
@@ -241,6 +244,16 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
         if (newConfig.TLS_SIDECAR_ENABLED_PROVIDERS !== undefined) currentConfig.TLS_SIDECAR_ENABLED_PROVIDERS = newConfig.TLS_SIDECAR_ENABLED_PROVIDERS;
         if (newConfig.TLS_SIDECAR_PORT !== undefined) currentConfig.TLS_SIDECAR_PORT = newConfig.TLS_SIDECAR_PORT;
         if (newConfig.TLS_SIDECAR_PROXY_URL !== undefined) currentConfig.TLS_SIDECAR_PROXY_URL = newConfig.TLS_SIDECAR_PROXY_URL;
+
+        // Kiro Sidecar settings (applied on service restart)
+        if (newConfig.KIRO_SIDECAR_ENABLED !== undefined) currentConfig.KIRO_SIDECAR_ENABLED = parseBooleanConfig(newConfig.KIRO_SIDECAR_ENABLED);
+        if (newConfig.KIRO_SIDECAR_PORT !== undefined) {
+            const port = Number(newConfig.KIRO_SIDECAR_PORT);
+            if (Number.isInteger(port) && port >= NETWORK.MIN_PORT && port <= NETWORK.MAX_PORT) currentConfig.KIRO_SIDECAR_PORT = port;
+        }
+        if (newConfig.KIRO_SIDECAR_PROXY_URL === null || typeof newConfig.KIRO_SIDECAR_PROXY_URL === 'string') {
+            currentConfig.KIRO_SIDECAR_PROXY_URL = newConfig.KIRO_SIDECAR_PROXY_URL?.trim() || null;
+        }
 
         // Log settings
         if (newConfig.LOG_ENABLED !== undefined) currentConfig.LOG_ENABLED = newConfig.LOG_ENABLED;
@@ -384,6 +397,10 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
                 TLS_SIDECAR_ENABLED_PROVIDERS: currentConfig.TLS_SIDECAR_ENABLED_PROVIDERS,
                 TLS_SIDECAR_PORT: currentConfig.TLS_SIDECAR_PORT,
                 TLS_SIDECAR_PROXY_URL: currentConfig.TLS_SIDECAR_PROXY_URL,
+                KIRO_SIDECAR_ENABLED: currentConfig.KIRO_SIDECAR_ENABLED,
+                KIRO_SIDECAR_PORT: currentConfig.KIRO_SIDECAR_PORT,
+                KIRO_SIDECAR_PATH: currentConfig.KIRO_SIDECAR_PATH,
+                KIRO_SIDECAR_PROXY_URL: currentConfig.KIRO_SIDECAR_PROXY_URL,
                 SCHEDULED_HEALTH_CHECK: currentConfig.SCHEDULED_HEALTH_CHECK
             };
 
