@@ -67,6 +67,8 @@ Node.js (claude-kiro.js)
 
 ### 与 tls-sidecar 的关系
 
+2026-11-02 增补：当两个 Sidecar 都启用、TLS Sidecar 提供商列表匹配当前 Kiro 节点，且两个进程都已就绪时，生成请求使用 `Node.js → kiro-sidecar → tls-sidecar → 上游代理（如有）→ AWS`。Node.js 在请求开始时固定该选择；Rust 保留目标校验与资源预算，通过父进程配置的 loopback 地址调用 Go 的 `/kiro/stream`，Go 负责实际 TLS 握手。真实 HTTPS 目标与本机中继地址独立处理，不将 Kiro 的本机地址交给 TLS Sidecar 再包装。Go 的来源标记用于区分中继故障与 AWS HTTP 错误；中途故障不自动切换传输。串联沿用 Kiro 的上游代理解析规则，不改用 TLS Sidecar 专用代理配置。详见 `docs/KIRO_PRODUCTION_SAFETY.md`。
+
 | 维度 | tls-sidecar | kiro-sidecar 首版 |
 |------|-------------|------------------|
 | 语言 | Go | Rust |

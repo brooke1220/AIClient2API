@@ -1,4 +1,4 @@
-import deepmerge from 'deepmerge';
+import { cloneConfig } from '../utils/config-merge.js';
 import logger from '../utils/logger.js';
 import requestContext from '../utils/context.js';
 import { handleError, getClientIp, getRequestBody } from '../utils/common.js';
@@ -38,7 +38,7 @@ export function createRequestHandler(config, providerPoolManager) {
         return requestContext.run({ requestId }, async () => {
             return logger.runWithContext(requestId, async () => {
                 // Deep copy the config for each request to allow dynamic modification
-                const currentConfig = deepmerge({}, config);
+                const currentConfig = cloneConfig(config);
                 currentConfig._monitorRequestId = requestId;
                 
                 // 计算当前请求的基础 URL

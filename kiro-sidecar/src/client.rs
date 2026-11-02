@@ -116,6 +116,7 @@ mod tests {
             max_client_cache: 2,
             connect_timeout_secs: 5,
             transport_profile: "v1-aws-lc-rs".into(),
+            tls_sidecar_url: None,
         }
     }
 

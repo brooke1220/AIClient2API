@@ -27,6 +27,7 @@ pub async fn health(
         "protocol_version": 1,
         "instance_id": state.config.instance_id,
         "transport_profile": state.config.transport_profile,
+        "tls_sidecar_configured": state.config.tls_sidecar_url.is_some(),
         "inflight": state.budget.inflight_count(),
         "buffer_bytes": state.budget.buffer_bytes_used(),
     });

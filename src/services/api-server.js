@@ -305,6 +305,7 @@ async function startServer() {
                 binaryPath: CONFIG.KIRO_SIDECAR_PATH || undefined,
                 maxPayloadBytes: CONFIG.KIRO_MAX_PAYLOAD_BYTES,
                 targetOrigins: await getKiroSidecarTargetOrigins(CONFIG),
+                tlsSidecarUrl: CONFIG.TLS_SIDECAR_ENABLED ? getTLSSidecar().baseUrl : undefined,
             });
         } catch { logger.warn('[Initialization] Invalid Kiro sidecar endpoint configuration'); }
         if (started) {

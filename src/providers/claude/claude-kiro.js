@@ -6,7 +6,7 @@ import { buildKiroInferenceConfig, guardKiroPayload, inlineOrphanToolResults, va
 import { decodeKiroFrames, kiroIntegrityError, normalizeKiroStopReason } from './kiro-event-stream.js';
 import { KiroToolAssembler } from './kiro-tool-assembler.js';
 import { KiroBracketToolParser } from './kiro-bracket-tools.js';
-import { markKiroSidecarError, requestViaKiroSidecar } from './kiro-sidecar-transport.js';
+import { markKiroSidecarError, requestViaKiroSidecar, selectKiroSidecarTransport } from './kiro-sidecar-transport.js';
 import { atomicWriteFile } from '../../utils/file-lock.js';
 import axios from 'axios';
 import logger from '../../utils/logger.js';
@@ -656,6 +656,15 @@ function createKiroEmptyResponseError() {
     return createEmptyUpstreamResponseError('Kiro');
 }
 
+function kiroRetryBudget(value) {
+    if ((typeof value !== 'number' && typeof value !== 'string') || (typeof value === 'string' && value.trim() === '')) return 3;
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 ? number : 3;
+}
+
+const KIRO_CREDENTIAL_FIELDS = ['accessToken', 'refreshToken', 'clientId', 'clientSecret', 'clientIdHash',
+    'authMethod', 'expiresAt', 'profileArn', 'region', 'idcRegion'];
+
 async function getKiroErrorResponsePreview(error, maxLength = 500, options = {}) {
     try {
         const responseText = await getNormalizedErrorResponseText(error, options);
@@ -694,6 +703,9 @@ export class KiroApiService {
                 const parsedCreds = JSON.parse(decodedCreds);
                 // Store parsedCreds to be merged in initializeAuth
                 this.base64Creds = parsedCreds;
+                // Stable across pool UUID changes, isolated from every other account.
+                const fingerprint = crypto.createHash('sha256').update(config.KIRO_OAUTH_CREDS_BASE64).digest('hex');
+                this.credsFilePath = path.join(this.credPath, '.kiro-base64', `${fingerprint}.json`);
                 logger.info('[Kiro] Successfully decoded Base64 credentials in constructor.');
             } catch (error) {
                 logger.error(`[Kiro] Failed to parse Base64 credentials in constructor: ${error.message}`);
@@ -802,12 +814,20 @@ export class KiroApiService {
 
         // Kiro sidecar transport path (only when explicitly enabled for this request)
         if (options.allowKiroSidecar && options._transportContext?.kind === 'kiro-sidecar') {
+            this._assertKiroAccountAvailable(options);
             return await this._requestViaKiroSidecar(routedConfig, options._transportContext);
         }
 
         // Existing path: tls-sidecar / direct
         this._applySidecar(routedConfig);
+        this._assertKiroAccountAvailable(options);
         return await this.axiosInstance.request(routedConfig);
+    }
+
+    _assertKiroAccountAvailable(options) {
+        const availability = { allowUnhealthy: options.kiroHealthCheck === true, manualRecovery: options.kiroManualRecovery === true };
+        if (options.kiroAccountLease?.assertUsable) options.kiroAccountLease.assertUsable(availability);
+        else getProviderPoolManager()?.assertProviderAvailable?.(this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, this.uuid, availability);
     }
 
     /**
@@ -865,41 +885,27 @@ async loadCredentials() {
     try {
         let mergedCredentials = {};
 
-        // Priority 1: Load from Base64 credentials if available
-        if (this.base64Creds) {
-            Object.assign(mergedCredentials, this.base64Creds);
-            logger.info('[Kiro Auth] Successfully loaded credentials from Base64 (constructor).');
-            this.base64Creds = null;
+        if (this._credentialsDirty) {
+            // A refresh token may have been consumed before persistence failed.
+            // Reloading an older snapshot would replay that consumed token.
+            for (const field of KIRO_CREDENTIAL_FIELDS) mergedCredentials[field] = this[field];
+        } else {
+            mergedCredentials = await loadCredentialsFromFile(tokenFilePath) || this.base64Creds || {};
         }
 
-        // 从文件加载
-        const targetFilePath = tokenFilePath;
-        const dirPath = path.dirname(targetFilePath);
-        const targetFileName = path.basename(targetFilePath);
-
-        logger.debug(`[Kiro Auth] Loading credentials from directory: ${dirPath}`);
-
-        try {
-            const targetCredentials = await loadCredentialsFromFile(targetFilePath);
-            if (targetCredentials) {
-                Object.assign(mergedCredentials, targetCredentials);
-                logger.info(`[Kiro Auth] Successfully loaded OAuth credentials from ${targetFilePath}`);
-            }
-
-            const files = await fs.readdir(dirPath);
-            for (const file of files) {
-                if (file.endsWith('.json') && file !== targetFileName) {
-                    const filePath = path.join(dirPath, file);
-                    const credentials = await loadCredentialsFromFile(filePath);
-                    if (credentials) {
-                        credentials.expiresAt = mergedCredentials.expiresAt;
-                        Object.assign(mergedCredentials, credentials);
-                        logger.debug(`[Kiro Auth] Loaded Client credentials from ${file}`);
-                    }
+        // Read only the matching IdC registration, never merge sibling accounts.
+        const hash = mergedCredentials.clientIdHash;
+        if ((!mergedCredentials.clientId || !mergedCredentials.clientSecret) && typeof hash === 'string' && /^[a-zA-Z0-9_-]+$/.test(hash)) {
+            const directories = new Set([path.dirname(tokenFilePath), this.credPath]);
+            for (const directory of directories) {
+                const registration = await loadCredentialsFromFile(path.join(directory, `${hash}.json`));
+                if (!registration) continue;
+                if (['clientId', 'clientSecret'].some(field => mergedCredentials[field] && registration[field] !== mergedCredentials[field])) continue;
+                for (const field of ['clientId', 'clientSecret']) {
+                    if (!mergedCredentials[field] && typeof registration[field] === 'string') mergedCredentials[field] = registration[field];
                 }
+                if (mergedCredentials.clientId && mergedCredentials.clientSecret) break;
             }
-        } catch (error) {
-            logger.warn(`[Kiro Auth] Error loading credentials from directory ${dirPath}: ${error.message}`);
         }
 
         // Apply loaded credentials. Force-refresh paths must not keep stale in-memory tokens.
@@ -912,6 +918,7 @@ async loadCredentials() {
         applyCredential('refreshToken');
         applyCredential('clientId');
         applyCredential('clientSecret');
+        applyCredential('clientIdHash');
         applyCredential('authMethod');
         applyCredential('expiresAt');
         applyCredential('profileArn');
@@ -1127,6 +1134,7 @@ async saveCredentialsToFile(filePath, newData) {
         }
     }
     const mergedData = { ...existingData, ...newData };
+    await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
     await atomicWriteFile(filePath, JSON.stringify(mergedData, null, 2), { encoding: 'utf8', mode: 0o600 });
     logger.info(`[Kiro Auth] Updated token file: ${filePath}`);
 };
@@ -1188,6 +1196,7 @@ async saveCredentialsToFile(filePath, newData) {
                 const expiresIn = Number(response.data.expiresIn) || 3600;
                 const expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
                 this.expiresAt = expiresAt;
+                this._credentialsDirty = true;
                 logger.info('[Kiro Auth] Access token refreshed successfully');
 
                 // IdC refresh responses do not include profileArn. Discover it now that
@@ -1195,15 +1204,10 @@ async saveCredentialsToFile(filePath, newData) {
                 // request and before persisting the refreshed credentials.
                 await this._ensureProfileArn(isSocialAuth);
 
-                const updatedTokenData = {
-                    accessToken: this.accessToken,
-                    refreshToken: this.refreshToken,
-                    expiresAt: expiresAt,
-                };
-                if (this.profileArn) {
-                    updatedTokenData.profileArn = this.profileArn;
-                }
+                const updatedTokenData = Object.fromEntries(KIRO_CREDENTIAL_FIELDS
+                    .filter(field => this[field] !== undefined).map(field => [field, this[field]]));
                 await saveCredentialsToFile(tokenFilePath, updatedTokenData);
+                this._credentialsDirty = false;
 
                 // 刷新成功，重置 PoolManager 中的刷新状态并标记为健康
                 const poolManager = getProviderPoolManager();
@@ -1943,7 +1947,7 @@ async saveCredentialsToFile(filePath, newData) {
      */
     async callApi(method, model, body, isRetry = false, retryCount = 0) {
         if (!this.isInitialized) await this.initialize();
-        const maxRetries = this.config.REQUEST_MAX_RETRIES ?? 3;
+        const maxRetries = kiroRetryBudget(this.config.REQUEST_MAX_RETRIES);
         const baseDelay = this.config.REQUEST_BASE_DELAY ?? 1000; // 1 second base delay
 
         // 处理不同格式的请求体（messages 或 contents）
@@ -1988,6 +1992,7 @@ async saveCredentialsToFile(filePath, newData) {
             response._kiroToolNameMaps = requestData._kiroToolNameMaps;
             return response;
         } catch (error) {
+            if (error.isKiroAccountUnavailable) throw error;
             const status = error.response?.status;
             const errorCode = error.code;
             const errorMessage = error.message || '';
@@ -2436,10 +2441,13 @@ async saveCredentialsToFile(filePath, newData) {
      * 真正的流式 API 调用 - 使用 responseType: 'stream'
      */
     async * streamApiReal(method, model, body, isRetry = false, retryCount = 0, options = {}) {
+        // Keep request-local routing state private while passing its pinned
+        // transport through retries. Callers may reuse or freeze their options.
+        options = { ...options };
         const { signal } = options;
         signal?.throwIfAborted();
         if (!this.isInitialized) await waitForKiroOperation(this.initialize(), signal);
-        const maxRetries = this.config.REQUEST_MAX_RETRIES ?? 3;
+        const maxRetries = kiroRetryBudget(this.config.REQUEST_MAX_RETRIES);
         const baseDelay = this.config.REQUEST_BASE_DELAY ?? 1000;
 
         // 处理不同格式的请求体（messages 或 contents）
@@ -2524,20 +2532,14 @@ async saveCredentialsToFile(filePath, newData) {
             if (totalMs > 0) totalTimer = setTimeout(() => expire('stream total'), totalMs);
             // Transport selection: determine once per request, reuse across retries
             if (!options._transportContext) {
-                const { getKiroSidecar } = await import('../../utils/kiro-sidecar.js');
-                const kiroSidecar = getKiroSidecar();
-                if (this.config.KIRO_SIDECAR_ENABLED && kiroSidecar.isReady() && axiosConfig.responseType === 'stream') {
-                    options._transportContext = kiroSidecar.getTransportContext();
-                    logger.info('[Kiro Stream] Using kiro-sidecar transport');
-                } else {
-                    options._transportContext = { kind: 'default' };
+                options._transportContext = selectKiroSidecarTransport(this.config);
+                if (options._transportContext.kind === 'kiro-sidecar') {
+                    logger.info(`[Kiro Stream] Using ${options._transportContext.tlsSidecar ? 'kiro-sidecar -> tls-sidecar (uTLS)' : 'kiro-sidecar'} transport`);
                 }
             }
             const upstreamStartedAt = performance.now();
-            const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData, {
-                allowKiroSidecar: true,
-                _transportContext: options._transportContext,
-            });
+            options.allowKiroSidecar = true;
+            const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData, options);
 
             stream = response.data;
             signal?.addEventListener('abort', onAbort, { once: true });
@@ -2627,6 +2629,7 @@ async saveCredentialsToFile(filePath, newData) {
             // Cancellation is not an upstream failure and must never retry or
             // switch credentials, even if destroying a socket reports a reset.
             if (signal?.aborted) throw error;
+            if (error.isKiroAccountUnavailable) throw error;
 
             // A body reset or local-hop failure must never reach AWS account handling.
             if (options._transportContext?.kind === 'kiro-sidecar' && !error.response
@@ -3233,7 +3236,8 @@ async saveCredentialsToFile(filePath, newData) {
             // 4. 发送 message_delta 事件
             yield {
                 type: "message_delta",
-                delta: { stop_reason: upstreamStopReason || (toolCalls.length > 0 ? "tool_use" : (emittedOnlyThinking ? "max_tokens" : "end_turn")),
+                delta: { stop_reason: toolCalls.length > 0 && (!upstreamStopReason || upstreamStopReason === 'end_turn')
+                    ? 'tool_use' : (upstreamStopReason || (emittedOnlyThinking ? 'max_tokens' : 'end_turn')),
                     stop_sequence: upstreamStopSequence },
                 usage: {
                     input_tokens: inputTokens,

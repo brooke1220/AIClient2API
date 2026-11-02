@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { getKiroSidecar } from '../../utils/kiro-sidecar.js';
-import { resolveProxyUrlForProvider } from '../../utils/proxy-utils.js';
+import { isTLSSidecarEnabledForProvider, resolveProxyUrlForProvider } from '../../utils/proxy-utils.js';
+import { getTLSSidecar } from '../../utils/tls-sidecar.js';
 import { getNormalizedErrorResponseText, isRetryableNetworkError } from '../../utils/common.js';
 
 export function markKiroSidecarError(error, code = 'SIDECAR_TRANSPORT_ERROR', retryable = false) {
@@ -11,6 +12,16 @@ export function markKiroSidecarError(error, code = 'SIDECAR_TRANSPORT_ERROR', re
     error.retryable = retryable;
     error.code = code;
     return error;
+}
+
+/** Pin both hops once, so retries never silently change the outbound transport. */
+export function selectKiroSidecarTransport(config, sidecar = getKiroSidecar()) {
+    if (!config.KIRO_SIDECAR_ENABLED || !sidecar.isReady()) return { kind: 'default' };
+    const context = sidecar.getTransportContext();
+    if (!context) return { kind: 'default' };
+    const tlsSidecar = isTLSSidecarEnabledForProvider(config, config.MODEL_PROVIDER || 'claude-kiro-oauth')
+        && getTLSSidecar().supportsKiroRelay();
+    return tlsSidecar ? Object.freeze({ ...context, tlsSidecar: true }) : context;
 }
 
 /** Match Axios's flattening of common, method-level and top-level headers. */
@@ -37,12 +48,13 @@ function prepareRequest(instance, routed, config, context) {
     const connectionHeaders = String(headers.get('connection') || '').split(',').map(name => name.trim()).filter(Boolean);
     for (const name of [...connectionHeaders, 'host', 'content-length', 'connection', 'transfer-encoding', 'keep-alive', 'upgrade',
         'proxy-authorization', 'proxy-connection', 'te', 'trailer', 'x-target-url', 'x-proxy-url',
-        'x-kiro-sidecar-token', 'x-kiro-protocol-version']) headers.delete(name);
+        'x-kiro-sidecar-token', 'x-kiro-protocol-version', 'x-kiro-use-tls-sidecar']) headers.delete(name);
     headers.setContentType('application/json', false);
     headers.set('X-Kiro-Sidecar-Token', context.localToken);
     headers.set('X-Kiro-Protocol-Version', '1');
     headers.set('X-Target-Url', routed.url);
     if (proxy) headers.set('X-Proxy-Url', proxy);
+    if (context.tlsSidecar) headers.set('X-Kiro-Use-TLS-Sidecar', '1');
     return { headers, data };
 }
 

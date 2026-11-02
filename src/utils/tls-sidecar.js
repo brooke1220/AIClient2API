@@ -33,6 +33,10 @@ class TLSSidecar {
         this.restartCount = 0;
         this.isShuttingDown = false;
         this.ready = false;
+        this.kiroRelayProtocolVersion = null;
+        this.startPromise = null;
+        this.restartTimer = null;
+        this.restartTimestamps = [];
     }
 
     /**
@@ -42,11 +46,23 @@ class TLSSidecar {
      * @param {string} [options.binaryPath] - 自定义二进制路径
      * @returns {Promise<boolean>}
      */
-    async start(options = {}) {
+    start(options = {}) {
+        if (this.startPromise) return this.startPromise;
         if (this.process) {
             logger.info('[TLS-Sidecar] Already running');
-            return true;
+            return Promise.resolve(this.isReady());
         }
+        clearTimeout(this.restartTimer);
+        this.restartTimer = null;
+        this.isShuttingDown = false;
+        const operation = this._start(options);
+        this.startPromise = operation;
+        const clear = () => { if (this.startPromise === operation) this.startPromise = null; };
+        operation.then(clear, clear);
+        return operation;
+    }
+
+    async _start(options) {
 
         this.port = options.port || parseInt(process.env.TLS_SIDECAR_PORT) || DEFAULT_PORT;
         this.baseUrl = `http://127.0.0.1:${this.port}`;
@@ -70,13 +86,14 @@ class TLSSidecar {
                 }
             }
 
-            this.process = spawn(binaryPath, [], {
+            const child = spawn(binaryPath, [], {
                 env: {
                     ...process.env,
                     TLS_SIDECAR_PORT: String(this.port),
                 },
                 stdio: ['ignore', 'pipe', 'pipe'],
             });
+            this.process = child;
 
             // 转发 sidecar 日志
             this.process.stdout.on('data', (data) => {
@@ -89,33 +106,44 @@ class TLSSidecar {
                 if (msg) logger.error(`[TLS-Sidecar] ${msg}`);
             });
 
-            this.process.on('exit', (code, signal) => {
+            const onExit = (code, signal) => {
+                if (this.process !== child) return;
                 logger.warn(`[TLS-Sidecar] Process exited (code=${code}, signal=${signal})`);
                 this.process = null;
                 this.ready = false;
+                this.kiroRelayProtocolVersion = null;
+                this._stopHealthCheck();
 
-                if (!this.isShuttingDown && this.restartCount < MAX_RESTART_ATTEMPTS) {
-                    this.restartCount++;
+                this.restartTimestamps = this.restartTimestamps.filter(t => Date.now() - t < 10 * 60 * 1000);
+                if (!this.isShuttingDown && this.restartTimestamps.length < MAX_RESTART_ATTEMPTS) {
+                    this.restartTimestamps.push(Date.now());
+                    this.restartCount = this.restartTimestamps.length;
                     logger.info(`[TLS-Sidecar] Auto-restart attempt ${this.restartCount}/${MAX_RESTART_ATTEMPTS}`);
-                    setTimeout(() => this.start(options), RESTART_DELAY);
+                    this.restartTimer = setTimeout(() => {
+                        this.restartTimer = null;
+                        if (!this.isShuttingDown) this.start(options);
+                    }, RESTART_DELAY);
+                    this.restartTimer.unref?.();
                 }
-            });
+            };
+            child.once('exit', onExit);
 
-            this.process.on('error', (err) => {
+            child.once('error', (err) => {
                 logger.error(`[TLS-Sidecar] Spawn error: ${err.message}`);
-                this.process = null;
-                this.ready = false;
+                onExit(null, null);
             });
 
             // 等待 sidecar 就绪
-            const ok = await this._waitForReady();
-            if (ok) {
+            const ok = await this._waitForReady(10000, child);
+            if (ok && this.process === child && !this.isShuttingDown) {
                 this.ready = true;
-                this.restartCount = 0;
                 this._startHealthCheck();
                 logger.info(`[TLS-Sidecar] Ready at ${this.baseUrl}`);
+                if (!this.supportsKiroRelay()) logger.warn('[TLS-Sidecar] Kiro relay protocol unavailable; rebuild the TLS sidecar to enable chaining');
+                return true;
             }
-            return ok;
+            if (this.process === child) child.kill('SIGTERM');
+            return false;
 
         } catch (err) {
             logger.error(`[TLS-Sidecar] Failed to start: ${err.message}`);
@@ -128,28 +156,33 @@ class TLSSidecar {
      */
     async stop() {
         this.isShuttingDown = true;
+        clearTimeout(this.restartTimer);
+        this.restartTimer = null;
+        this.ready = false;
+        this.kiroRelayProtocolVersion = null;
         this._stopHealthCheck();
 
         if (this.process) {
             logger.info('[TLS-Sidecar] Stopping...');
+            const child = this.process;
             return new Promise((resolve) => {
                 const timeout = setTimeout(() => {
-                    if (this.process) {
+                    if (this.process === child) {
                         logger.warn('[TLS-Sidecar] Force killing');
-                        this.process.kill('SIGKILL');
+                        child.kill('SIGKILL');
                     }
                     resolve();
                 }, 5000);
 
-                this.process.once('exit', () => {
+                child.once('exit', () => {
                     clearTimeout(timeout);
-                    this.process = null;
+                    if (this.process === child) this.process = null;
                     this.ready = false;
                     logger.info('[TLS-Sidecar] Stopped');
                     resolve();
                 });
 
-                this.process.kill('SIGTERM');
+                child.kill('SIGTERM');
             });
         }
     }
@@ -160,6 +193,10 @@ class TLSSidecar {
      */
     isReady() {
         return this.ready && this.process !== null;
+    }
+
+    supportsKiroRelay() {
+        return this.isReady() && this.kiroRelayProtocolVersion === 1;
     }
 
     /**
@@ -232,9 +269,9 @@ class TLSSidecar {
         return null;
     }
 
-    async _waitForReady(timeoutMs = 10000) {
+    async _waitForReady(timeoutMs = 10000, child = this.process) {
         const start = Date.now();
-        while (Date.now() - start < timeoutMs) {
+        while (Date.now() - start < timeoutMs && this.process === child && !this.isShuttingDown) {
             try {
                 const ok = await this._healthCheck();
                 if (ok) return true;
@@ -246,12 +283,22 @@ class TLSSidecar {
     }
 
     _healthCheck() {
+        const child = this.process;
         return new Promise((resolve) => {
             const req = http.get(`${this.baseUrl}/health`, { timeout: HEALTH_CHECK_TIMEOUT }, (res) => {
                 let body = '';
-                res.on('data', (chunk) => body += chunk);
+                res.on('error', () => resolve(false));
+                res.on('aborted', () => resolve(false));
+                res.on('data', (chunk) => {
+                    body += chunk;
+                    if (body.length > 64 * 1024) { req.destroy(); resolve(false); }
+                });
                 res.on('end', () => {
-                    resolve(res.statusCode === 200);
+                    let health;
+                    try { health = JSON.parse(body); } catch { resolve(false); return; }
+                    const ok = res.statusCode === 200 && health?.status === 'ok';
+                    if (this.process === child && !this.isShuttingDown) this.kiroRelayProtocolVersion = ok ? health.kiro_relay_protocol_version ?? null : null;
+                    resolve(ok);
                 });
             });
             req.on('error', () => resolve(false));
@@ -264,8 +311,10 @@ class TLSSidecar {
 
     _startHealthCheck() {
         this._stopHealthCheck();
+        const child = this.process;
         this.healthCheckTimer = setInterval(async () => {
             const ok = await this._healthCheck();
+            if (this.process !== child || this.isShuttingDown) return;
             if (!ok && this.ready) {
                 logger.warn('[TLS-Sidecar] Health check failed');
                 this.ready = false;

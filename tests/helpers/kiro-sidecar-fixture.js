@@ -64,13 +64,46 @@ export async function createFixture() {
     const sockets = new Set(), sessions = new Set(), children = new Set();
     const fixture = { caFile: file('ca.pem'), ca: fs.readFileSync(file('ca.pem')), requests: [], connects: [],
         handler: (_req, res) => res.end('ok'), proxyAuth: true };
+    let tlsBinary;
+    fixture.startTLS = async () => {
+        if (!tlsBinary) {
+            tlsBinary = file(`tls-sidecar${process.platform === 'win32' ? '.exe' : ''}`);
+            execFileSync('go', ['build', '-o', tlsBinary, '.'], { cwd: path.join(root, 'tls-sidecar'), stdio: 'pipe' });
+        }
+        const port = await freePort();
+        const child = spawn(tlsBinary, [], { env: { ...process.env, SSL_CERT_FILE: fixture.caFile,
+            TLS_SIDECAR_PORT: String(port) }, stdio: ['pipe', 'pipe', 'pipe'] });
+        children.add(child);
+        let output = '';
+        child.stdout.on('data', chunk => output += chunk);
+        child.stderr.on('data', chunk => output += chunk);
+        const agent = new http.Agent({ keepAlive: true });
+        const sidecar = { port, child, agent, binaryPath: tlsBinary, token: '', baseUrl: `http://127.0.0.1:${port}`,
+            health: async () => {
+                const response = await localRequest(sidecar, null, { method: 'GET', route: '/health' }).response;
+                return JSON.parse((await readBody(response)).toString());
+            },
+            stop: async () => {
+                agent.destroy();
+                if (child.exitCode === null && child.signalCode === null) {
+                    const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited;
+                }
+                children.delete(child);
+            },
+        };
+        await waitFor(async () => {
+            if (child.exitCode !== null || child.signalCode !== null) throw new Error(output);
+            try { return (await sidecar.health()).kiro_relay_protocol_version === 1; } catch { return false; }
+        });
+        return sidecar;
+    };
     const handle = (req, res) => {
         const chunks = [];
         req.on('error', () => {});
         res.on('error', () => {});
         req.on('data', chunk => chunks.push(chunk));
         req.on('end', () => {
-            fixture.requests.push({ url: req.url, headers: req.headers, body: Buffer.concat(chunks), version: req.httpVersion });
+            fixture.requests.push({ url: req.url, headers: req.headers, body: Buffer.concat(chunks), version: req.httpVersion, remotePort: req.socket.remotePort });
             fixture.handler(req, res);
         });
     };

@@ -255,7 +255,7 @@
                     <input type="text" id="kiroSidecarProxyUrl" class="form-control" data-i18n-placeholder="config.proxy.urlPlaceholder" placeholder="例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080">
                     <small class="form-text" data-i18n="config.proxy.kiroSidecarProxyUrlNote">支持 HTTP、HTTPS 和 SOCKS5。优先级：节点代理 > 插件绑定代理 > Kiro Sidecar 上游代理 > 全局代理 > 直连；留空继承全局代理，不受全局提供商勾选限制。</small>
                 </div>
-                <small class="form-text" data-i18n="config.proxy.kiroSidecarNote">启用后 Kiro 请求将通过 Rust kiro-sidecar 传输代理转发（需重启服务）</small>
+                <small class="form-text" data-i18n="config.proxy.kiroSidecarNote">Kiro 生成请求通过 Rust Sidecar 转发；同时开启 TLS Sidecar 并选中 Kiro 时，使用 Rust → Go uTLS 串联出站。上游代理仍按 Kiro Sidecar 配置解析（需重启服务）。</small>
             </div>
 
             <!-- 服务治理与高可用 -->

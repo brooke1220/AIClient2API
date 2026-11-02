@@ -317,6 +317,10 @@ The most recommended way to use AIClient2API is to start it through an automated
 
 #### 🐳 Docker Quick Start (Recommended)
 
+The image runs as root, preserving the existing deployment behavior. This upgrade does not require changing the user or ownership of bind-mounted directories.
+
+Local account settings, credentials, and user plugins are excluded from the image. Supply them through the mounts below.
+
 ```bash
 docker run -d -p 3000:3000 -p 8086:8086 -p 1455:1455 -p 56121:56121 -p 19876-19880:19876-19880 --restart=always -v "your_path/configs:/app/configs" -v "your_path/plugins:/app/src/plugins-user" --name aiclient2api justlikemaki/aiclient-2-api
 ```
@@ -335,14 +339,18 @@ You can also use Docker Compose for deployment. First, navigate to the `docker` 
 
 ```bash
 cd docker
-mkdir -p configs
+mkdir -p configs plugins
 docker compose up -d
 ```
 
-To build from source instead of using the pre-built image, edit `docker-compose.yml`:
-1. Comment out the `image: justlikemaki/aiclient-2-api:latest` line
-2. Uncomment the `build:` section
-3. Run `docker compose up -d --build`
+To deploy the changes in this checkout, use the source build configuration from the **repository root**:
+
+```bash
+mkdir -p configs plugins
+docker compose -f docker/docker-compose.build.yml up -d --build
+```
+
+The default configuration mounts `docker/configs` and `docker/plugins`; the source build configuration mounts `configs` and `plugins` at the repository root. When switching an existing deployment, back up the original directories, then move settings and credentials to the target directories or point the mounts at the original directories. Do not replace existing account settings with empty directories.
 
 #### 1. Run the startup script
 *   **Linux/macOS**: `chmod +x install-and-run.sh && ./install-and-run.sh`
@@ -722,6 +730,8 @@ When all accounts under a Provider Type (e.g., `claude-kiro-oauth`) are exhauste
 - The system automatically checks if the target Provider Type supports the requested model
 
 #### 4. TLS Sidecar (Bypass 403/Cloudflare)
+
+**Using both Sidecars for Kiro**: Enable both Sidecars and select Kiro (`claude-kiro-oauth`) in the TLS Sidecar provider list to use `Node.js → Rust Kiro Sidecar → Go TLS Sidecar → upstream proxy (if configured) → Kiro / AWS` for generation. Rust retains target validation and resource limits; Go owns the outbound uTLS connection. The upstream proxy follows Kiro Sidecar settings. Without TLS Sidecar enabled for Kiro, Rust keeps its own outbound transport. Rebuild both binaries (or the Docker image) and restart after upgrading. See [Kiro production behavior](docs/KIRO_PRODUCTION_SAFETY.md).
 
 For services like Grok that strictly validate TLS fingerprints (JA3/JA4), this project integrates a Sidecar proxy based on Go uTLS, which effectively solves 403 Forbidden errors by simulating browser TLS features.
 

@@ -27,6 +27,7 @@ pub struct Config {
     pub max_client_cache: usize,
     pub connect_timeout_secs: u64,
     pub transport_profile: String,
+    pub tls_sidecar_url: Option<Url>,
 }
 
 impl Config {
@@ -88,6 +89,11 @@ impl Config {
         if transport_profile != "v1-aws-lc-rs" {
             return Err("unsupported transport profile".into());
         }
+        let tls_sidecar_url = env::var("KIRO_TLS_SIDECAR_URL")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| Self::parse_tls_sidecar_url(&value))
+            .transpose()?;
 
         Ok(Config {
             port,
@@ -100,7 +106,26 @@ impl Config {
             max_client_cache,
             connect_timeout_secs,
             transport_profile,
+            tls_sidecar_url,
         })
+    }
+
+    /// Keep the relay endpoint separate from the validated HTTPS business target.
+    fn parse_tls_sidecar_url(value: &str) -> Result<Url, String> {
+        let mut url = Url::parse(value).map_err(|_| "invalid TLS sidecar endpoint")?;
+        if url.scheme() != "http"
+            || url.host_str() != Some("127.0.0.1")
+            || url.port().unwrap_or(80) == 0
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !matches!(url.path(), "" | "/")
+        {
+            return Err("TLS sidecar endpoint must be an HTTP origin on 127.0.0.1".into());
+        }
+        url.set_path("/kiro/stream");
+        Ok(url)
     }
 
     /// Check whether a target URL is allowed by the allowlist.
@@ -127,9 +152,7 @@ impl Config {
         }
 
         let origin = url.origin().ascii_serialization();
-        self.target_allowlist
-            .iter()
-            .any(|allowed| *allowed == origin)
+        self.target_allowlist.contains(&origin)
     }
 
     /// Read a required environment variable, returning an error if missing.
@@ -158,6 +181,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relay_endpoint_is_a_trusted_loopback_origin() {
+        assert_eq!(
+            Config::parse_tls_sidecar_url("http://127.0.0.1:9090")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:9090/kiro/stream"
+        );
+        for value in [
+            "https://127.0.0.1:9090",
+            "http://localhost:9090",
+            "http://example.com:9090",
+            "http://user:secret@127.0.0.1:9090",
+            "http://127.0.0.1:9090/path",
+            "http://127.0.0.1:9090?target=remote",
+            "http://127.0.0.1:0",
+        ] {
+            assert!(Config::parse_tls_sidecar_url(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
     fn test_is_target_allowed_builtin() {
         let config = Config {
             port: 9091,
@@ -170,6 +214,7 @@ mod tests {
             max_client_cache: 128,
             connect_timeout_secs: 10,
             transport_profile: "v1-aws-lc-rs".into(),
+            tls_sidecar_url: None,
         };
 
         let allowed = Url::parse("https://q.us-east-1.amazonaws.com/some/path").unwrap();
@@ -192,6 +237,7 @@ mod tests {
             max_client_cache: 128,
             connect_timeout_secs: 10,
             transport_profile: "v1-aws-lc-rs".into(),
+            tls_sidecar_url: None,
         };
 
         let http_url = Url::parse("http://q.us-east-1.amazonaws.com/path").unwrap();
@@ -211,6 +257,7 @@ mod tests {
             max_client_cache: 128,
             connect_timeout_secs: 10,
             transport_profile: "v1-aws-lc-rs".into(),
+            tls_sidecar_url: None,
         };
 
         let url_with_user = Url::parse("https://user:pass@q.us-east-1.amazonaws.com/path").unwrap();
@@ -230,6 +277,7 @@ mod tests {
             max_client_cache: 128,
             connect_timeout_secs: 10,
             transport_profile: "v1-aws-lc-rs".into(),
+            tls_sidecar_url: None,
         };
 
         let url_with_frag = Url::parse("https://q.us-east-1.amazonaws.com/path#frag").unwrap();

@@ -10,10 +10,10 @@ RUN apk add --no-cache git
 
 WORKDIR /build
 COPY tls-sidecar/go.mod tls-sidecar/go.sum* ./
-RUN go mod download || true
+RUN go mod download
 
 COPY tls-sidecar/ ./
-RUN go mod tidy && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o tls-sidecar .
+RUN CGO_ENABLED=0 GOOS=linux go build -mod=readonly -ldflags="-s -w" -o tls-sidecar .
 
 # ── Stage 1b: 编译 Rust kiro-sidecar ──
 FROM rust:1.88-alpine AS kiro-builder
@@ -35,6 +35,8 @@ RUN cargo build --release --locked
 # 选择20-alpine版本以满足undici包的要求（需要Node.js >=20.18.1）
 FROM node:20-alpine
 
+ENV NODE_ENV=production
+
 # 设置标签
 LABEL maintainer="AIClient2API Team"
 LABEL description="Docker image for AIClient2API server"
@@ -53,7 +55,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # 构建时代理（如果提供了的话）
-RUN npm install || npm install --ignore-scripts
+RUN npm ci --omit=dev
 
 # 复制源代码
 COPY . .
@@ -69,10 +71,11 @@ RUN chmod +x /app/kiro-sidecar/kiro-sidecar
 
 USER root
 
-# 创建目录用于存储日志和系统提示文件
-RUN mkdir -p /app/logs
+# 创建运行目录，沿用原有 root 部署方式
+RUN mkdir -p /app/logs /app/configs /app/src/plugins-user
 
-# 暴露端口
+# Web / OAuth 回调端口；19876-19880 是 Kiro 登录回调。
+# 两个 sidecar 的 9090 / 9091 仅在容器内部使用，不声明为公开端口。
 EXPOSE 3000 8085 8086 19876-19880
 
 # 添加健康检查
@@ -82,4 +85,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 # 设置启动命令
 # 使用默认配置启动服务器，支持通过环境变量配置
 # 通过环境变量传递参数，例如：docker run -e ARGS="--api-key mykey --port 8080" ...
-CMD ["sh", "-c", "node src/core/master.js $ARGS"]
+CMD ["sh", "-c", "exec node src/core/master.js $ARGS"]

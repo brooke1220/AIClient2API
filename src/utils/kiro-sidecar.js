@@ -119,6 +119,8 @@ export default class KiroSidecar {
                     KIRO_SIDECAR_MANAGED: '1', KIRO_SIDECAR_TRANSPORT_PROFILE: KIRO_TRANSPORT_PROFILE,
                     KIRO_SIDECAR_MAX_PAYLOAD_BYTES: String(this.options.maxPayloadBytes || 10 * 1024 * 1024),
                     KIRO_SIDECAR_TARGET_ALLOWLIST: [process.env.KIRO_SIDECAR_TARGET_ALLOWLIST, ...(this.options.targetOrigins || [])].filter(Boolean).join(','),
+                    // Only the manager selects this trusted local endpoint; requests select a boolean mode.
+                    KIRO_TLS_SIDECAR_URL: this.options.tlsSidecarUrl || '',
                 },
                 stdio: ['pipe', 'pipe', 'pipe'],
             });

@@ -598,6 +598,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tokio-util",
  "tracing",

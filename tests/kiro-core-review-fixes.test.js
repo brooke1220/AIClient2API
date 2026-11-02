@@ -90,6 +90,18 @@ describe('Kiro credential account isolation', () => {
         expect(backend).toMatchObject(account);
     });
 
+    test('an incomplete embedded IdC client cannot mix with a different registration', async () => {
+        const dir = await tempDir();
+        const tokenFile = await writeCredentials(dir, 'token.json', {
+            ...credentials('A'), authMethod: 'builder-id', clientIdHash: 'registration-A', clientId: 'embedded-client'
+        });
+        await writeCredentials(dir, 'registration-A.json', { clientId: 'other-client', clientSecret: 'other-secret' });
+        const backend = credentialService(dir, { KIRO_OAUTH_CREDS_FILE_PATH: tokenFile });
+        await backend.loadCredentials();
+        expect(backend.clientId).toBe('embedded-client');
+        expect(backend.clientSecret).toBeUndefined();
+    });
+
     test('an exported IdC token can resolve its exact registration in the configured cache directory', async () => {
         const tokenDir = await tempDir();
         const cacheDir = await tempDir();
@@ -277,8 +289,8 @@ async function invoke(backend, mode, body = request(), options = {}) {
 describe('Kiro retry configuration', () => {
     test.each(['stream', 'callApi'])('%s honors zero, numeric strings and rejects invalid retry budgets', async mode => {
         for (const [configured, expectedRequests] of [
-            [0, 1], ['0', 1], [2, 3], ['2', 3],
-            [-1, 4], [1.5, 4], [Infinity, 4], [NaN, 4], ['invalid', 4], [null, 4], ['', 4], [false, 4]
+            [0, 1], ['0', 1], [2, 3], ['2', 3], ['2e0', 3],
+            [-1, 4], [1.5, 4], [Infinity, 4], [NaN, 4], ['invalid', 4], [null, 4], ['', 4], ['  ', 4], [false, 4]
         ]) {
             const error = Object.assign(new Error('connection reset'), { code: 'ECONNRESET' });
             const backend = service([], { REQUEST_MAX_RETRIES: configured, REQUEST_BASE_DELAY: 1 });
@@ -291,6 +303,26 @@ describe('Kiro retry configuration', () => {
     });
 });
 
+describe('Kiro request options isolation', () => {
+    test.each([false, true])('streaming accepts caller options without mutation (frozen=%s)', async frozen => {
+        const backend = service();
+        const controller = new AbortController();
+        const lease = { assertUsable: jest.fn() };
+        const options = { signal: controller.signal, kiroAccountLease: lease };
+        if (frozen) Object.freeze(options);
+
+        expect(await invoke(backend, 'stream', request(), options)).toEqual([{ type: 'content', content: 'answer' }]);
+
+        expect(Object.keys(options)).toEqual(['signal', 'kiroAccountLease']);
+        const forwarded = backend._requestWithBuilderEndpointRouting.mock.calls[0][2];
+        expect(forwarded).not.toBe(options);
+        expect(forwarded).toMatchObject({ ...options, allowKiroSidecar: true });
+        expect(forwarded.signal).toBe(controller.signal);
+        expect(forwarded.kiroAccountLease).toBe(lease);
+        expect(controller.signal.aborted).toBe(false);
+    });
+});
+
 describe('Kiro final availability check', () => {
     test('streaming forwards trusted health recovery options to the final send check', async () => {
         const backend = service();
@@ -299,7 +331,7 @@ describe('Kiro final availability check', () => {
         await invoke(backend, 'stream', request(), options);
 
         expect(backend._requestWithBuilderEndpointRouting).toHaveBeenCalledWith(
-            expect.any(Object), expect.any(Object), options
+            expect.any(Object), expect.any(Object), expect.objectContaining(options)
         );
     });
 

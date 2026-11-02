@@ -316,6 +316,10 @@
 
 #### 🐳 Docker 快捷启动 (推荐)
 
+镜像以 root 用户运行，沿用原有部署方式，无需为本次升级调整挂载目录的用户或归属。
+
+构建镜像不包含本地账号配置、凭据或用户插件，部署时通过下面的目录挂载提供。
+
 ```bash
 docker run -d -p 3000:3000 -p 8086:8086 -p 1455:1455 -p 56121:56121 -p 19876-19880:19876-19880 --restart=always -v "指定路径/configs:/app/configs" -v "指定路径/plugins:/app/src/plugins-user" --name aiclient2api justlikemaki/aiclient-2-api
 ```
@@ -334,14 +338,18 @@ docker run -d -p 3000:3000 -p 8086:8086 -p 1455:1455 -p 56121:56121 -p 19876-198
 
 ```bash
 cd docker
-mkdir -p configs
+mkdir -p configs plugins
 docker compose up -d
 ```
 
-如需从源码构建而非使用预构建镜像，请编辑 `docker-compose.yml`：
-1. 注释掉 `image: justlikemaki/aiclient-2-api:latest` 行
-2. 取消 `build:` 部分的注释
-3. 运行 `docker compose up -d --build`
+如需部署当前仓库的修改，请在**仓库根目录**使用源码构建配置：
+
+```bash
+mkdir -p configs plugins
+docker compose -f docker/docker-compose.build.yml up -d --build
+```
+
+默认配置挂载 `docker/configs`、`docker/plugins`；源码构建配置挂载仓库根目录的 `configs`、`plugins`。从旧部署切换时，先备份原目录，并将配置和凭据迁移到目标目录，或修改挂载路径指向原目录。请勿用空目录覆盖原有账号配置。
 
 #### 1. 运行启动脚本
 *   **Linux/macOS**: `chmod +x install-and-run.sh && ./install-and-run.sh`
@@ -744,6 +752,8 @@ Claude 强度来源的优先级为 `reasoning_effort` > `output_config.effort` >
 - 系统会自动检查目标 Provider Type 是否支持当前请求的模型
 
 #### 4. TLS Sidecar (Bypass 403/Cloudflare)
+
+**与 Kiro Sidecar 同时使用**：同时开启两个 Sidecar，并在 TLS Sidecar 提供商列表选中 Kiro（`claude-kiro-oauth`）后，生成请求使用 `Node.js → Rust Kiro Sidecar → Go TLS Sidecar → 上游代理（如有）→ Kiro / AWS`。Rust 保留目标校验和资源限制，Go 负责 uTLS 出站；上游代理仍使用 Kiro Sidecar 的代理优先级。未对 Kiro 启用 TLS Sidecar 时保留 Rust 出站。升级后需重新编译两个二进制或重建 Docker 镜像，并重启服务。参见 [Kiro 生产行为说明](docs/KIRO_PRODUCTION_SAFETY.md)。
 
 针对 Grok 等对 TLS 指纹（JA3/JA4）校验严格的服务，本项目集成了基于 Go uTLS 的 Sidecar 代理，通过模拟浏览器 TLS 特征有效解决 403 Forbidden 报错。
 

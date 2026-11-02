@@ -108,10 +108,25 @@ async fn handle_stream_inner(
         .await
         .map_err(|_| too_large())?;
 
-    // 4. Get or create reqwest client for the (optional) proxy.
+    // The business target was validated above. The relay is a separate, trusted
+    // loopback origin; never configure it as reqwest's CONNECT proxy.
+    let target = if control.use_tls_sidecar {
+        state
+            .config
+            .tls_sidecar_url
+            .as_ref()
+            .ok_or_else(|| relay_error("TLS_SIDECAR_UNAVAILABLE"))?
+    } else {
+        &control.target_url
+    };
+    // The local hop must bypass the external proxy; Go receives it explicitly.
     let client = state
         .client_cache
-        .get_or_create(control.proxy_url.as_deref())
+        .get_or_create(if control.use_tls_sidecar {
+            None
+        } else {
+            control.proxy_url.as_deref()
+        })
         .map_err(|e| SidecarError {
             status: StatusCode::BAD_GATEWAY,
             source: "sidecar",
@@ -123,13 +138,28 @@ async fn handle_stream_inner(
 
     // 5. Build and send upstream request.
     let upstream_headers = protocol::build_upstream_headers(&parts.headers);
-    let upstream_resp = client
-        .post(control.target_url.as_str())
+    let mut outbound = client
+        .post(target.as_str())
         .headers(upstream_headers)
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| classify_reqwest_error(e, control.proxy_url.is_some()))?;
+        .body(body_bytes);
+    if control.use_tls_sidecar {
+        outbound = outbound
+            .header(protocol::H_TARGET_URL, control.target_url.as_str())
+            .header(H_PROTOCOL_VERSION, PROTOCOL_VERSION);
+        if let Some(proxy) = &control.proxy_url {
+            outbound = outbound.header(protocol::H_PROXY_URL, proxy);
+        }
+    }
+    let upstream_resp = outbound.send().await.map_err(|e| {
+        if control.use_tls_sidecar {
+            relay_error("TLS_SIDECAR_CONNECTION_ERROR")
+        } else {
+            classify_reqwest_error(e, control.proxy_url.is_some())
+        }
+    })?;
+    if control.use_tls_sidecar {
+        validate_relay_response(&upstream_resp)?;
+    }
 
     // 6. Build response with sidecar headers and streamed body.
     let status = upstream_resp.status();
@@ -180,6 +210,58 @@ async fn handle_stream_inner(
     Ok(response)
 }
 
+/// Only trusted relay metadata can classify an error as local. The upstream's
+/// HTTP status and body remain untouched, even for 401/403/429/502 responses.
+fn validate_relay_response(response: &reqwest::Response) -> Result<(), SidecarError> {
+    let headers = response.headers();
+    if headers
+        .get(H_PROTOCOL_VERSION)
+        .and_then(|v| v.to_str().ok())
+        != Some(PROTOCOL_VERSION)
+    {
+        return Err(relay_error("TLS_SIDECAR_PROTOCOL_ERROR"));
+    }
+    match headers.get(H_RESPONSE_SOURCE).and_then(|v| v.to_str().ok()) {
+        Some("upstream") => Ok(()),
+        Some("sidecar")
+            if response.status().is_client_error() || response.status().is_server_error() =>
+        {
+            Err(relay_error(
+                headers
+                    .get("x-kiro-error-code")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or(""),
+            ))
+        }
+        _ => Err(relay_error("TLS_SIDECAR_PROTOCOL_ERROR")),
+    }
+}
+
+fn relay_error(code: &str) -> SidecarError {
+    let (code, phase, retryable) = match code {
+        "TLS_SIDECAR_UNAVAILABLE" => ("TLS_SIDECAR_UNAVAILABLE", "local", true),
+        "TLS_SIDECAR_CONNECTION_ERROR" => ("TLS_SIDECAR_CONNECTION_ERROR", "local", true),
+        "INVALID_TARGET" => ("INVALID_TARGET", "local", false),
+        "INVALID_PROXY" => ("INVALID_PROXY", "local", false),
+        "TLS_ERROR" => ("TLS_ERROR", "tls", false),
+        "PROXY_AUTH_FAILED" => ("PROXY_AUTH_FAILED", "proxy", false),
+        "CONNECT_TIMEOUT" => ("CONNECT_TIMEOUT", "connect", true),
+        "DNS_ERROR" => ("DNS_ERROR", "dns", true),
+        "CONNECT_ERROR" => ("CONNECT_ERROR", "connect", true),
+        "PROXY_CONNECT_ERROR" => ("PROXY_CONNECT_ERROR", "proxy", true),
+        "UPSTREAM_HEADERS_ERROR" => ("UPSTREAM_HEADERS_ERROR", "headers", true),
+        _ => ("TLS_SIDECAR_PROTOCOL_ERROR", "local", false),
+    };
+    SidecarError {
+        status: StatusCode::BAD_GATEWAY,
+        source: "sidecar",
+        code,
+        phase,
+        message: code.into(),
+        retryable,
+    }
+}
+
 // ── Error classification ──────────────────────────────────────────────
 
 /// Classify a reqwest send error into a structured `SidecarError`.
@@ -194,7 +276,8 @@ fn classify_reqwest_error(err: reqwest::Error, proxied: bool) -> SidecarError {
     }
     let (code, phase, retryable) = if details.contains("proxy authentication required")
         || details.contains("proxy authorization required")
-        || details.contains("407")
+        || details.contains("407 ")
+        || details.contains("status code 407")
     {
         ("PROXY_AUTH_FAILED", "proxy", false)
     } else if tls_error || details.contains("certificate") || details.contains("tls handshake") {
@@ -227,6 +310,76 @@ fn classify_reqwest_error(err: reqwest::Error, proxied: bool) -> SidecarError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_response(
+        status: u16,
+        version: Option<&str>,
+        source: Option<&str>,
+        code: Option<&str>,
+    ) -> reqwest::Response {
+        let mut response = http::Response::builder().status(status);
+        for (name, value) in [
+            (H_PROTOCOL_VERSION, version),
+            (H_RESPONSE_SOURCE, source),
+            ("x-kiro-error-code", code),
+        ] {
+            if let Some(value) = value {
+                response = response.header(name, value);
+            }
+        }
+        response.body("").unwrap().into()
+    }
+
+    #[test]
+    fn relay_upstream_statuses_are_not_local_errors() {
+        for status in [200, 401, 403, 429, 502] {
+            let response = relay_response(status, Some("1"), Some("upstream"), Some("TLS_ERROR"));
+            assert!(validate_relay_response(&response).is_ok(), "{status}");
+        }
+    }
+
+    #[test]
+    fn relay_rejects_missing_or_invalid_protocol_metadata() {
+        for (version, source, status, code) in [
+            (None, Some("upstream"), 200, None),
+            (Some("2"), Some("upstream"), 200, None),
+            (Some("1"), None, 401, None),
+            (Some("1"), Some("unknown"), 502, None),
+            (Some("1"), Some("sidecar"), 200, Some("TLS_ERROR")),
+            (Some("1"), Some("sidecar"), 302, Some("TLS_ERROR")),
+            (Some("1"), Some("sidecar"), 502, None),
+            (Some("1"), Some("sidecar"), 502, Some("UNKNOWN_ERROR")),
+        ] {
+            let response = relay_response(status, version, source, code);
+            let error = validate_relay_response(&response).unwrap_err();
+            assert_eq!(error.code, "TLS_SIDECAR_PROTOCOL_ERROR");
+            assert!(!error.retryable);
+        }
+    }
+
+    #[test]
+    fn relay_local_errors_preserve_their_phase_and_retry_policy() {
+        for (code, phase, retryable) in [
+            ("TLS_SIDECAR_UNAVAILABLE", "local", true),
+            ("TLS_SIDECAR_CONNECTION_ERROR", "local", true),
+            ("INVALID_TARGET", "local", false),
+            ("INVALID_PROXY", "local", false),
+            ("TLS_ERROR", "tls", false),
+            ("PROXY_AUTH_FAILED", "proxy", false),
+            ("CONNECT_TIMEOUT", "connect", true),
+            ("DNS_ERROR", "dns", true),
+            ("CONNECT_ERROR", "connect", true),
+            ("PROXY_CONNECT_ERROR", "proxy", true),
+            ("UPSTREAM_HEADERS_ERROR", "headers", true),
+        ] {
+            let response = relay_response(502, Some("1"), Some("sidecar"), Some(code));
+            let error = validate_relay_response(&response).unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.phase, phase);
+            assert_eq!(error.retryable, retryable);
+            assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        }
+    }
 
     #[test]
     fn forwarded_response_headers_are_lowercase() {

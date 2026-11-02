@@ -3,9 +3,15 @@
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
+use subtle::ConstantTimeEq;
 use url::Url;
 
 use crate::config::Config;
+
+/// Constant-time string comparison to prevent timing side-channels on token validation.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+}
 
 /// Standard protocol version header value.
 pub const PROTOCOL_VERSION: &str = "1";
@@ -21,6 +27,9 @@ pub const H_TARGET_URL: &str = "x-target-url";
 
 /// Header name for the optional proxy URL.
 pub const H_PROXY_URL: &str = "x-proxy-url";
+
+/// Selects the trusted Go relay configured by the parent, never a caller-supplied URL.
+pub const H_USE_TLS_SIDECAR: &str = "x-kiro-use-tls-sidecar";
 
 /// Response header indicating the source of the response.
 pub const H_RESPONSE_SOURCE: &str = "x-kiro-response-source";
@@ -96,6 +105,7 @@ impl IntoResponse for SidecarError {
 pub struct ControlHeaders {
     pub target_url: Url,
     pub proxy_url: Option<String>,
+    pub use_tls_sidecar: bool,
 }
 
 // ── extract_control_headers ─────────────────────────────────────────────
@@ -118,10 +128,25 @@ pub fn extract_control_headers(
 
     // 4. X-Proxy-Url: optional, but must be a valid URL if present
     let proxy_url = validate_proxy_url(headers)?;
+    let use_tls_sidecar = match headers.get(H_USE_TLS_SIDECAR) {
+        None => false,
+        Some(value) if value == "1" => true,
+        Some(_) => {
+            return Err(SidecarError {
+                status: StatusCode::BAD_REQUEST,
+                source: "sidecar",
+                code: "SIDECAR_PROTOCOL_ERROR",
+                phase: "local",
+                message: "invalid TLS sidecar mode".into(),
+                retryable: false,
+            })
+        }
+    };
 
     Ok(ControlHeaders {
         target_url,
         proxy_url,
+        use_tls_sidecar,
     })
 }
 
@@ -132,7 +157,7 @@ pub fn validate_auth(headers: &HeaderMap, config: &Config) -> Result<(), Sidecar
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if token != config.token {
+    if !constant_time_eq(token, &config.token) {
         return Err(SidecarError {
             status: StatusCode::UNAUTHORIZED,
             source: "sidecar",
@@ -199,10 +224,7 @@ fn validate_target_url(headers: &HeaderMap, config: &Config) -> Result<Url, Side
             source: "sidecar",
             code: "INVALID_TARGET",
             phase: "auth",
-            message: format!(
-                "target URL origin is not in the allowlist: {}",
-                url.origin().ascii_serialization()
-            ),
+            message: "target URL origin is not in the allowlist".into(),
             retryable: false,
         });
     }
@@ -327,6 +349,7 @@ mod tests {
             max_client_cache: 128,
             connect_timeout_secs: 10,
             transport_profile: "v1-aws-lc-rs".into(),
+            tls_sidecar_url: None,
         }
     }
 
@@ -340,6 +363,31 @@ mod tests {
             "https://q.us-east-1.amazonaws.com/invoke".parse().unwrap(),
         );
         h
+    }
+
+    #[test]
+    fn tls_sidecar_mode_requires_the_explicit_protocol_value() {
+        let config = test_config();
+        let mut headers = valid_headers();
+        assert!(
+            !extract_control_headers(&headers, &config)
+                .unwrap()
+                .use_tls_sidecar
+        );
+        headers.insert(H_USE_TLS_SIDECAR, "1".parse().unwrap());
+        assert!(
+            extract_control_headers(&headers, &config)
+                .unwrap()
+                .use_tls_sidecar
+        );
+
+        for value in ["", "0", "2", "true", "false", " 1"] {
+            headers.insert(H_USE_TLS_SIDECAR, value.parse().unwrap());
+            let error = extract_control_headers(&headers, &config).unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(error.code, "SIDECAR_PROTOCOL_ERROR");
+            assert!(!error.retryable);
+        }
     }
 
     #[test]
