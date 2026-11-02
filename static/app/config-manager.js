@@ -598,11 +598,18 @@ async function loadConfiguration() {
             });
         }
         
+        // Kiro Sidecar 配置
+        const kiroSidecarEnabledEl = document.getElementById('kiroSidecarEnabled');
+        const kiroSidecarPortEl = document.getElementById('kiroSidecarPort');
+
+        if (kiroSidecarEnabledEl) kiroSidecarEnabledEl.checked = data.KIRO_SIDECAR_ENABLED || false;
+        if (kiroSidecarPortEl) kiroSidecarPortEl.value = data.KIRO_SIDECAR_PORT || 9091;
+
         // 定时健康检查配置
         const scheduledHealthCheckEnabledEl = document.getElementById('scheduledHealthCheckEnabled');
         const scheduledHealthCheckStartupRunEl = document.getElementById('scheduledHealthCheckStartupRun');
         const scheduledHealthCheckIntervalEl = document.getElementById('scheduledHealthCheckInterval');
-        
+
         if (data.SCHEDULED_HEALTH_CHECK) {
             if (scheduledHealthCheckEnabledEl) scheduledHealthCheckEnabledEl.checked = data.SCHEDULED_HEALTH_CHECK.enabled === true;
             if (scheduledHealthCheckStartupRunEl) scheduledHealthCheckStartupRunEl.checked = data.SCHEDULED_HEALTH_CHECK.startupRun !== false;
@@ -772,7 +779,11 @@ async function saveConfiguration(options = {}) {
     } else {
         config.TLS_SIDECAR_ENABLED_PROVIDERS = [];
     }
-    
+
+    // Kiro Sidecar 配置
+    config.KIRO_SIDECAR_ENABLED = document.getElementById('kiroSidecarEnabled')?.checked || false;
+    config.KIRO_SIDECAR_PORT = parseInt(document.getElementById('kiroSidecarPort')?.value || 9091);
+
     // 定时健康检查配置
     const scheduledHealthCheckProvidersEl = document.getElementById('scheduledHealthCheckProviders');
     const scheduledHealthCheckProviderTypes = scheduledHealthCheckProvidersEl

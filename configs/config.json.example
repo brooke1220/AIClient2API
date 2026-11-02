@@ -98,5 +98,7 @@
     "LOG_MAX_FILES": 10,
     "TLS_SIDECAR_ENABLED": false,
     "TLS_SIDECAR_PORT": 9090,
+    "KIRO_SIDECAR_ENABLED": false,
+    "KIRO_SIDECAR_PORT": 9091,
     "UI_ENABLED": true
 }

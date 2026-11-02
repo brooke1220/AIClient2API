@@ -236,6 +236,21 @@
                     <small class="form-text" data-i18n="config.proxy.enabledProvidersNote">点击选择需要通过 TLS Sidecar 访问的提供商</small>
                 </div>
                 <small class="form-text" data-i18n="config.proxy.tlsSidecarNote">启用后选中的提供商请求将通过 Go uTLS sidecar 转发，完美模拟 Chrome TLS/H2 指纹绕过 Cloudflare（需重启服务）</small>
+                <hr>
+                <div class="config-row">
+                    <div class="form-group">
+                        <label data-i18n="config.proxy.kiroSidecarEnabled">Kiro Sidecar 传输代理</label>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="kiroSidecarEnabled">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label for="kiroSidecarPort" data-i18n="config.proxy.kiroSidecarPort">Sidecar 端口</label>
+                        <input type="number" id="kiroSidecarPort" class="form-control" min="1024" max="65535" value="9091">
+                    </div>
+                </div>
+                <small class="form-text" data-i18n="config.proxy.kiroSidecarNote">启用后 Kiro 请求将通过 Rust kiro-sidecar 传输代理转发（需重启服务）</small>
             </div>
 
             <!-- 服务治理与高可用 -->
