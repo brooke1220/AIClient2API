@@ -1,8 +1,19 @@
 # Kiro 生产保护与兼容性开关
 
-本次调整保留现有多协议出口和账号配置。流式与非流式生成共用 AWS 帧解码、工具参数组装和结束原因判断；实现为本项目独立代码，没有引入参考项目的运行环境或依赖。
+本次调整保留现有多协议出口和账号配置。流式与非流式生成共用 AWS 帧解码、工具参数组装和结束原因判断；实现为本项目独立代码。图片解码与缩放使用锁定版本的 `sharp`，不需要参考项目的 Rust 运行环境。
 
 ## 默认生效的保护
+
+- `/cc/v1/messages` 与普通消息端点默认实时输出。`message_start.usage` 先提供估算值（开启缓存 `estimate` 模式时输入与缓存改为零占位），最终用量在 `message_delta.usage` 更新；要求起始事件携带最终输入用量的旧客户端可以显式开启缓冲。
+- 原生 `metadataEvent.tokenUsage` 的非缓存输入、输出、缓存读取和缓存写入分别映射到 Claude 用量字段。同一调用的重复快照取最新有效值，不累加；缺失或非法字段保留已知值或原有估算。OpenAI/Responses 输入总数包含缓存读取和写入，缓存读取仍单独列出。
+- `CONTENT_FILTERED` 输出明确的拒答与 `stop_reason=refusal`，不会作为损坏流重试。原生思考签名和隐藏思考内容在 Claude 流式与非流式响应中保留；OpenAI Chat 使用 `finish_reason=content_filter`，Responses 使用 `incomplete_details.reason=content_filter`。
+- `meteringEvent` 的 `usage` 是本次调用的 credit 用量快照，不是 token。Claude、OpenAI Chat 和 Responses 的最终 `usage` 通过 `credit_usage`、`credit_unit` 和可选 `credit_unit_plural` 扩展字段返回最近一次有效值，不累加重复快照。
+- 显式模型不可用返回 503；上游错误地以 5xx 返回的明确请求格式错误转为 400；明确网关超时转为 504；请求体超过上游阈值转为 413。这些情况不会处罚账号或触发凭证切换。未知 5xx 保留原有恢复策略。
+- 明确账号限流（`USER_REQUEST_RATE_EXCEEDED`、`CREDIT_CONSUMPTION_RATE_EXCEEDED`、`SERVICE_REQUEST_RATE_EXCEEDED` 等）触发账号短冷却和切换，即使通用冷却开关关闭。明确模型容量不足的 429 直接返回，不处罚账号。非流式保留 `Retry-After` 响应头；SSE 已发出响应头时，在错误事件的 `error.retry_after` 返回原值（Responses 错误事件使用顶层 `retry_after`），同时带 `status`。模型暂不可用且上游未给重试时间时默认 5 秒。
+- HTTP 请求按客户端 API Key 的哈希隔离会话，优先读取 `metadata.session_id`、JSON `metadata.user_id.session_id`、Claude Code 的 `user_…_session_UUID`、`session_id` 或 `conversation_id`；缺失时从 system 与首条 user 消息生成稳定 ID。会话 ID 使用带客户端作用域的哈希派生 UUID，不在日志或上游载荷中暴露客户端 Key。
+- 会话账号绑定仅在上游返回成功响应头后建立，保存于内存，最多 8192 条，1 小时过期。优先使用仍健康、支持模型且有空闲并发的绑定账号；冷却、停用、刷新、排除和并发满时按现有选择规则继续恢复。绑定跟随账号状态，能够跨 UUID 轮换保留。共享同一个 API Key 的客户端属于同一作用域；应提供明确 session ID 以区分独立对话。
+- 图片按实际字节识别 PNG/JPEG/GIF/WebP，并验证可解码性；声明 MIME 不一致时纠正格式。默认将大图限制在长边 1568 像素、base64 400000 字节内；转换为 JPEG 时保持比例、透明区域铺白底。需要重编码的动画只保留首帧。源字节与解码像素都有预算，损坏图片在请求上游前返回 400，源体积超限或无法满足输出预算返回 413。
+- 工具缺少描述时使用工具名，保留参数 schema 的必填、枚举、组合与长度等约束。
 
 - 校验 prelude CRC 与 message CRC、帧头边界及 JSON；异常帧和 EOF 残帧不会被正常收尾。
 - 相同文本增量仍逐段保留，不以字符串相等判定重发。
@@ -38,6 +49,21 @@
 
 | 配置 | 默认值 | 说明 |
 | --- | ---: | --- |
+| `KIRO_CC_BUFFERED` | false | CC 端点显式开启整段缓冲，起始事件使用最终输入与缓存计数；代价是首字要等上游完成。节点配置优先。 |
+| `KIRO_MAX_BUFFERED_RESPONSE_BYTES` | 33554432 | 缓冲事件序列化后的 UTF-8 字节上限，超限关闭上游、返回错误并且不切号；不是 Node.js 堆内存的精确上限。 |
+| `KIRO_SESSION_AFFINITY` | true | 账号池按客户端作用域与会话进行软绑定；绑定账号需要等待速率预算时，优先切到额度和并发均可用的账号。没有可立即使用的账号时保留原有排队和评分选择。全局关闭后仍保留稳定的上游会话 ID。 |
+| `KIRO_ACCOUNT_MIN_INTERVAL_MS` | 0 | 每账号发起请求的最小间隔；0 关闭，节点可独立覆盖。不会在整个响应期间持有启动队列。 |
+| `KIRO_ACCOUNT_REQUESTS_PER_MINUTE` | 0 | 每账号滚动 60 秒的请求启动次数预算；0 关闭。重试也占次数，取消的等待不占次数。原有 `KIRO_REQUEST_MIN_INTERVAL_MS` 全局间隔仍可组合使用。 |
+| `KIRO_IMAGE_MAX_SOURCE_BYTES` | 10485760 | 单图解码前字节预算；先限制 base64 长度再解码。 |
+| `KIRO_IMAGE_MAX_PIXELS` | 40000000 | 单图解码像素预算，防止压缩图展开后过大。 |
+| `KIRO_IMAGE_MAX_EDGE` | 1568 | 自动缩放后的长边上限，不放大小图。 |
+| `KIRO_IMAGE_MAX_BASE64_BYTES` | 400000 | 单图发送给上游的 base64 字节预算，仍受最终 JSON 总体预算限制。 |
+| `KIRO_REQUEST_TRACE` | false | 每次生成上游尝试输出一条 `[Kiro Trace]` JSON 日志；同一请求重试共享 requestId，并递增 attempt。记录账号摘要、模型、路径类型、耗时、状态、首事件、原生用量与 credit。最终 `[Kiro Usage]` 记录实际返回用量、来源与可用的缓存计量详情，不记录提示词、工具参数、图片或凭证。 |
+| `KIRO_PROMPT_CACHE_MODE` | off | `observe` 只记录本地缓存估算日志，`estimate` 补全缺失的缓存字段；明确的上游值和零值优先。 |
+| `KIRO_PROMPT_CACHE_POLICY` | auto | 有缓存声明时使用 `explicit`，否则使用 `history`；可显式固定其中一种策略。 |
+| `KIRO_PROMPT_CACHE_DEFAULT_TTL_MS` | 300000 | 未声明 TTL 时的本地默认有效期，从上游请求发起时计算，最多 1 小时。 |
+| `KIRO_PROMPT_CACHE_MAX_ENTRIES` | 65536 | 进程内前缀账本上限，最多 1048576；重启后冷启动，多实例不共享。 |
+| `KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL` | `{}` | 按最终上游模型 ID 覆盖本地门槛，须为正整数；默认 Sonnet 1024，其它 4096，不代表已验证的 Kiro 门槛。 |
 | `SSE_HEARTBEAT_INTERVAL_MS` | 15000 | SSE 心跳间隔；0 关闭。不会在背压期间继续堆积心跳。 |
 | `KIRO_FIRST_EVENT_TIMEOUT_MS` | 30000 | 从实际发起上游请求开始，等待有意义的文本、思考或工具事件；元数据字节不算首事件。0 关闭。 |
 | `KIRO_REFRESH_AHEAD_MINUTES` | 10 | 请求侧与定时检查共用的提前续期窗口；独立于 `CRON_NEAR_MINUTES` 检查频率。必须是正数，无效值回退默认。 |
@@ -54,7 +80,7 @@
 | `KIRO_TRIM_HISTORY` | false | 显式开启后才能裁剪较旧的完整对话轮次；保留开头的 priming 对话和最近轮次，修复孤立工具结果，并添加省略提示。不会截短当前输入或工具参数，仍超限则返回 413。 |
 | `KIRO_HISTORY_IMAGE_MESSAGE_WINDOW` | 5 | 保留图片的历史消息距末尾最大距离，按过滤空消息、合并同角色消息后的序列计算，含 assistant 消息，不等于用户轮次数。`0` 只省略历史图片，当前消息图片仍保留；无效值回退默认。超窗口的图片留省略说明，不静默丢弃。 |
 | `KIRO_ENABLE_INFERENCE_CONFIG` | true | 将 `max_tokens`、`temperature`、`top_p` 映射到上游 `inferenceConfig`；保留 `temperature=0`。不支持该字段的自定义端点可关闭。参数仍需合法。 |
-| `KIRO_DYNAMIC_MODELS` | false | 开启账号隔离的动态模型列表和能力读取；关闭时继续使用配置模型列表。 |
+| `KIRO_DYNAMIC_MODELS` | false | 开启账号隔离的动态模型列表和能力读取；成功发现且缓存未过期时，账号池据此过滤不支持模型的账号（包括已知别名）。发现失败或过期不把静态回退列表当成账号能力。 |
 | `KIRO_MODEL_CACHE_TTL_MS` | 300000 | 动态元数据缓存 TTL；失败回退最多缓存 30 秒。0 禁用结果缓存，仍合并同时发起的相同读取。 |
 | `KIRO_MODELS_URL` | 未设置 | 覆盖模型发现 URL；API Key 的模型列表契约需单独验证，API Key 模式未提供该 URL 时保持静态列表。 |
 | `KIRO_API_KEY_RUNTIME_ENABLED` | false | 显式开启 API Key CLI runtime 路由；不会默认迁移现有 API Key 流量。 |
@@ -62,7 +88,7 @@
 
 生成流请求显式关闭继承的 Axios socket 超时，由以上三个 Kiro 请求级期限管理连接。因此关闭或延长某项期限不会再受原有 120 秒实例超时限制，消费者背压也不会触发该隐藏超时。Go 将入站请求的取消上下文传给出站请求，串联链路随 Node.js 取消而释放资源；Go 不额外施加覆盖整个响应正文的固定总超时。独立调用 Go relay，或关闭 Node.js 对应期限时，调用方需要自行提供取消或期限。认证刷新、模型发现、用量查询和错误响应体仍保留各自的期限。
 
-Kiro 的上游尝试期限与下游写入期限分别管理；上游结束不意味着客户端已经接收完数据。启用既有 `RATE_LIMIT_COOLDOWN_ENABLED` 后，Kiro 的显式 `Retry-After` 不再受 `RATE_LIMIT_COOLDOWN_MAX_MS` 截短，恢复时间不会早于上游要求；其它渠道保留原有策略。冷却默认开关不变。`REQUEST_MAX_RETRIES=0` 关闭 Kiro 网络重试，`CREDENTIAL_SWITCH_MAX_RETRIES=0` 关闭 Kiro 凭证切换重试；空响应预算仍由原有 `EMPTY_RESPONSE_MAX_RETRIES` 独立控制。
+Kiro 的上游尝试期限与下游写入期限分别管理；上游结束不意味着客户端已经接收完数据。Kiro 明确账号限流与启用 `RATE_LIMIT_COOLDOWN_ENABLED` 的通用限流，其显式 `Retry-After` 不受 `RATE_LIMIT_COOLDOWN_MAX_MS` 截短，恢复时间不会早于上游要求；模型容量限流不进入账号冷却，其它渠道保留原有策略。`REQUEST_MAX_RETRIES=0` 关闭 Kiro 网络重试，`CREDENTIAL_SWITCH_MAX_RETRIES=0` 关闭 Kiro 凭证切换重试；空响应预算仍由原有 `EMPTY_RESPONSE_MAX_RETRIES` 独立控制。
 
 `REQUEST_MAX_RETRIES` 默认 3，表示首次尝试之外的重试次数。Kiro 接受非负安全整数及转换后满足该条件的数字字符串（包括科学计数法）；负数、小数、空值或非法值回退为 3。既有配置没有约定额外的业务上限，本次不静默截短显式配置。重试采用指数退避，配置很大的次数会显著延长失败等待；应优先使用默认值或较小预算，并通过调用方取消控制整个请求生命周期。
 
@@ -74,7 +100,9 @@ Base64 独立缓存保存在凭证目录的 `.kiro-base64/<原始配置指纹>.j
 
 动态缓存按服务实例、认证、区域、profile、端点和代理身份隔离，最多缓存 16 个条目，并限制共享读取数量。发现请求总期限为 10 秒、响应体最多 1 MiB、分页最多 20 页；失败保留静态模型列表，不因为发现失败处罚生成账号。共享只读发现不会被一个调用方的取消打断。缓存不作为全局账号权限注册表，也不自动把新模型加入所有账号池。
 
-开启动态发现后，已发现模型的输出上限用于校验 `max_tokens`，输入容量用于上下文占用百分比的估算；显式配置的自定义上下文容量优先。真实上游 token 计数优先于估算，不伪造缓存命中或收费数据。
+账号池的模型能力快照另行绑定凭证来源及端点、代理配置的身份指纹。更换凭证来源或相关配置后，旧快照立即失效；旧配置下尚未完成的发现也不能回写新快照。配置重载仍保留活跃请求和等待队列，单纯 UUID 或 access token 轮换不清除同一来源的有效能力。选择账号时只读取速率预算，不提前占用启动次数；相同 API Key 或相同凭证文件共用预算，Base64 账号按各自稳定凭证文件隔离。
+
+开启动态发现后，已发现模型的输出上限用于校验 `max_tokens`，输入容量用于上下文占用百分比的估算；显式配置的自定义上下文容量优先。真实上游 token 计数优先于估算。缓存本地估算需显式启用，不代表上游实际缓存命中或收费数据；具体口径、来源与历史迁移见 [Kiro 缓存计量](KIRO_PROMPT_CACHE.md)。
 
 ## Sidecar 本机信任与证书更新
 

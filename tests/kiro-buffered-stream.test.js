@@ -4,6 +4,7 @@ jest.mock('open', () => ({ __esModule: true, default: jest.fn() }));
 jest.mock('../src/utils/logger.js', () => ({ __esModule: true, default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() } }));
 
 import { KiroApiService } from '../src/providers/claude/claude-kiro.js';
+import { KiroApiServiceAdapter } from '../src/providers/adapter.js';
 import { KIRO_TRUNCATION_NOTICE } from '../src/providers/claude/kiro-truncation-recovery.js';
 import { collect, frame, model, request, service, text, openStream, bounded, tick } from './helpers/kiro-safety-fixtures.js';
 
@@ -15,6 +16,27 @@ async function nextPrompt(backend) {
 }
 
 describe('buffered Kiro stream lifecycle and truncation recovery', () => {
+    test.each([false, true])('the selected CC node buffers=%s; live text arrives before upstream EOF', async buffered => {
+        const upstream = openStream();
+        const backend = service([], { KIRO_CC_BUFFERED: buffered });
+        backend._requestWithBuilderEndpointRouting.mockResolvedValue({ data: upstream });
+        const adapter = Object.create(KiroApiServiceAdapter.prototype); adapter.kiroApiService = backend;
+        const stream = adapter.generateContentStream(model, { ...request(), _ccEndpoint: true, _ccBuffered: !buffered });
+        let delivered = false;
+        const first = stream.next().then(result => { delivered = true; return result; });
+        try {
+            upstream.push(text('text before EOF'));
+            await tick();
+            expect(delivered).toBe(!buffered);
+            if (!buffered) {
+                expect((await bounded(first)).value.type).toBe('message_start');
+                expect((await bounded(stream.next())).value.type).toBe('content_block_start');
+                expect((await bounded(stream.next())).value.delta.text).toBe('text before EOF');
+            }
+            upstream.push(frame('metadataEvent', { stopReason: 'end_turn' })); upstream.push(null);
+            await bounded(first); await collect(stream);
+        } finally { upstream.destroy(); await first.catch(() => {}); await stream.return(); }
+    });
     test('holds output until completion and corrects the initial input token count', async () => {
         const upstream = openStream();
         const backend = service();

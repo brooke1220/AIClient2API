@@ -18,7 +18,8 @@ jest.mock('../src/utils/logger.js', () => ({
 }));
 
 import { CONFIG, initializeConfig } from '../src/core/config-manager.js';
-import { handleGetConfig, handleUpdateConfig } from '../src/ui-modules/config-api.js';
+import { handleGetConfig, handleUpdateConfig, reloadConfig } from '../src/ui-modules/config-api.js';
+import * as configManager from '../src/core/config-manager.js';
 import * as fileOperations from '../src/utils/file-lock.js';
 
 function response() {
@@ -35,7 +36,12 @@ describe('management configuration persistence', () => {
         KIRO_MODEL_CACHE_TTL_MS: 120000,
         KIRO_REFRESH_AHEAD_MINUTES: 2.5,
         KIRO_REFRESH_JITTER_MS: 1234,
-        KIRO_REFRESH_WAIT_TIMEOUT_MS: 45000
+        KIRO_REFRESH_WAIT_TIMEOUT_MS: 45000,
+        KIRO_PROMPT_CACHE_MODE: 'estimate',
+        KIRO_PROMPT_CACHE_POLICY: 'history',
+        KIRO_PROMPT_CACHE_DEFAULT_TTL_MS: 900001,
+        KIRO_PROMPT_CACHE_MAX_ENTRIES: 2048,
+        KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL: { 'claude-sonnet-4.5': 1536, 'claude-opus-4.5': 4096 }
     };
     const readSaved = () => fs.readFile(configPath, 'utf8').then(JSON.parse);
 
@@ -79,6 +85,15 @@ describe('management configuration persistence', () => {
         expect(reloaded).toMatchObject(settings);
     });
 
+    test('UI reload supplies new global settings before rebuilding provider status', async () => {
+        const reloaded = { ...settings, KIRO_MODELS_URL: 'https://new.invalid/models', providerPools: {} };
+        jest.spyOn(configManager, 'initializeConfig').mockResolvedValue(reloaded);
+        const manager = { globalConfig: { KIRO_MODELS_URL: 'https://old.invalid/models' },
+            initializeProviderStatus: jest.fn(function () { expect(this.globalConfig).toBe(reloaded); }) };
+        await expect(reloadConfig(manager)).resolves.toBe(reloaded);
+        expect(manager.initializeProviderStatus).toHaveBeenCalledWith(true);
+    });
+
     test('disabling discovery and setting zero cache and jitter survive a second save', async () => {
         expect((await save(settings)).statusCode).toBe(200);
         const disabled = { KIRO_DYNAMIC_MODELS: false, KIRO_MODEL_CACHE_TTL_MS: 0, KIRO_REFRESH_JITTER_MS: 0 };
@@ -97,7 +112,10 @@ describe('management configuration persistence', () => {
         expect(page.body).toMatchObject({
             KIRO_DYNAMIC_MODELS: false, KIRO_MODEL_CACHE_TTL_MS: 300000,
             KIRO_REFRESH_AHEAD_MINUTES: 10, KIRO_REFRESH_JITTER_MS: 30000,
-            KIRO_REFRESH_WAIT_TIMEOUT_MS: 15000
+            KIRO_REFRESH_WAIT_TIMEOUT_MS: 15000,
+            KIRO_PROMPT_CACHE_MODE: 'off', KIRO_PROMPT_CACHE_POLICY: 'auto',
+            KIRO_PROMPT_CACHE_DEFAULT_TTL_MS: 300000, KIRO_PROMPT_CACHE_MAX_ENTRIES: 65536,
+            KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL: {}
         });
         expect(page.body).not.toHaveProperty('KIRO_OAUTH_CREDS_FILE_PATH');
         expect(page.body).not.toHaveProperty('providerPools');
@@ -156,11 +174,40 @@ describe('management configuration persistence', () => {
     });
 
     test('normalizes boolean and numeric strings for Kiro settings', async () => {
-        const strings = Object.fromEntries(Object.entries(settings).map(([key, value]) => [key, String(value)]));
+        const strings = Object.fromEntries(Object.entries(settings).map(([key, value]) => [key,
+            typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([model, count]) => [model, String(count)])) : String(value)]));
         expect((await save(strings)).statusCode).toBe(200);
         expect(await readSaved()).toMatchObject(settings);
         expect((await save({ KIRO_DYNAMIC_MODELS: 'false' })).statusCode).toBe(200);
         expect(await readSaved()).toHaveProperty('KIRO_DYNAMIC_MODELS', false);
+    });
+
+    test('cache mode changes, model deletion and clearing overrides survive save and reload', async () => {
+        expect((await save(settings)).statusCode).toBe(200);
+        const edited = { KIRO_PROMPT_CACHE_MODE: 'off', KIRO_PROMPT_CACHE_POLICY: 'explicit',
+            KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL: { 'claude-sonnet-4.5': 2048 } };
+        expect((await save(edited)).statusCode).toBe(200);
+        expect((await initializeConfig([], configPath))).toMatchObject({ ...settings, ...edited });
+        expect((await save({ KIRO_PROMPT_CACHE_MODE: 'observe', KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL: {} })).statusCode).toBe(200);
+        const loaded = await initializeConfig([], configPath);
+        expect(loaded.KIRO_PROMPT_CACHE_MODE).toBe('observe');
+        expect(loaded.KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL).toEqual({});
+    });
+
+    test('a partial save retains cache settings edited directly on disk', async () => {
+        Object.assign(config, settings);
+        const changed = { ...settings, KIRO_PROMPT_CACHE_MODE: 'observe', KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL: { 'new-model': 2000 } };
+        await fs.writeFile(configPath, JSON.stringify(changed));
+        expect((await save({ REQUEST_MAX_RETRIES: 2 })).statusCode).toBe(200);
+        expect(await readSaved()).toMatchObject(changed);
+    });
+
+    test.each([
+        ['KIRO_PROMPT_CACHE_DEFAULT_TTL_MS', 1], ['KIRO_PROMPT_CACHE_DEFAULT_TTL_MS', 3600000],
+        ['KIRO_PROMPT_CACHE_MAX_ENTRIES', 1], ['KIRO_PROMPT_CACHE_MAX_ENTRIES', 1048576]
+    ])('accepts the boundary %s = %p', async (field, value) => {
+        expect((await save({ [field]: value })).statusCode).toBe(200);
+        expect(await readSaved()).toHaveProperty(field, value);
     });
 
     test.each([
@@ -170,7 +217,22 @@ describe('management configuration persistence', () => {
         ['KIRO_REFRESH_AHEAD_MINUTES', 0], ['KIRO_REFRESH_AHEAD_MINUTES', -1],
         ['KIRO_REFRESH_AHEAD_MINUTES', 'invalid'], ['KIRO_REFRESH_JITTER_MS', -1],
         ['KIRO_REFRESH_JITTER_MS', true], ['KIRO_REFRESH_JITTER_MS', []],
-        ['KIRO_REFRESH_WAIT_TIMEOUT_MS', 0], ['KIRO_REFRESH_WAIT_TIMEOUT_MS', 2147483648]
+        ['KIRO_REFRESH_WAIT_TIMEOUT_MS', 0], ['KIRO_REFRESH_WAIT_TIMEOUT_MS', 2147483648],
+        ['KIRO_PROMPT_CACHE_MODE', 'invalid'], ['KIRO_PROMPT_CACHE_MODE', null],
+        ['KIRO_PROMPT_CACHE_MODE', true], ['KIRO_PROMPT_CACHE_POLICY', 'invalid'],
+        ['KIRO_PROMPT_CACHE_POLICY', []], ['KIRO_PROMPT_CACHE_DEFAULT_TTL_MS', 0],
+        ['KIRO_PROMPT_CACHE_DEFAULT_TTL_MS', 1.5], ['KIRO_PROMPT_CACHE_DEFAULT_TTL_MS', 3600001],
+        ['KIRO_PROMPT_CACHE_DEFAULT_TTL_MS', ''], ['KIRO_PROMPT_CACHE_DEFAULT_TTL_MS', null],
+        ['KIRO_PROMPT_CACHE_MAX_ENTRIES', 0], ['KIRO_PROMPT_CACHE_MAX_ENTRIES', 1048577],
+        ['KIRO_PROMPT_CACHE_MAX_ENTRIES', 1.5], ['KIRO_PROMPT_CACHE_MAX_ENTRIES', false],
+        ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', []], ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', null],
+        ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', 'invalid'], ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', { '': 10 }],
+        ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', { ' model ': 10 }], ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', { model: 0 }],
+        ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', { model: 1.5 }], ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', { model: null }],
+        ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', { model: true }], ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', { model: [] }],
+        ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', { model: Number.MAX_SAFE_INTEGER + 1 }],
+        ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', JSON.parse('{"__proto__":1024}')],
+        ['KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL', { constructor: 1024 }]
     ])('rejects invalid %s = %p before updating memory or disk', async (field, value) => {
         const original = { ...config, ...settings };
         Object.assign(config, original);

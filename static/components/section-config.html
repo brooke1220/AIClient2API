@@ -296,6 +296,53 @@
                 <small class="form-text" data-i18n="config.kiroSettings.scopeNote">保存后自动重载并生效；节点单独设置的同名配置优先。</small>
             </div>
 
+            <!-- Kiro 缓存计量 -->
+            <div class="config-group-section" id="kiroPromptCacheSettings">
+                <h3><i class="fas fa-database" aria-hidden="true"></i> <span data-i18n="config.kiroSettings.cacheTitle">Kiro 缓存计量</span></h3>
+                <p class="form-text" data-i18n="config.kiroSettings.cacheNote">上游返回值始终优先。本地估算用于补充缺失的缓存统计，不代表实际命中或 credit 节省；建议先使用“仅观察”。</p>
+                <div class="config-row">
+                    <div class="form-group">
+                        <label for="kiroPromptCacheMode" data-i18n="config.kiroSettings.cacheMode">缓存计量模式</label>
+                        <select id="kiroPromptCacheMode" class="form-control" aria-describedby="kiroPromptCacheModeNote">
+                            <option value="off" data-i18n="config.kiroSettings.cacheModeOff">关闭本地估算</option>
+                            <option value="observe" data-i18n="config.kiroSettings.cacheModeObserve">仅观察（只记录日志）</option>
+                            <option value="estimate" data-i18n="config.kiroSettings.cacheModeEstimate">启用估算（补全接口统计）</option>
+                        </select>
+                        <small id="kiroPromptCacheModeNote" class="form-text" data-i18n="config.kiroSettings.cacheModeNote">关闭时仍保留上游缓存数据；仅观察时不向客户端返回估算值。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="kiroPromptCachePolicy" data-i18n="config.kiroSettings.cachePolicy">缓存估算策略</label>
+                        <select id="kiroPromptCachePolicy" class="form-control" aria-describedby="kiroPromptCachePolicyNote">
+                            <option value="auto" data-i18n="config.kiroSettings.cachePolicyAuto">自动</option>
+                            <option value="explicit" data-i18n="config.kiroSettings.cachePolicyExplicit">显式缓存断点</option>
+                            <option value="history" data-i18n="config.kiroSettings.cachePolicyHistory">稳定历史前缀</option>
+                        </select>
+                        <small id="kiroPromptCachePolicyNote" class="form-text" data-i18n="config.kiroSettings.cachePolicyNote">自动：有缓存声明时按声明处理，否则估算工具、系统提示和历史前缀。历史策略不主动缓存本轮用户输入。</small>
+                    </div>
+                </div>
+                <div class="config-row">
+                    <div class="form-group">
+                        <label for="kiroPromptCacheTtlSeconds" data-i18n="config.kiroSettings.cacheTtl">默认有效期（秒）</label>
+                        <input type="number" id="kiroPromptCacheTtlSeconds" class="form-control" min="0.001" max="3600" step="0.001" value="300" required aria-describedby="kiroPromptCacheTtlNote">
+                        <small id="kiroPromptCacheTtlNote" class="form-text" data-i18n="config.kiroSettings.cacheTtlNote">未声明有效期时使用；默认 300 秒，最多 3600 秒，支持三位小数。显式 5 分钟或 1 小时声明优先。</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="kiroPromptCacheMaxEntries" data-i18n="config.kiroSettings.cacheMaxEntries">账本条目上限</label>
+                        <input type="number" id="kiroPromptCacheMaxEntries" class="form-control" min="1" max="1048576" step="1" value="65536" required aria-describedby="kiroPromptCacheMaxEntriesNote">
+                        <small id="kiroPromptCacheMaxEntriesNote" class="form-text" data-i18n="config.kiroSettings.cacheMaxEntriesNote">取值 1–1048576，默认 65536。账本保存在当前进程内存中，重启后重新计量，多实例不共享。</small>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <div class="config-inline-heading">
+                        <span id="kiroPromptCacheModelsLabel" data-i18n="config.kiroSettings.cacheModels">各模型最小缓存长度</span>
+                        <small id="kiroPromptCacheModelsNote" data-i18n="config.kiroSettings.cacheModelsNote">按最终上游模型 ID 设置正整数 Token 门槛。不添加覆盖时，Sonnet 默认 1024，其它模型默认 4096；这是本地估算规则。</small>
+                    </div>
+                    <div id="kiroPromptCacheModels" aria-labelledby="kiroPromptCacheModelsLabel" aria-describedby="kiroPromptCacheModelsNote"></div>
+                    <button type="button" id="kiroPromptCacheAddModel" class="btn btn-secondary"><i class="fas fa-plus" aria-hidden="true"></i> <span data-i18n="config.kiroSettings.cacheAddModel">添加模型覆盖</span></button>
+                </div>
+                <small class="form-text" data-i18n="config.kiroSettings.scopeNote">保存后自动重载并生效；节点单独设置的同名配置优先。</small>
+            </div>
+
             <!-- 服务治理与高可用 -->
             <div class="config-group-section">
                 <h3><i class="fas fa-shield-alt"></i> <span data-i18n="config.governance.title">服务治理</span></h3>

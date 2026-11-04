@@ -45,7 +45,6 @@
       .row .btn { width: 100%; }
       
       .stats { grid-template-columns: 1fr 1fr !important; gap: 12px !important; }
-      .stats article:last-child { grid-column: span 2; }
       .card { padding: 16px; }
       .card-value { font-size: 20px; }
       .note { font-size: 11px; }
@@ -338,7 +337,7 @@
     }
 
     .stats {
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      grid-template-columns: repeat(3, minmax(0, 1fr));
       margin-bottom: 24px;
     }
 
@@ -854,8 +853,9 @@
         <div class="card-value" id="totalRequests">0</div>
         <div class="note">QPS: <span id="currentQps" style="font-weight:700;color:var(--primary-color)">0.00</span> (峰值: <span id="maxQps">0.00</span>) | RPM: <span id="currentRpm" style="font-weight:700;color:var(--primary-color)">0.00</span> (峰值: <span id="maxRpm">0.00</span>)</div>
       </article>
-      <article class="card blue"><div class="card-label">输入 Token</div><div class="card-value" id="promptTokens">0</div><div class="note">输入 token 的累计值</div></article>
-      <article class="card cyan"><div class="card-label">缓存 Token</div><div class="card-value" id="cachedTokens">0</div><div class="note">缓存命中的累计值</div></article>
+      <article class="card blue"><div class="card-label">输入 Token（含缓存）</div><div class="card-value" id="promptTokens">0</div><div class="note">未缓存输入、缓存读取与写入的合计</div></article>
+      <article class="card cyan"><div class="card-label">缓存读取 Token</div><div class="card-value" id="cachedTokens">0</div><div class="note">包含上游返回值及启用后的本地估算</div></article>
+      <article class="card cyan"><div class="card-label">缓存写入 Token</div><div class="card-value" id="cacheCreationTokens">0</div><div class="note">新增缓存前缀；历史缺失数据未补算</div></article>
       <article class="card indigo"><div class="card-label">输出 Token</div><div class="card-value" id="completionTokens">0</div><div class="note">输出 token 的累计值</div></article>
       <article class="card orange">
         <div class="card-label">总 Token</div>
@@ -863,6 +863,7 @@
         <div class="note">TPS: <span id="currentTps" style="font-weight:700;color:var(--primary-color)">0.00</span> (峰值: <span id="maxTps">0.00</span>) | <span id="updatedAt">等待数据</span></div>
       </article>
     </section>
+    <p class="footer" id="cacheStatsNote">缓存来源随请求记录；本地估算不代表 Kiro 实际扣费或实际缓存命中。</p>
     
     <section class="split">
       <div class="panel calendar-panel" style="margin-bottom: 0;">
@@ -902,6 +903,8 @@
             <option value="totalTokens-desc">按总 Token 降序</option>
             <option value="requestCount-desc">按请求数降序</option>
             <option value="promptTokens-desc">按输入 Token 降序</option>
+            <option value="cachedTokens-desc">按缓存读取降序</option>
+            <option value="cacheCreationTokens-desc">按缓存写入降序</option>
             <option value="completionTokens-desc">按输出 Token 降序</option>
             <option value="provider-asc">按 Provider 升序</option>
             <option value="model-asc">按 Model 升序</option>
@@ -910,7 +913,7 @@
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Provider</th><th>Model</th><th>请求数</th><th>Prompt</th><th>Cached</th><th>Completion</th><th>Total</th><th>最近使用</th></tr></thead>
+          <thead><tr><th>Provider</th><th>Model</th><th>请求数</th><th>输入（含缓存）</th><th>缓存读取</th><th>缓存写入</th><th>缓存来源（请求数）</th><th>输出</th><th>总量</th><th>最近使用</th></tr></thead>
           <tbody id="tableBody"></tbody>
         </table>
       </div>
@@ -1067,11 +1070,20 @@
       })
     }
 
+    function cacheSourceText(s) {
+      const known = Number(s.cacheProviderRequests || 0) + Number(s.cacheEstimatedRequests || 0) + Number(s.cacheMixedRequests || 0);
+      const unknown = s.cacheUnavailableRequests ?? Math.max(0, Number(s.requestCount || 0) - known);
+      return `上游 ${fmt(s.cacheProviderRequests)} · 估算 ${fmt(s.cacheEstimatedRequests)} · 混合 ${fmt(s.cacheMixedRequests)} · 未标注 ${fmt(unknown)}`;
+    }
+
     function renderSummary(data) {
       const s = data.summary || {};
       el('totalRequests').textContent = fmt(s.requestCount);
       el('promptTokens').textContent = fmtToken(s.promptTokens);
       el('cachedTokens').textContent = fmtToken(s.cachedTokens);
+      el('cacheCreationTokens').textContent = fmtToken(s.cacheCreationTokens);
+      const since = data.cacheStatsStartedAt ? `；读写来源自 ${new Date(data.cacheStatsStartedAt).toLocaleString('zh-CN')} 起记录` : '';
+      el('cacheStatsNote').textContent = `缓存来源（请求数）：${cacheSourceText(s)}${since}。本地估算不代表 Kiro 实际扣费或实际缓存命中；0 也可能表示上游未提供、估算未启用或历史缺失。`;
       el('completionTokens').textContent = fmtToken(s.completionTokens);
       el('totalTokens').textContent = fmtToken(s.totalTokens);
       el('currentQps').textContent = (s.qps || 0).toFixed(2);
@@ -1099,7 +1111,7 @@
         const s = p.data.summary || {};
         const node = document.createElement('article');
         node.className = 'provider';
-        node.innerHTML = `<div class="provider-head"><div><div class="provider-name">${p.name}</div><div class="provider-sub">包含 ${fmt(p.count)} 个模型</div></div><span class="provider-badge"><i class="fas fa-bolt"></i>${fmt(s.requestCount)} 次调用</span></div><div class="mini"><div class="mini-box"><div class="mini-label">总 Token</div><div class="mini-value">${fmtToken(s.totalTokens)}</div></div><div class="mini-box"><div class="mini-label">输入</div><div class="mini-value">${fmtToken(s.promptTokens)}</div></div><div class="mini-box"><div class="mini-label">输出</div><div class="mini-value">${fmtToken(s.completionTokens)}</div></div><div class="mini-box"><div class="mini-label">QPS / RPM</div><div class="mini-value">${(s.qps || 0).toFixed(2)} / ${(s.rpm || 0).toFixed(2)}</div></div><div class="mini-box"><div class="mini-label">TPS</div><div class="mini-value">${(s.tps || 0).toFixed(2)}</div></div><div class="mini-box"><div class="mini-label">最近使用</div><div class="mini-value" style="font-size:14px">${rel(s.lastUsedAt)}</div></div></div>`;
+        node.innerHTML = `<div class="provider-head"><div><div class="provider-name">${p.name}</div><div class="provider-sub">包含 ${fmt(p.count)} 个模型</div></div><span class="provider-badge"><i class="fas fa-bolt"></i>${fmt(s.requestCount)} 次调用</span></div><div class="mini"><div class="mini-box"><div class="mini-label">总 Token</div><div class="mini-value">${fmtToken(s.totalTokens)}</div></div><div class="mini-box"><div class="mini-label">输入</div><div class="mini-value">${fmtToken(s.promptTokens)}</div></div><div class="mini-box"><div class="mini-label">缓存读取</div><div class="mini-value">${fmtToken(s.cachedTokens)}</div></div><div class="mini-box"><div class="mini-label">缓存写入</div><div class="mini-value">${fmtToken(s.cacheCreationTokens)}</div></div><div class="mini-box"><div class="mini-label">缓存来源（请求数）</div><div class="note">${cacheSourceText(s)}</div></div><div class="mini-box"><div class="mini-label">输出</div><div class="mini-value">${fmtToken(s.completionTokens)}</div></div><div class="mini-box"><div class="mini-label">QPS / RPM</div><div class="mini-value">${(s.qps || 0).toFixed(2)} / ${(s.rpm || 0).toFixed(2)}</div></div><div class="mini-box"><div class="mini-label">TPS</div><div class="mini-value">${(s.tps || 0).toFixed(2)}</div></div><div class="mini-box"><div class="mini-label">最近使用</div><div class="mini-value" style="font-size:14px">${rel(s.lastUsedAt)}</div></div></div>`;
         box.appendChild(node)
       })
     }
@@ -1126,12 +1138,12 @@
         list = filteredRows();
       tbody.innerHTML = '';
       if (!list.length) {
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--text-tertiary)">没有匹配的数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text-tertiary)">没有匹配的数据</td></tr>';
         return
       }
       list.forEach(r => {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td><span class="tag"><i class="fas fa-server"></i>${r.provider}</span></td><td>${r.model}</td><td class="mono">${fmt(r.requestCount)}</td><td class="mono">${fmtToken(r.promptTokens)}</td><td class="mono">${fmtToken(r.cachedTokens)}</td><td class="mono">${fmtToken(r.completionTokens)}</td><td class="mono">${fmtToken(r.totalTokens)}</td><td>${rel(r.lastUsedAt)}</td>`;
+        tr.innerHTML = `<td><span class="tag"><i class="fas fa-server"></i>${r.provider}</span></td><td>${r.model}</td><td class="mono">${fmt(r.requestCount)}</td><td class="mono">${fmtToken(r.promptTokens)}</td><td class="mono">${fmtToken(r.cachedTokens)}</td><td class="mono">${fmtToken(r.cacheCreationTokens)}</td><td>${cacheSourceText(r)}</td><td class="mono">${fmtToken(r.completionTokens)}</td><td class="mono">${fmtToken(r.totalTokens)}</td><td>${rel(r.lastUsedAt)}</td>`;
         tbody.appendChild(tr)
       })
     }

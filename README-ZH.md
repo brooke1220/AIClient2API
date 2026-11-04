@@ -564,6 +564,14 @@ Claude 强度来源的优先级为 `reasoning_effort` > `output_config.effort` >
 
 图片 token 计数仍是每张已透传图片约 1600 token 的本地粗估，不是上游实际用量；无法透传的图片不计入。日志 `Converted request images` 在请求含图片时记录最终保留的图片数量和 base64 字节数，不输出图片内容；可结合排队、上游首事件和首个可见文本日志分析延迟。提高窗口可能增加请求负载，默认值保持不变。
 
+#### Kiro 缓存读取与写入计量
+
+当 Kiro 未返回缓存明细时，可开启本地前缀估算。默认 `KIRO_PROMPT_CACHE_MODE="off"`；设置为 `"observe"` 可只在日志观察，设置为 `"estimate"` 则向客户端补全缺失的缓存计数。上游明确返回的值（包括 `0`）始终优先。本地估算不代表真实命中或实际 credit 节省。
+
+后台 **配置管理 → Kiro 缓存计量** 可直接调整这五项设置，包括逐行编辑模型门槛；保存后自动重载并应用到后续请求。
+
+在 `configs/config.json` 或 Kiro 账号池节点配置 `KIRO_PROMPT_CACHE_MODE` 和 `KIRO_PROMPT_CACHE_POLICY`（默认 `"auto"`）：有 `cache_control` 时按显式断点处理，无声明时估算工具、system 与历史前缀。统计页新增缓存读写及数据来源。普通实时流在估算模式下使用起始零占位，最终用量由 `message_delta` 更新；缓冲流回填起始用量。配置示例、TTL、模型门槛、内存限制和历史统计迁移见 [Kiro 缓存计量说明](docs/KIRO_PROMPT_CACHE.md)。
+
 #### Codex OAuth 配置
 1. **生成授权**：在 Web UI 的"提供商池"或"配置管理"页面，点击 Codex 的"生成授权"按钮
 2. **浏览器登录**：系统将打开 OpenAI Codex 授权页面，完成 OAuth 登录

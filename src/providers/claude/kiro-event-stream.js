@@ -199,6 +199,7 @@ export function normalizeKiroStopReason(value) {
     const normalized = String(value).replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
     const reasons = { stop: 'end_turn', end_turn: 'end_turn', tool_use: 'tool_use', tool_calls: 'tool_use',
         max_tokens: 'max_tokens', max_output_tokens: 'max_tokens', length: 'max_tokens',
-        model_context_window_exceeded: 'max_tokens', stop_sequence: 'stop_sequence' };
+        model_context_window_exceeded: 'max_tokens', stop_sequence: 'stop_sequence',
+        content_filtered: 'refusal', refusal: 'refusal' };
     return Object.hasOwn(reasons, normalized) ? reasons[normalized] : null;
 }

@@ -13,7 +13,7 @@ import { getKiroImagePayloadStats } from '../src/providers/claude/kiro-message-c
 import { countTokensAnthropic, ESTIMATED_IMAGE_TOKENS } from '../src/utils/token-utils.js';
 import { model, service, text, collect } from './helpers/kiro-safety-fixtures.js';
 
-const DATA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9FcAAAAASUVORK5CYII=';
+const DATA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWP4////fwAJ+wP9CNHoHgAAAABJRU5ErkJggg==';
 const CALL_ID = 'call_capture';
 const image = (data = DATA) => ({ type: 'input_image', image_url: `data:image/png;base64,${data}` });
 const claudeImage = () => ({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: DATA } });
@@ -195,7 +195,7 @@ describe('Responses conversion followed by the real Kiro request builder', () =>
     });
 
     test('includes converted tool images in the payload byte budget', async () => {
-        await expect(build(request([image(DATA.repeat(1000))]), { KIRO_MAX_PAYLOAD_BYTES: 3000 })).rejects.toMatchObject({ status: 413 });
+        await expect(build(request(Array.from({ length: 30 }, () => image())), { KIRO_MAX_PAYLOAD_BYTES: 3000 })).rejects.toMatchObject({ status: 413 });
     });
 
     test.each(['unary', 'stream'])('%s generation transports the converted image structure', async mode => {

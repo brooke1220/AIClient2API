@@ -633,6 +633,23 @@ input:checked + .toggle-slider:before {
     line-height: 1.5;
 }
 
+.kiro-cache-model-row {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 1rem;
+    margin-bottom: 1rem;
+}
+
+.kiro-cache-model-row .form-group {
+    min-width: 0;
+    margin-bottom: 0;
+}
+
+.kiro-cache-model-remove {
+    min-height: 42px;
+}
+
 /* 响应式调整 */
 @media (max-width: 768px) {
     .form-row, .config-row {
@@ -646,6 +663,17 @@ input:checked + .toggle-slider:before {
     
     .config-group-section {
         padding: 1rem;
+    }
+
+    .kiro-cache-model-row {
+        grid-template-columns: minmax(0, 1fr);
+        padding: 1rem;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-lg);
+    }
+
+    .kiro-cache-model-remove {
+        justify-self: start;
     }
 }
 

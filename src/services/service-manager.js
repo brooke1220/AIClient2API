@@ -274,6 +274,7 @@ export async function initApiService(config, isReady = false) {
 
     // Initialize or update ProviderPoolManager
     if (providerPoolManager) {
+        providerPoolManager.globalConfig = config;
         providerPoolManager.providerPools = config.providerPools || {};
         providerPoolManager.initializeProviderStatus();
         logger.info('[Initialization] ProviderPoolManager existing instance updated.');

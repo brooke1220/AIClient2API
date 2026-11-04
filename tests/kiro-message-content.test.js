@@ -7,7 +7,7 @@ import { convertKiroUserContent, getKiroHistoryImageMessageWindow, getKiroImageP
 import { guardKiroPayload } from '../src/providers/claude/kiro-request-guards.js';
 import { model, service, text, collect } from './helpers/kiro-safety-fixtures.js';
 
-const DATA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a9FcAAAAASUVORK5CYII=';
+const DATA = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAADUlEQVQImWP4////fwAJ+wP9CNHoHgAAAABJRU5ErkJggg==';
 const image = (data = DATA, media_type = 'image/png') => ({ type: 'image', source: { type: 'base64', media_type, data } });
 const toolResult = (content, options = {}) => ({ type: 'tool_result', tool_use_id: 'toolu_capture', content, ...options });
 const kiroImage = (data = DATA, format = 'png') => ({ format, source: { bytes: data } });
@@ -170,10 +170,10 @@ describe('actual Kiro request-builder regression coverage', () => {
         expect(payload.conversationState.history.at(-1)).toHaveProperty('assistantResponseMessage');
     });
     test.each([false, true])('duplicate results are consistently deduplicated on historical=%p path', async historical => {
-        const payload = await backend().buildCodewhispererRequest(conversation([toolResult([image('first')]), toolResult([image('second')])], historical), model, tools);
+        const payload = await backend().buildCodewhispererRequest(conversation([toolResult([image()]), toolResult([image('discarded')])], historical), model, tools);
         const user = resultUser(payload, historical);
         expect(user.userInputMessageContext.toolResults).toHaveLength(1);
-        expect(user.images).toEqual([kiroImage('first')]);
+        expect(user.images).toEqual([kiroImage()]);
     });
     test.each([[6, true], [7, false]])('first user image retains the old default boundary for %i processed messages', async (length, kept) => {
         const messages = Array.from({ length }, (_, i) => ({ role: i % 2 ? 'assistant' : 'user', content: i === 0 ? [image()] : `turn ${i}` }));
@@ -220,7 +220,7 @@ describe('actual Kiro request-builder regression coverage', () => {
         expect(user.userInputMessageContext.toolResults[0].content[0].text).toContain('not forwarded');
     });
     test('the final byte guard includes tool images instead of silently losing them', async () => {
-        await expect(backend({ KIRO_MAX_PAYLOAD_BYTES: 3000 }).buildCodewhispererRequest(conversation([toolResult([image(DATA.repeat(1000))])]), model, tools)).rejects.toMatchObject({ status: 413 });
+        await expect(backend({ KIRO_MAX_PAYLOAD_BYTES: 3000 }).buildCodewhispererRequest(conversation([toolResult(Array.from({ length: 30 }, () => image()))]), model, tools)).rejects.toMatchObject({ status: 413 });
     });
     test.each([false, true])('an orphaned first-message tool result (is_error=%p) becomes text, never an unpaired toolResult', async is_error => {
         const messages = [

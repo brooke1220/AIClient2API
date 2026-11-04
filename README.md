@@ -546,6 +546,14 @@ The first history message has no preceding assistant turn, so a tool result ther
 
 Image token counts remain a local approximation of roughly 1600 tokens per forwarded image, not actual upstream usage; images that cannot be forwarded are not counted. The `Converted request images` log records the final retained image count and base64 byte size without logging image content, and pairs well with the queueing, upstream-first-event and first-visible-text logs when investigating latency. Raising the window may increase request size; the default is unchanged.
 
+#### Kiro Cache Read and Write Accounting
+
+When Kiro omits cache details, optional local prefix accounting can estimate them. `KIRO_PROMPT_CACHE_MODE` defaults to `"off"`. Use `"observe"` for log-only comparison, then `"estimate"` to fill missing cache counts. Explicit provider values, including zero, always win. Estimates do not establish actual upstream hits or credit savings.
+
+Use **Configuration → Kiro Cache Accounting** to edit all five settings, including model threshold rows. Saving automatically reloads the configuration for subsequent requests.
+
+Configure the mode globally in `configs/config.json` or on a Kiro pool node. `KIRO_PROMPT_CACHE_POLICY="auto"` follows explicit `cache_control` declarations when present and otherwise estimates stable tools, system and history prefixes. Model statistics display reads, writes and provenance. In estimate mode, live streams start with zero input/cache placeholders and provide final usage in `message_delta`; buffered streams backfill initial usage. The ledger is bounded, in memory and local to each process. See [Kiro cache accounting](docs/KIRO_PROMPT_CACHE.md) for configuration, TTLs, model thresholds and statistics migration.
+
 #### Codex OAuth Configuration
 1. **Generate Authorization**: On the Web UI "Provider Pools" or "Configuration" page, click the "Generate Authorization" button for Codex
 2. **Browser Login**: The system opens the OpenAI Codex authorization page to complete OAuth login

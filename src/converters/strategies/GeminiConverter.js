@@ -14,7 +14,8 @@ import {
     OPENAI_DEFAULT_TOP_P,
     CLAUDE_DEFAULT_MAX_TOKENS,
     CLAUDE_DEFAULT_TEMPERATURE,
-    CLAUDE_DEFAULT_TOP_P
+    CLAUDE_DEFAULT_TOP_P,
+    toClaudeInputUsage
 } from '../utils.js';
 import { MODEL_PROTOCOL_PREFIX } from '../../utils/common.js';
 import {
@@ -764,9 +765,8 @@ export class GeminiConverter extends BaseConverter {
             stop_reason: stopReason,
             stop_sequence: null,
             usage: {
-                input_tokens: geminiResponse.usageMetadata?.promptTokenCount || 0,
+                ...toClaudeInputUsage(geminiResponse.usageMetadata?.promptTokenCount, geminiResponse.usageMetadata?.cachedContentTokenCount),
                 cache_creation_input_tokens: 0,
-                cache_read_input_tokens: geminiResponse.usageMetadata?.cachedContentTokenCount || 0,
                 output_tokens: geminiResponse.usageMetadata?.candidatesTokenCount || 0
             }
         };
@@ -882,9 +882,8 @@ export class GeminiConverter extends BaseConverter {
                         };
                         if (geminiChunk.usageMetadata) {
                             messageDelta.usage = {
-                                input_tokens: geminiChunk.usageMetadata.promptTokenCount || 0,
+                                ...toClaudeInputUsage(geminiChunk.usageMetadata.promptTokenCount, geminiChunk.usageMetadata.cachedContentTokenCount),
                                 cache_creation_input_tokens: 0,
-                                cache_read_input_tokens: geminiChunk.usageMetadata.cachedContentTokenCount || 0,
                                 output_tokens: geminiChunk.usageMetadata.candidatesTokenCount || 0
                             };
                         }
@@ -913,9 +912,8 @@ export class GeminiConverter extends BaseConverter {
                     // 添加 usage 信息
                     if (geminiChunk.usageMetadata) {
                         result.usage = {
-                            input_tokens: geminiChunk.usageMetadata.promptTokenCount || 0,
+                            ...toClaudeInputUsage(geminiChunk.usageMetadata.promptTokenCount, geminiChunk.usageMetadata.cachedContentTokenCount),
                             cache_creation_input_tokens: 0,
-                            cache_read_input_tokens: geminiChunk.usageMetadata.cachedContentTokenCount || 0,
                             output_tokens: geminiChunk.usageMetadata.candidatesTokenCount || 0,
                             prompt_tokens: geminiChunk.usageMetadata.promptTokenCount || 0,
                             completion_tokens: geminiChunk.usageMetadata.candidatesTokenCount || 0,

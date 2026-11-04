@@ -19,6 +19,9 @@ import {
 import { broadcastEvent } from '../ui-modules/event-broadcast.js';
 import { ENDPOINT_TYPE } from '../utils/common.js';
 import { quotaFamilyForModel } from './gemini/antigravity-quota-family.js';
+import { KiroSessionAffinity } from './claude/kiro-session.js';
+import { kiroAccountBudget, kiroBudgetKeyForConfig } from './claude/kiro-account-budget.js';
+import { kiroModelCapabilityScope } from './claude/kiro-model-cache.js';
 
 function kiroPauseSnapshot(provider, config) {
     return JSON.stringify([
@@ -85,6 +88,7 @@ export class ProviderPoolManager {
         this.providerPools = providerPools;
         this.globalConfig = options.globalConfig || {}; // 存储全局配置
         this.providerStatus = {}; // Tracks health and usage for each provider instance
+        this._kiroSessionAffinity = new KiroSessionAffinity();
         this.roundRobinIndex = {}; // Tracks the current index for round-robin selection for each provider type
         // 使用 ?? 运算符确保 0 也能被正确设置，而不是被 || 替换为默认值
         this.maxErrorCount = options.maxErrorCount ?? 10; // Default to 10 errors before marking unhealthy
@@ -358,6 +362,24 @@ export class ProviderPoolManager {
         // still finishing persistence. A version change alone is not enough.
         return () => (state._kiroCredentialVersion || 0) > version &&
             (!state._kiroCredentialFingerprint || state._kiroCredentialFingerprint !== fingerprint);
+    }
+
+    captureKiroSessionBinding(providerType, uuid, sessionKey) {
+        if (!isKiroProviderType(providerType) || !sessionKey || this.globalConfig.KIRO_SESSION_AFFINITY === false) return;
+        const provider = this._findProvider(providerType, uuid);
+        if (provider && provider.config.KIRO_SESSION_AFFINITY !== false) {
+            return () => this._kiroSessionAffinity.bind(`${providerType}:${sessionKey}`, provider.state);
+        }
+    }
+
+    updateKiroModelCapabilities(providerType, uuid, modelIds, ttlMs, sourceScope) {
+        if (!isKiroProviderType(providerType) || !Array.isArray(modelIds) || !modelIds.length) return;
+        const provider = this._findProvider(providerType, uuid);
+        if (!provider) return;
+        const scope = kiroModelCapabilityScope({ ...this.globalConfig, ...provider.config });
+        // A discovery started by a retired adapter must not repopulate current capabilities.
+        if (sourceScope !== undefined && sourceScope !== scope) return;
+        provider.state._kiroDiscoveredModels = { ids: new Set(modelIds), expiresAt: Date.now() + ttlMs, scope };
     }
 
     /** Proactive refresh keeps a valid token usable; blocking refresh pauses it. */
@@ -1070,6 +1092,10 @@ export class ProviderPoolManager {
                     this._migrateLegacyAntigravityQuotaCooldown(providerType, providerConfig);
 
                     const slotState = existing ? existing.state : { activeCount: 0, waitingCount: 0, queue: [] };
+                    if (isKiroProviderType(providerType) && slotState._kiroDiscoveredModels &&
+                        slotState._kiroDiscoveredModels.scope !== kiroModelCapabilityScope({ ...this.globalConfig, ...providerConfig })) {
+                        delete slotState._kiroDiscoveredModels;
+                    }
                     Object.defineProperty(slotState, '_slotConfig', { value: providerConfig, writable: true, configurable: true });
                     const providerStatus = {
                         config: providerConfig,
@@ -1192,6 +1218,10 @@ export class ProviderPoolManager {
         const excludedUuids = new Set(Array.isArray(options.excludeUuids) ? options.excludeUuids : []);
         const supportsRequestedModel = p => {
             if (!requestedModel) return true;
+            const discovered = p.state._kiroDiscoveredModels;
+            if (isKiroProviderType(providerType) && (p.config.KIRO_DYNAMIC_MODELS ?? this.globalConfig.KIRO_DYNAMIC_MODELS) === true &&
+                discovered?.expiresAt > now && discovered.scope === kiroModelCapabilityScope({ ...this.globalConfig, ...p.config }) &&
+                !discovered.ids.has(requestedModel)) return false;
             const supportedModels = getConfiguredSupportedModels(providerType, p.config);
             if (supportedModels.length > 0) return supportedModels.includes(requestedModel);
             return !Array.isArray(p.config.notSupportedModels) || !p.config.notSupportedModels.includes(requestedModel);
@@ -1301,9 +1331,29 @@ export class ProviderPoolManager {
             if (alternatives.length) availableAndHealthyProviders = alternatives;
         }
 
+        const budgetWaits = new Map();
+        if (isKiroProviderType(providerType)) {
+            for (const provider of availableAndHealthyProviders) {
+                const config = { ...this.globalConfig, ...provider.config };
+                budgetWaits.set(provider, kiroAccountBudget.getWaitMs(kiroBudgetKeyForConfig(config), config));
+            }
+            // Prefer accounts that can start now, while retaining existing queue
+            // and scoring behavior when every candidate would have to wait.
+            const ready = availableAndHealthyProviders.filter(provider => budgetWaits.get(provider) === 0 &&
+                !(Number(provider.config.concurrencyLimit) > 0 && provider.state.activeCount >= Number(provider.config.concurrencyLimit)) &&
+                !provider.state.waitingCount);
+            if (ready.length) availableAndHealthyProviders = ready;
+        }
+
         // 改进：使用统一的评分策略进行选择
         // 传入当前时间戳 now 确保一致性
-        const selected = availableAndHealthyProviders.sort((a, b) => {
+        const boundState = isKiroProviderType(providerType) && options.kiroSession?.key && this.globalConfig.KIRO_SESSION_AFFINITY !== false
+            ? this._kiroSessionAffinity.get(`${providerType}:${options.kiroSession.key}`) : null;
+        const preferred = availableAndHealthyProviders.find(provider => provider.state === boundState && provider.config.KIRO_SESSION_AFFINITY !== false &&
+            budgetWaits.get(provider) === 0 &&
+            !(Number(provider.config.concurrencyLimit) > 0 && provider.state.activeCount >= Number(provider.config.concurrencyLimit)) &&
+            !provider.state.waitingCount);
+        const selected = preferred || availableAndHealthyProviders.sort((a, b) => {
             const scoreA = this._calculateNodeScore(a, now, minSeq);
             const scoreB = this._calculateNodeScore(b, now, minSeq);
             if (scoreA !== scoreB) return scoreA - scoreB;

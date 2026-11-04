@@ -1,10 +1,19 @@
-import { KiroModelCache } from './kiro-model-cache.js';
+import { KiroModelCache, kiroModelCapabilityScope } from './kiro-model-cache.js';
+import { readKiroTokenUsage, readKiroMetering, kiroRefusalText } from './kiro-response-metadata.js';
+import { applyKiroErrorPolicy } from './kiro-error-policy.js';
+import { normalizeKiroImages } from './kiro-images.js';
+import { createKiroSessionContext } from './kiro-session.js';
+import { kiroAccountBudget, kiroBudgetKey } from './kiro-account-budget.js';
+import { createKiroRequestTrace } from './kiro-request-trace.js';
 import { appendKiroPromptAdditions, getKiroIdentityPrompt, prepareKiroToolDescription, shouldUseKiroThinkingPrompt } from './kiro-prompt-policy.js';
 import { KiroTruncationRecovery } from './kiro-truncation-recovery.js';
 import { convertKiroUserContent, getKiroHistoryImageMessageWindow, getKiroImagePayloadStats } from './kiro-message-content.js';
 import { buildKiroInferenceConfig, guardKiroPayload, inlineOrphanToolResults, validateKiroGenerationRequest } from './kiro-request-guards.js';
 import { decodeKiroFrames, kiroIntegrityError, normalizeKiroStopReason } from './kiro-event-stream.js';
 import { KiroToolAssembler } from './kiro-tool-assembler.js';
+import { captureKiroCacheSources } from './kiro-cache-profile.js';
+import { kiroCacheMode, prepareKiroCacheAttempt } from './kiro-cache-meter.js';
+import { copyKiroUsageDetails, resolveKiroCacheUsage } from './kiro-cache-usage.js';
 import { KiroBracketToolParser } from './kiro-bracket-tools.js';
 import { markKiroSidecarError, requestViaKiroSidecar, selectKiroSidecarTransport } from './kiro-sidecar-transport.js';
 import { atomicWriteFile } from '../../utils/file-lock.js';
@@ -818,15 +827,28 @@ export class KiroApiService {
             this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, this.uuid, this.accessToken
         );
 
+        // Cache identity uses the business endpoint even when the transport
+        // wrapper rewrites the URL to a local relay. Availability is checked
+        // after transport setup, immediately before accounting and dispatch.
+        const businessRequest = { url: routedConfig.url, data: routedConfig.data };
+        const prepareCache = () => {
+            if (options.kiroCacheAccounting) options.kiroCacheAccounting.attempt = prepareKiroCacheAttempt(
+                this, businessRequest, requestData._kiroCacheSourceInfo, options.kiroSession?.key);
+        };
+
         // Kiro sidecar transport path (only when explicitly enabled for this request)
         if (options.allowKiroSidecar && options._transportContext?.kind === 'kiro-sidecar') {
+            options._kiroTraceTransport = options._transportContext.tlsSidecar ? 'kiro-sidecar+tls-sidecar' : 'kiro-sidecar';
             this._assertKiroAccountAvailable(options);
+            prepareCache();
             return await this._requestViaKiroSidecar(routedConfig, options._transportContext);
         }
 
         // Existing path: tls-sidecar / direct
         this._applySidecar(routedConfig);
+        options._kiroTraceTransport = routedConfig.headers?.['X-Target-Url'] ? 'tls-sidecar' : 'direct';
         this._assertKiroAccountAvailable(options);
+        prepareCache();
         return await this.axiosInstance.request(routedConfig);
     }
 
@@ -1374,8 +1396,15 @@ async saveCredentialsToFile(filePath, newData) {
      * Build CodeWhisperer request from OpenAI messages
      */
 
-    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, outputConfig = null, reasoningEffort = null, generationParams = {}) {
-        const conversationId = uuidv4();
+    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, outputConfig = null, reasoningEffort = null, generationParams = {}, requestOptions = {}) {
+        const session = requestOptions.kiroSession || createKiroSessionContext({ ...generationParams, messages, system: inSystemPrompt });
+        const conversationId = session?.conversationId || uuidv4();
+        const cacheSources = kiroCacheMode(this.config) === 'off' ? null : [];
+        const rememberCacheSource = (wire, content, withSystem = false) => cacheSources?.push({
+            wire, content, system: withSystem ? inSystemPrompt : undefined,
+            systemPrefixLength: withSystem && systemPrompt ? systemPrompt.length
+                + (wire.content?.startsWith(`${systemPrompt}\n\n`) ? 2 : 0) : 0
+        });
         
         // Preserve the client's instructions; identity text is explicitly opt-in.
         let systemPrompt = appendKiroPromptAdditions(this.getContentText(inSystemPrompt), [getKiroIdentityPrompt(this.config)]);
@@ -1487,14 +1516,6 @@ async saveCredentialsToFile(filePath, newData) {
                 toolsContext = { tools: [buildKiroPlaceholderTool()] };
             } else {
                 const kiroTools = filteredTools
-                    .filter(tool => {
-                        // 过滤掉描述为空的工具
-                        if (typeof tool.description !== 'string' || tool.description.trim() === '') {
-                            logger.info(`[Kiro] Ignoring tool with empty description: ${tool.name}`);
-                            return false;
-                        }
-                        return true;
-                    })
                     .map(tool => {
                         const wireName = toolNameMaps.toKiroName(tool.name);
                         const { description, documentation } = prepareKiroToolDescription(tool, wireName, this.config);
@@ -1567,17 +1588,20 @@ async saveCredentialsToFile(filePath, newData) {
                     firstHistoryMsg.userInputMessage.images = firstUserPayload.images;
                 }
                 history.push(firstHistoryMsg);
+                rememberCacheSource(firstHistoryMsg.userInputMessage, processedMessages[0].content, true);
                 startIndex = 1; // Start processing from the second message
             } else {
                 // If the first message is not a user message, or if there's no initial user message,
                 // add system prompt as a standalone user message.
-                history.push({
+                const systemEntry = {
                     userInputMessage: {
                         content: systemPrompt || '(empty placeholder)',
                         modelId: codewhispererModel,
                         origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR,
                     }
-                });
+                };
+                history.push(systemEntry);
+                rememberCacheSource(systemEntry.userInputMessage, null, true);
             }
         }
 
@@ -1614,6 +1638,7 @@ async saveCredentialsToFile(filePath, newData) {
                 }
 
                 history.push({ userInputMessage });
+                rememberCacheSource(userInputMessage, message.content);
             } else if (message.role === 'assistant') {
                 let assistantResponseMessage = {
                     content: ''
@@ -1657,6 +1682,7 @@ async saveCredentialsToFile(filePath, newData) {
                 }
 
                 history.push({ assistantResponseMessage });
+                rememberCacheSource(assistantResponseMessage, message.content);
             }
         }
 
@@ -1703,6 +1729,7 @@ async saveCredentialsToFile(filePath, newData) {
                 delete assistantResponseMessage.toolUses;
             }
             history.push({ assistantResponseMessage });
+            rememberCacheSource(assistantResponseMessage, currentMessage.content);
             
             // 设置 currentContent 为 "Continue"，因为我们需要一个 user 消息来触发 AI 继续
             currentContent = 'Continue';
@@ -1800,6 +1827,7 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         request.conversationState.currentMessage.userInputMessage = userInputMessage;
+        if (currentMessage.role === 'user') rememberCacheSource(userInputMessage, currentMessage.content, prependSystemToCurrentMessage);
 
         if (additionalModelRequestFields) {
             request.additionalModelRequestFields = additionalModelRequestFields;
@@ -1812,6 +1840,11 @@ async saveCredentialsToFile(filePath, newData) {
 
         const inference = buildKiroInferenceConfig(generationParams, this.config.KIRO_ENABLE_INFERENCE_CONFIG !== false);
         if (inference) request.inferenceConfig = inference;
+        await normalizeKiroImages(request, this.config, requestOptions.signal);
+        const cacheSourceInfo = cacheSources ? captureKiroCacheSources(cacheSources, {
+            messages, tools, system: inSystemPrompt, cache_control: generationParams.cache_control
+        }) : null;
+        if (cacheSourceInfo) cacheSourceInfo.sessionKey = session?.key;
         const guarded = guardKiroPayload(request, this.config);
         const imageStats = getKiroImagePayloadStats(guarded);
         if (imageStats.imageCount > 0) {
@@ -1822,6 +1855,7 @@ async saveCredentialsToFile(filePath, newData) {
             value: toolNameMaps,
             enumerable: false
         });
+        if (cacheSourceInfo) Object.defineProperty(guarded, '_kiroCacheSourceInfo', { value: cacheSourceInfo });
 
         // 监控钩子：内部请求转换
         if (this.config?._monitorRequestId) {
@@ -1994,13 +2028,21 @@ async saveCredentialsToFile(filePath, newData) {
                 data: requestData,
                 headers
             };
-            await waitForKiroRequestSlot(this.config);
+            await kiroAccountBudget.reserve(kiroBudgetKey(this), this.config, undefined,
+                () => waitForKiroRequestSlot(this.config));
             const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData, requestOptions);
             response._kiroToolNameMaps = requestData._kiroToolNameMaps;
             return response;
         } catch (error) {
             if (error.isKiroAccountUnavailable) throw error;
             const status = error.response?.status;
+            if (status === 400 || status === 429 || status >= 500) {
+                const body = error.response?.data;
+                const raw = typeof body?.read === 'function'
+                    ? await getNormalizedErrorResponseText(error, { rawBody: true }) : body;
+                if (raw !== body) error.response.data = raw;
+                if (applyKiroErrorPolicy(error, raw)) throw error;
+            }
             const errorCode = error.code;
             const errorMessage = error.message || '';
             
@@ -2400,11 +2442,13 @@ async saveCredentialsToFile(filePath, newData) {
                 const block = blocks.get(event.index);
                 if (event.delta.type === 'text_delta') block.text = (block.text || '') + event.delta.text;
                 else if (event.delta.type === 'thinking_delta') block.thinking = (block.thinking || '') + event.delta.thinking;
+                else if (event.delta.type === 'signature_delta') block.signature = (block.signature || '') + event.delta.signature;
                 else if (event.delta.type === 'input_json_delta') block._arguments = (block._arguments || '') + event.delta.partial_json;
             } else if (event.type === 'message_delta') {
                 if (Object.hasOwn(event.delta, 'stop_reason')) message.stop_reason = event.delta.stop_reason;
                 if (Object.hasOwn(event.delta, 'stop_sequence')) message.stop_sequence = event.delta.stop_sequence;
                 message.usage = { ...message.usage, ...event.usage };
+                copyKiroUsageDetails(event.usage, message.usage);
             }
         }
         if (!message) throw createKiroEmptyResponseError();
@@ -2430,13 +2474,19 @@ async saveCredentialsToFile(filePath, newData) {
         const events = [];
         for (const { headers, data } of frames) {
             const type = headers[':event-type'];
-            for (const field of ['content', 'text', 'name', 'toolUseId']) {
+            for (const field of ['content', 'text', 'name', 'toolUseId', 'signature', 'redactedContent']) {
+                if (type === 'reasoningContentEvent' && ['text', 'signature', 'redactedContent'].includes(field) && data[field] === null) continue;
                 if (data[field] !== undefined && typeof data[field] !== 'string') throw kiroIntegrityError(`invalid ${field} field`);
             }
             if (type === 'metadataEvent' || Object.hasOwn(data, 'stopReason') || Object.hasOwn(data, 'stop_reason')) {
                 events.push({ type: 'metadata', data });
             }
             if (data.usage && typeof data.usage === 'object') events.push({ type: 'usage', data: data.usage });
+            if (type === 'meteringEvent') {
+                const metering = readKiroMetering(data);
+                if (metering) events.push({ type: 'metering', data: metering });
+                continue;
+            }
             if (type === 'toolUseEvent' || data.toolUseId || data.name && data.input !== undefined) {
                 const toolUseId = data.toolUseId || data.toolUseID || data.tool_use_id;
                 if (data.name) events.push({ type: 'toolUse', data: { ...data, toolUseId } });
@@ -2445,7 +2495,7 @@ async saveCredentialsToFile(filePath, newData) {
             } else if (data.contextUsagePercentage !== undefined) {
                 events.push({ type: 'contextUsage', data });
             } else if (type === 'reasoningContentEvent' || data.text !== undefined) {
-                events.push({ type: 'reasoning', data: data.text });
+                events.push({ type: 'reasoning', data: data.text, signature: data.signature, redactedContent: data.redactedContent });
             } else if (data.content !== undefined && !data.followupPrompt) {
                 events.push({ type: 'content', data: data.content });
             }
@@ -2461,6 +2511,7 @@ async saveCredentialsToFile(filePath, newData) {
         // Keep request-local routing state private while passing its pinned
         // transport through retries. Callers may reuse or freeze their options.
         options = { ...options };
+        if (options.kiroCacheAccounting) options.kiroCacheAccounting.attempt = null;
         const attemptStartedAt = performance.now();
         const requestStartedAt = options.kiroTiming?.startedAt ?? attemptStartedAt;
         const { signal } = options;
@@ -2484,7 +2535,7 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         const buildStartedAt = performance.now();
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.output_config, body.reasoning_effort, body);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body.output_config, body.reasoning_effort, body, options);
         const buildMs = performance.now() - buildStartedAt;
         signal?.throwIfAborted();
         const toolNameMaps = requestData._kiroToolNameMaps;
@@ -2530,6 +2581,9 @@ async saveCredentialsToFile(filePath, newData) {
             if (meaningfulEventSeen && ms > 0) idleTimer = setTimeout(() => expire('stream idle'), ms);
         };
         const clearTimers = () => { clearTimeout(firstTimer); clearTimeout(idleTimer); clearTimeout(totalTimer); };
+        const trace = createKiroRequestTrace(this, model, options);
+        let attemptError;
+        let upstreamComplete = false;
 
         try {
             const axiosConfig = {
@@ -2544,7 +2598,8 @@ async saveCredentialsToFile(filePath, newData) {
                 signal: transport.signal
             };
             const queuedAt = performance.now();
-            await waitForKiroRequestSlot(this.config, signal);
+            await kiroAccountBudget.reserve(kiroBudgetKey(this), this.config, signal,
+                () => waitForKiroRequestSlot(this.config, signal));
             signal?.addEventListener('abort', forwardAbort, { once: true });
             if (signal?.aborted) forwardAbort();
             const firstMs = timeoutMs('KIRO_FIRST_EVENT_TIMEOUT_MS', 30000);
@@ -2560,7 +2615,10 @@ async saveCredentialsToFile(filePath, newData) {
             }
             const upstreamStartedAt = performance.now();
             options.allowKiroSidecar = true;
+            const bindSession = getProviderPoolManager()?.captureKiroSessionBinding?.(
+                this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, this.uuid, options.kiroSession?.key);
             const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData, options);
+            bindSession?.();
 
             stream = response.data;
             signal?.addEventListener('abort', onAbort, { once: true });
@@ -2581,8 +2639,10 @@ async saveCredentialsToFile(filePath, newData) {
                 
                 // Preserve every valid delta; matching text is not proof of a replay.
                 for (const event of events) {
+                    trace?.accept(event);
                     signal?.throwIfAborted();
-                    if (((event.type === 'content' || event.type === 'reasoning') && event.data) || (event.type === 'toolUse' && event.data.name !== KIRO_PLACEHOLDER_TOOL_NAME)) {
+                    if (((event.type === 'content' || event.type === 'reasoning') && event.data) ||
+                        event.type === 'reasoning' && event.redactedContent || (event.type === 'toolUse' && event.data.name !== KIRO_PLACEHOLDER_TOOL_NAME)) {
                         meaningfulEventSeen = true;
                         clearTimeout(firstTimer);
                     }
@@ -2602,7 +2662,7 @@ async saveCredentialsToFile(filePath, newData) {
                     } else if (event.type === 'reasoning') {
                         hasYieldedContent = true;
                         clearTimeout(idleTimer);
-                        yield { type: 'reasoning', reasoning: event.data };
+                        yield { type: 'reasoning', reasoning: event.data, signature: event.signature, redactedContent: event.redactedContent };
                         armIdle();
                     } else if (event.type === 'toolUse') {
                         hasYieldedContent = true;
@@ -2622,7 +2682,7 @@ async saveCredentialsToFile(filePath, newData) {
                         clearTimeout(idleTimer);
                         yield { type: 'toolUseStop', toolUseId: event.data.toolUseId, stop: event.data.stop };
                         armIdle();
-                    } else if (['metadata', 'usage'].includes(event.type)) {
+                    } else if (['metadata', 'usage', 'metering'].includes(event.type)) {
                         clearTimeout(idleTimer);
                         yield { type: event.type, data: event.data };
                         armIdle();
@@ -2634,9 +2694,11 @@ async saveCredentialsToFile(filePath, newData) {
                 }
             }
             if (buffer.length) throw kiroIntegrityError('truncated trailing event frame');
+            upstreamComplete = true;
         } catch (error) {
             clearTimers();
             if (!signal?.aborted && timeoutError) error = timeoutError;
+            attemptError = error;
             // 确保出错时关闭流
             if (stream && typeof stream.destroy === 'function') {
                 stream.destroy();
@@ -2662,6 +2724,7 @@ async saveCredentialsToFile(filePath, newData) {
                 error.shouldSwitchCredential = false;
                 error.isRetryableUpstreamResponseFailure = false;
                 if (error.retryable && retryCount < maxRetries && !hasYieldedContent) {
+                    trace?.finish(error);
                     transport.abort();
                     await sleep(baseDelay * Math.pow(2, retryCount), undefined, { signal });
                     yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1, options);
@@ -2671,6 +2734,13 @@ async saveCredentialsToFile(filePath, newData) {
             }
 
             const status = error.response?.status;
+            if (status === 400 || status === 429 || status >= 500) {
+                const body = error.response?.data;
+                const raw = typeof body?.read === 'function'
+                    ? await getNormalizedErrorResponseText(error, { rawBody: true, signal }) : body;
+                if (raw !== body) error.response.data = raw;
+                if (applyKiroErrorPolicy(error, raw)) throw error;
+            }
             const errorCode = error.code;
             const errorMessage = error.message || '';
             
@@ -2735,6 +2805,7 @@ async saveCredentialsToFile(filePath, newData) {
             // 只在尚未产出任何内容时才从头重试：若已经 yield 过内容，
             // 从头重发会导致已发送部分与重试响应重复/错位，故中途断线不重试。
             if (isNetworkError && retryCount < maxRetries && !hasYieldedContent) {
+                trace?.finish(error);
                 const delay = baseDelay * Math.pow(2, retryCount);
                 const errorIdentifier = errorCode || errorMessage.substring(0, 50);
                 logger.info(`[Kiro] Network error (${errorIdentifier}) in stream. Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
@@ -2755,6 +2826,7 @@ async saveCredentialsToFile(filePath, newData) {
             logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`,  error.message);
             throw error;
         } finally {
+            trace?.finish(attemptError, upstreamComplete);
             clearTimers();
             signal?.removeEventListener('abort', forwardAbort);
             transport.abort();
@@ -2885,7 +2957,14 @@ async saveCredentialsToFile(filePath, newData) {
             if (index == null) return [];
             if (streamState.stoppedBlocks.has(index)) return [];
             streamState.stoppedBlocks.add(index);
-            return [{ type: "content_block_stop", index }];
+            const events = [];
+            if (index === streamState.thinkingBlockIndex && streamState.pendingSignature) {
+                events.push({ type: 'content_block_delta', index,
+                    delta: { type: 'signature_delta', signature: streamState.pendingSignature } });
+                streamState.pendingSignature = null;
+            }
+            events.push({ type: "content_block_stop", index });
+            return events;
         };
 
         const createPlainTextDeltaEvents = (text) => {
@@ -3018,6 +3097,9 @@ async saveCredentialsToFile(filePath, newData) {
             let upstreamStopReason = null;
             let upstreamStopSequence = null;
             let upstreamUsage = {};
+            let nativeUsage = null;
+            let metering = null;
+            let refusalText = null;
             // 记录被忽略的占位工具调用 id（详见 KIRO_PLACEHOLDER_TOOL_NAME 说明）
             const ignoredToolUseIds = new Set();
             let ignoredLegacyTool = false;
@@ -3037,7 +3119,7 @@ async saveCredentialsToFile(filePath, newData) {
                     stop_reason: null,
                     stop_sequence: null,
                     usage: {
-                        input_tokens: estimatedInputTokens,
+                        input_tokens: kiroCacheMode(this.config) === 'estimate' ? 0 : estimatedInputTokens,
                         output_tokens: 0,
                         cache_creation_input_tokens: 0,
                         cache_read_input_tokens: 0
@@ -3051,11 +3133,27 @@ async saveCredentialsToFile(filePath, newData) {
                 if (event.type === 'contextUsage' && event.contextUsagePercentage) {
                     // 捕获上下文使用百分比（包含输入和输出的总使用量）
                     contextUsagePercentage = event.contextUsagePercentage;
-                } else if (event.type === 'reasoning' && event.reasoning) {
+                } else if (event.type === 'reasoning') {
                     // 原生 reasoning 流（reasoningContentEvent）：直接走 thinking 输出通道，
                     // 不经过 <thinking> 标签扫描（新模型的思考不再内联在 content 标签里）。
                     yield* pushEvents(flushPendingContent());
-                    yield* pushEvents(createThinkingDeltaEvents(event.reasoning));
+                    if (event.signature) {
+                        // Signature-only frames can arrive after the thinking text.
+                        streamState.pendingSignature = event.signature;
+                        yield* pushEvents(stopBlock(streamState.textBlockIndex));
+                        yield* pushEvents(ensureBlockStart('thinking'));
+                        streamState.hasThinkingContent = true;
+                    }
+                    if (event.reasoning) yield* pushEvents(createThinkingDeltaEvents(event.reasoning));
+                    if (event.redactedContent) {
+                        yield* pushEvents(stopBlock(streamState.thinkingBlockIndex));
+                        yield* pushEvents(stopBlock(streamState.textBlockIndex));
+                        const index = streamState.nextBlockIndex++;
+                        streamState.hasThinkingContent = true;
+                        yield { type: 'content_block_start', index,
+                            content_block: { type: 'redacted_thinking', data: event.redactedContent } };
+                        yield { type: 'content_block_stop', index };
+                    }
                     continue;
                 } else if (event.type === 'content' && event.content) {
                     if (!thinkingRequested) {
@@ -3188,6 +3286,9 @@ async saveCredentialsToFile(filePath, newData) {
                     const reason = event.data.stopReason ?? event.data.stop_reason;
                     if (reason !== undefined && reason !== null && (typeof reason !== 'string' || !normalizeKiroStopReason(reason))) throw kiroIntegrityError('unsupported upstream stop reason');
                     upstreamStopReason = normalizeKiroStopReason(reason) || upstreamStopReason;
+                    if (upstreamStopReason === 'refusal') refusalText = kiroRefusalText(event.data);
+                    const snapshot = readKiroTokenUsage(event.data.tokenUsage);
+                    if (snapshot) nativeUsage = { ...nativeUsage, ...snapshot };
                     const sequence = Object.hasOwn(event.data, 'stopSequence') ? event.data.stopSequence : event.data.stop_sequence;
                     if (sequence !== undefined) {
                         if (sequence !== null && typeof sequence !== 'string') throw kiroIntegrityError('invalid upstream stop sequence');
@@ -3196,6 +3297,9 @@ async saveCredentialsToFile(filePath, newData) {
                     upstreamUsage = { ...upstreamUsage, ...event.data.usage, ...event.data };
                 } else if (event.type === 'usage') {
                     upstreamUsage = { ...upstreamUsage, ...event.data };
+                } else if (event.type === 'metering') {
+                    // Per-call metering is a snapshot, like tokenUsage; replayed snapshots must not double-charge.
+                    metering = event.data;
                 }
             }
             if (this.config.KIRO_REQUIRE_STOP_REASON === true && !upstreamStopReason) {
@@ -3212,7 +3316,9 @@ async saveCredentialsToFile(filePath, newData) {
                 streamState.hasThinkingContent &&
                 !streamState.hasVisibleText &&
                 toolCalls.length === 0;
-            if (emittedOnlyThinking) {
+            if (upstreamStopReason === 'refusal' && !streamState.hasVisibleText) {
+                yield* pushEvents(createTextDeltaEvents(refusalText));
+            } else if (emittedOnlyThinking) {
                 logger.warn('[Kiro Stream] Thinking-only response received; emitting minimal text and preserving upstream stop reason (max_tokens fallback)');
                 yield* pushEvents(createTextDeltaEvents(' '));
             }
@@ -3226,8 +3332,9 @@ async saveCredentialsToFile(filePath, newData) {
 
             yield* pushEvents(stopBlock(streamState.textBlockIndex));
 
-            const actualInput = upstreamUsage.inputTokens ?? upstreamUsage.input_tokens;
-            const actualOutput = upstreamUsage.outputTokens ?? upstreamUsage.output_tokens;
+            const providerTotalInput = upstreamUsage.inputTokens ?? upstreamUsage.input_tokens;
+            const actualInput = nativeUsage?.input_tokens ?? providerTotalInput;
+            const actualOutput = nativeUsage?.output_tokens ?? upstreamUsage.outputTokens ?? upstreamUsage.output_tokens;
             if (Number.isFinite(actualInput) && actualInput >= 0 && Number.isFinite(actualOutput) && actualOutput >= 0) {
                 // All integrity/tool checks have already completed. With both
                 // actual counts present, the local estimate would be discarded.
@@ -3254,18 +3361,43 @@ async saveCredentialsToFile(filePath, newData) {
                 if (Number.isFinite(actualOutput) && actualOutput >= 0) outputTokens = actualOutput;
             }
 
+            // Native input_tokens is UNCACHED input. It may skip redundant
+            // output tokenization above, but must not become the total budget
+            // used to estimate missing reads/writes below.
+            const completeNativeInput = ['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']
+                .every(name => Number.isSafeInteger(nativeUsage?.[name]) && nativeUsage[name] >= 0);
+            const hasProviderTotal = Number.isSafeInteger(providerTotalInput) && providerTotalInput >= 0;
+            let cacheInputTotal = inputTokens;
+            if (completeNativeInput) {
+                cacheInputTotal = nativeUsage.input_tokens + nativeUsage.cache_read_input_tokens + nativeUsage.cache_creation_input_tokens;
+            } else if (nativeUsage?.input_tokens !== undefined) {
+                const contextTotal = contextUsagePercentage > 0
+                    ? Math.round((normalizeContextLength(findCustomModelConfigForModel(model, this.config)?.contextLength)
+                        || normalizeContextLength(modelInfo?.tokenLimits?.maxInputTokens)
+                        || getContextTokensForModel(model, this.config, finalModel)) * contextUsagePercentage / 100) : null;
+                cacheInputTotal = hasProviderTotal ? providerTotalInput
+                    : contextTotal !== null ? Math.max(0, contextTotal - outputTokens) : estimatedInputTokens;
+            }
+            const { usage: finalUsage, details: usageDetails } = resolveKiroCacheUsage({
+                inputTokens: cacheInputTotal, outputTokens, nativeUsage, metering,
+                plan: options.kiroCacheAccounting?.attempt, mode: kiroCacheMode(this.config),
+                totalSource: hasProviderTotal ? 'provider_total' : contextUsagePercentage > 0 ? 'context_estimate' : 'local_estimate',
+                outputSource: Number.isFinite(actualOutput) && actualOutput >= 0 ? 'provider' : 'estimated'
+            });
+            options.kiroTiming.usageSource = usageDetails.totalSource;
+            options.kiroTiming.usage = finalUsage;
+            options.kiroTiming.cacheAccounting = usageDetails;
+            if (options.kiroCacheAccounting) options.kiroCacheAccounting.commit = options.kiroCacheAccounting.attempt?.commit;
+            if (this.config.KIRO_REQUEST_TRACE === true || kiroCacheMode(this.config) === 'observe') logger.info(`[Kiro Usage] ${JSON.stringify({
+                requestId: options.kiroTiming.traceId, usageSource: options.kiroTiming.usageSource, usage: finalUsage,
+                cacheAccounting: usageDetails })}`);
             // 4. 发送 message_delta 事件
             yield {
                 type: "message_delta",
                 delta: { stop_reason: toolCalls.length > 0 && (!upstreamStopReason || upstreamStopReason === 'end_turn')
                     ? 'tool_use' : (upstreamStopReason || (emittedOnlyThinking ? 'max_tokens' : 'end_turn')),
                     stop_sequence: upstreamStopSequence },
-                usage: {
-                    input_tokens: inputTokens,
-                    output_tokens: outputTokens,
-                    cache_creation_input_tokens: 0,
-                    cache_read_input_tokens: 0
-                }
+                usage: finalUsage
             };
 
             // 5. 发送 message_stop 事件
@@ -3290,7 +3422,8 @@ async saveCredentialsToFile(filePath, newData) {
     //   转发给调用方，调用方（handleStreamRequest）尚未向客户端写入任何数据，
     //   可以安全地整体重试（不会出现同一个 SSE 响应里出现两个 message_start）。
     async * generateContentStream(model, requestBody, options = {}) {
-        const rawGenerator = this._generateContentStreamRaw(model, requestBody, options);
+        const cacheAccounting = {};
+        const rawGenerator = this._generateContentStreamRaw(model, requestBody, { ...options, kiroCacheAccounting: cacheAccounting });
 
         try {
             const first = await rawGenerator.next();
@@ -3308,6 +3441,10 @@ async saveCredentialsToFile(filePath, newData) {
                 const { value, done } = await rawGenerator.next();
                 if (done) break;
                 observation?.accept(value);
+                if (value.type === 'message_stop') {
+                    options.signal?.throwIfAborted();
+                    cacheAccounting.commit?.();
+                }
 
                 if (!flushedMessageStart) {
                     yield pendingMessageStart;
@@ -3328,14 +3465,25 @@ async saveCredentialsToFile(filePath, newData) {
      * instead of an estimation. Used by the /cc/v1/messages endpoint.
      */
     async * generateContentStreamBuffered(model, requestBody, options = {}) {
-        const rawGenerator = this._generateContentStreamRaw(model, requestBody, options);
+        const cacheAccounting = {};
+        const rawGenerator = this._generateContentStreamRaw(model, requestBody, { ...options, kiroCacheAccounting: cacheAccounting });
         const events = [];
+        const configuredLimit = Number(this.config.KIRO_MAX_BUFFERED_RESPONSE_BYTES);
+        const maxBytes = Number.isSafeInteger(configuredLimit) && configuredLimit > 0
+            ? configuredLimit : 32 * 1024 * 1024;
+        let bufferedBytes = 0;
         const recovery = this.config.KIRO_TRUNCATION_RECOVERY === false ? null
             : (this._truncationRecovery ||= new KiroTruncationRecovery());
         const observation = recovery?.observe(resolveKiroModel(model, this.config), requestBody);
 
         try {
             for await (const event of rawGenerator) {
+                bufferedBytes += Buffer.byteLength(JSON.stringify(event), 'utf8');
+                if (bufferedBytes > maxBytes) {
+                    const error = new Error(`Kiro buffered response exceeds the ${maxBytes}-byte limit; use live streaming or increase KIRO_MAX_BUFFERED_RESPONSE_BYTES`);
+                    Object.assign(error, { status: 502, code: 'KIRO_BUFFER_LIMIT', skipErrorCount: true, shouldSwitchCredential: false });
+                    throw error;
+                }
                 events.push(event);
             }
         } catch (error) {
@@ -3344,6 +3492,8 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         if (events.length === 0) return;
+        options.signal?.throwIfAborted();
+        cacheAccounting.commit?.();
 
         // Extract real input_tokens from the message_delta usage
         const messageDelta = events.find(e => e.type === 'message_delta');
@@ -3354,8 +3504,12 @@ async saveCredentialsToFile(filePath, newData) {
         if (messageStart?.type === 'message_start' && Number.isFinite(realInputTokens) && realInputTokens >= 0) {
             messageStart.message = {
                 ...messageStart.message,
-                usage: { ...messageStart.message.usage, input_tokens: realInputTokens }
+                usage: { ...messageStart.message.usage, input_tokens: realInputTokens,
+                    cache_read_input_tokens: messageDelta.usage.cache_read_input_tokens,
+                    cache_creation_input_tokens: messageDelta.usage.cache_creation_input_tokens,
+                    ...(messageDelta.usage.cache_creation ? { cache_creation: messageDelta.usage.cache_creation } : {}) }
             };
+            copyKiroUsageDetails(messageDelta.usage, messageStart.message.usage, { stage: 'initial' });
         }
 
         // Feed all events to the truncation recovery observer
@@ -3595,6 +3749,7 @@ async saveCredentialsToFile(filePath, newData) {
     async listModels(options = {}) {
         const fallback = { models: KIRO_MODELS.map(name => ({ name })) };
         if (this.config.KIRO_DYNAMIC_MODELS !== true) return fallback;
+        const capabilityScope = kiroModelCapabilityScope(this.config);
         const excluded = Array.isArray(this.config.notSupportedModels) ? this.config.notSupportedModels : [];
         const blocked = new Set(excluded.flatMap(name => [name, Object.hasOwn(MODEL_MAPPING, name) ? MODEL_MAPPING[name] : name]));
         const allowedModels = value => ({ models: value.models.filter(item => !blocked.has(item.name)) });
@@ -3663,6 +3818,10 @@ async saveCredentialsToFile(filePath, newData) {
                     seenTokens.add(nextToken);
                 }
                 if (!models.length) throw new Error('Empty upstream model list');
+                const discoveredIds = new Set(models.map(model => model.name));
+                const aliases = Object.entries(MODEL_MAPPING).filter(([, target]) => discoveredIds.has(target)).map(([alias]) => alias);
+                getProviderPoolManager()?.updateKiroModelCapabilities?.(
+                    this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, this.uuid, [...discoveredIds, ...aliases], ttl, capabilityScope);
                 return { models: [...new Map(models.map(model => [model.name, model])).values()] };
             } catch (error) {
                 logger.warn('[Kiro Models] Discovery failed; retaining configured model list');
@@ -3782,17 +3941,22 @@ async saveCredentialsToFile(filePath, newData) {
         if (!this.isInitialized) await waitForKiroOperation(this.initialize(), signal);
         signal?.throwIfAborted();
 
-        // Token 刷新策略：
-        // 1. 已过期 → 必须等待刷新
-        // 2. 即将过期但还能用 → 后台异步刷新，不阻塞当前请求
-        // if (this.isTokenExpired()) {
-        //     logger.info('[Kiro] Token is expired, must refresh before getUsageLimits request...');
-        //     await this.initializeAuth(true);
-        // } else if (this.isExpiryDateNear()) {
-        //     logger.info('[Kiro] Token is near expiry, triggering background refresh...');
-        //     this.triggerBackgroundRefresh();
-        // }
-        
+        // 空闲账号不经过对话请求的刷新路径，过期 token 会被上游以
+        // 403 "bearer token ... invalid" 拒绝，所以查询前同样先等待刷新。
+        // 用量查询是只读的管理操作：冷却中或不健康的账号也要能查看额度，
+        // 因此按手动健康检查放行可用性校验。
+        try {
+            await waitForKiroOperation(this._prepareAccessTokenForRequest('getUsageLimits', {
+                signal, kiroHealthCheck: true, kiroManualRecovery: true
+            }), signal);
+        } catch (error) {
+            signal?.throwIfAborted();
+            // 管理页只展示 message，补上刷新失败的具体原因。
+            if (error.cause?.message) error.message = `${error.message}: ${error.cause.message}`;
+            throw error;
+        }
+        signal?.throwIfAborted();
+
         // 内部固定的资源类型
         const resourceType = 'AGENTIC_REQUEST';
         

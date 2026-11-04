@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
 import { BaseConverter } from '../BaseConverter.js';
 import { MODEL_PROTOCOL_PREFIX } from '../../utils/common.js';
+import { toClaudeInputUsage } from '../utils.js';
 import {
     generateResponseCreated,
     generateResponseInProgress,
@@ -1028,9 +1029,8 @@ export class CodexConverter extends BaseConverter {
             content: content,
             stop_reason: stopReason,
             usage: {
-                input_tokens: response.usage?.input_tokens || 0,
-                output_tokens: response.usage?.output_tokens || 0,
-                cache_read_input_tokens: this.getCachedInputTokens(response.usage)
+                ...toClaudeInputUsage(response.usage?.input_tokens, this.getCachedInputTokens(response.usage)),
+                output_tokens: response.usage?.output_tokens || 0
             }
         };
     }
@@ -1669,9 +1669,8 @@ export class CodexConverter extends BaseConverter {
                     type: "message_delta",
                     delta: { stop_reason: "end_turn" },
                     usage: {
-                        input_tokens: chunk.response.usage?.input_tokens || 0,
-                        output_tokens: chunk.response.usage?.output_tokens || 0,
-                        cache_read_input_tokens: this.getCachedInputTokens(chunk.response.usage)
+                        ...toClaudeInputUsage(chunk.response.usage?.input_tokens, this.getCachedInputTokens(chunk.response.usage)),
+                        output_tokens: chunk.response.usage?.output_tokens || 0
                     }
                 },
                 { type: "message_stop" }

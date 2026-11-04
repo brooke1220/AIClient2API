@@ -14,6 +14,7 @@ import {
     checkAndAssignOrDefault,
     extractThinkingFromOpenAIText,
     mapFinishReason,
+    toClaudeInputUsage,
     cleanJsonSchemaProperties as cleanJsonSchema,
     CLAUDE_DEFAULT_MAX_TOKENS,
     CLAUDE_DEFAULT_TEMPERATURE,
@@ -459,9 +460,8 @@ export class OpenAIConverter extends BaseConverter {
             stop_reason: stopReason,
             stop_sequence: null,
             usage: {
-                input_tokens: openaiResponse.usage?.prompt_tokens || 0,
+                ...toClaudeInputUsage(openaiResponse.usage?.prompt_tokens, openaiResponse.usage?.prompt_tokens_details?.cached_tokens),
                 cache_creation_input_tokens: 0,
-                cache_read_input_tokens: openaiResponse.usage?.prompt_tokens_details?.cached_tokens || 0,
                 output_tokens: openaiResponse.usage?.completion_tokens || 0
             }
         };
@@ -593,9 +593,8 @@ export class OpenAIConverter extends BaseConverter {
                         stop_sequence: null
                     },
                     usage: {
-                        input_tokens: openaiChunk.usage?.prompt_tokens || 0,
+                        ...toClaudeInputUsage(openaiChunk.usage?.prompt_tokens, openaiChunk.usage?.prompt_tokens_details?.cached_tokens),
                         cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: openaiChunk.usage?.prompt_tokens_details?.cached_tokens || 0,
                         output_tokens: openaiChunk.usage?.completion_tokens || 0
                     }
                 });

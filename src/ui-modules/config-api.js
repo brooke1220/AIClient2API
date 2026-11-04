@@ -20,6 +20,14 @@ function parseBooleanConfig(value) {
 
 function parseKiroSettings(config) {
     const settings = {};
+    for (const [field, choices] of [
+        ['KIRO_PROMPT_CACHE_MODE', ['off', 'observe', 'estimate']],
+        ['KIRO_PROMPT_CACHE_POLICY', ['auto', 'explicit', 'history']]
+    ]) {
+        if (config[field] === undefined) continue;
+        if (!choices.includes(config[field])) throw new Error(`${field} must be one of: ${choices.join(', ')}`);
+        settings[field] = config[field];
+    }
     if (config.KIRO_DYNAMIC_MODELS !== undefined) {
         const value = config.KIRO_DYNAMIC_MODELS;
         if (typeof value !== 'boolean' && !(typeof value === 'string' && /^(true|false)$/i.test(value))) {
@@ -31,7 +39,9 @@ function parseKiroSettings(config) {
         ['KIRO_MODEL_CACHE_TTL_MS', true, true, Number.MAX_SAFE_INTEGER],
         ['KIRO_REFRESH_AHEAD_MINUTES', false, false, Number.MAX_SAFE_INTEGER / 60000],
         ['KIRO_REFRESH_JITTER_MS', true, true, Number.MAX_SAFE_INTEGER],
-        ['KIRO_REFRESH_WAIT_TIMEOUT_MS', false, true, 2147483647]
+        ['KIRO_REFRESH_WAIT_TIMEOUT_MS', false, true, 2147483647],
+        ['KIRO_PROMPT_CACHE_DEFAULT_TTL_MS', false, true, 3600000],
+        ['KIRO_PROMPT_CACHE_MAX_ENTRIES', false, true, 1048576]
     ]) {
         if (config[field] === undefined) continue;
         const raw = config[field];
@@ -42,6 +52,23 @@ function parseKiroSettings(config) {
             throw new Error(`${field} must be a ${allowZero ? 'non-negative' : 'positive'} ${integer ? 'integer' : 'number'} no greater than ${max}`);
         }
         settings[field] = value;
+    }
+    const thresholds = config.KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL;
+    if (thresholds !== undefined) {
+        const field = 'KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL';
+        if (!thresholds || typeof thresholds !== 'object' || Array.isArray(thresholds)) {
+            throw new Error(`${field} must be an object mapping model IDs to positive safe integers`);
+        }
+        const entries = Object.entries(thresholds);
+        for (const [model, raw] of entries) {
+            const value = Number(raw);
+            if (!model.trim() || model !== model.trim() || ['__proto__', 'constructor', 'prototype'].includes(model)
+                || !['number', 'string'].includes(typeof raw) || String(raw).trim() === ''
+                || !Number.isSafeInteger(value) || value <= 0) {
+                throw new Error(`${field} must map non-empty model IDs to positive safe integers`);
+            }
+        }
+        settings[field] = Object.fromEntries(entries.map(([model, value]) => [model, Number(value)]));
     }
     return settings;
 }
@@ -74,6 +101,7 @@ export async function reloadConfig(providerPoolManager) {
             const newConfig = await initializeConfig(process.argv.slice(2), configPath);
             // Update provider pool manager if available
             if (providerPoolManager) {
+                providerPoolManager.globalConfig = newConfig;
                 providerPoolManager.providerPools = newConfig.providerPools;
                 providerPoolManager.initializeProviderStatus(true);
             }
@@ -135,6 +163,11 @@ export async function handleGetConfig(req, res, currentConfig) {
         KIRO_REFRESH_AHEAD_MINUTES: currentConfig.KIRO_REFRESH_AHEAD_MINUTES ?? 10,
         KIRO_REFRESH_JITTER_MS: currentConfig.KIRO_REFRESH_JITTER_MS ?? 30000,
         KIRO_REFRESH_WAIT_TIMEOUT_MS: currentConfig.KIRO_REFRESH_WAIT_TIMEOUT_MS ?? 15000,
+        KIRO_PROMPT_CACHE_MODE: currentConfig.KIRO_PROMPT_CACHE_MODE ?? 'off',
+        KIRO_PROMPT_CACHE_POLICY: currentConfig.KIRO_PROMPT_CACHE_POLICY ?? 'auto',
+        KIRO_PROMPT_CACHE_DEFAULT_TTL_MS: currentConfig.KIRO_PROMPT_CACHE_DEFAULT_TTL_MS ?? 300000,
+        KIRO_PROMPT_CACHE_MAX_ENTRIES: currentConfig.KIRO_PROMPT_CACHE_MAX_ENTRIES ?? 65536,
+        KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL: currentConfig.KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL ?? {},
         LOGIN_EXPIRY: currentConfig.LOGIN_EXPIRY,
         TRUST_PROXY: currentConfig.TRUST_PROXY,
         TRUSTED_PROXY_IPS: currentConfig.TRUSTED_PROXY_IPS,
@@ -438,6 +471,11 @@ async function _handleUpdateConfig(req, res, currentConfig, body) {
                 KIRO_REFRESH_AHEAD_MINUTES: currentConfig.KIRO_REFRESH_AHEAD_MINUTES,
                 KIRO_REFRESH_JITTER_MS: currentConfig.KIRO_REFRESH_JITTER_MS,
                 KIRO_REFRESH_WAIT_TIMEOUT_MS: currentConfig.KIRO_REFRESH_WAIT_TIMEOUT_MS,
+                KIRO_PROMPT_CACHE_MODE: currentConfig.KIRO_PROMPT_CACHE_MODE,
+                KIRO_PROMPT_CACHE_POLICY: currentConfig.KIRO_PROMPT_CACHE_POLICY,
+                KIRO_PROMPT_CACHE_DEFAULT_TTL_MS: currentConfig.KIRO_PROMPT_CACHE_DEFAULT_TTL_MS,
+                KIRO_PROMPT_CACHE_MAX_ENTRIES: currentConfig.KIRO_PROMPT_CACHE_MAX_ENTRIES,
+                KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL: currentConfig.KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL,
                 LOGIN_EXPIRY: currentConfig.LOGIN_EXPIRY,
                 TRUST_PROXY: currentConfig.TRUST_PROXY,
                 TRUSTED_PROXY_IPS: currentConfig.TRUSTED_PROXY_IPS,

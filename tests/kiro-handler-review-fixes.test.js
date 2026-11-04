@@ -285,6 +285,80 @@ describe('Kiro request timing covers account selection', () => {
     });
 });
 
+describe('CC endpoint streaming contract', () => {
+    afterEach(() => jest.restoreAllMocks());
+
+    test.each([false, true])('public CC endpoint forwards configured buffering=%s and scoped session context', async buffered => {
+        const req = new EventEmitter(), res = response();
+        req.headers = { 'x-api-key': 'test-client-key' }; req.url = '/cc/v1/messages';
+        let sentBody, options;
+        const backend = { generateContentStream: async function* (_, requestBody, received) {
+            sentBody = requestBody; options = received;
+            yield startChunk(); yield textChunk(); yield { type: 'message_stop' };
+        } };
+        const pending = handleContentGenerationRequest(req, res, backend, ENDPOINT_TYPE.CLAUDE_CC_MESSAGE,
+            { MODEL_PROVIDER: KIRO, PROMPT_LOG_MODE: 'none', SSE_HEARTBEAT_INTERVAL_MS: 0,
+                ...(buffered ? { KIRO_CC_BUFFERED: true } : {}) }, null, null, null);
+        req.emit('data', Buffer.from(JSON.stringify({ model: MODEL, ...body(), stream: true })));
+        req.emit('end');
+        await settles(pending, res);
+        expect(sentBody).toMatchObject({ _ccBuffered: buffered, _ccEndpoint: true });
+        expect(options.kiroSession.key).toMatch(/^[a-f0-9]{64}$/);
+        expect(JSON.stringify(options.kiroSession)).not.toContain('test-client-key');
+    });
+
+    test.each(['stream', 'unary'])('classified failures expose Retry-After through the %s response', async mode => {
+        const error = Object.assign(new Error('Model temporarily unavailable'), {
+            status: 503, code: 'KIRO_MODEL_UNAVAILABLE', kiroErrorKind: 'model_unavailable', skipErrorCount: true,
+            shouldSwitchCredential: false, response: { status: 503, headers: { 'retry-after': '17' } }
+        });
+        const backend = { generateContent: async () => { throw error; }, generateContentStream: async function* () { throw error; } };
+        const res = response(), manager = pool();
+        if (mode === 'stream') {
+            await runStream(res, backend, manager);
+            expect(res.write.mock.calls.flat().join('')).toContain('"retry_after":"17"');
+            expect(res.write.mock.calls.flat().join('')).toContain('"status":503');
+        } else {
+            await handleUnaryRequest(res, backend, MODEL, body(), 'claude', KIRO, 'none', null, manager, 'node', null,
+                { CONFIG: {}, currentRetry: 0, maxRetries: 0 });
+            expect(res.writeHead).toHaveBeenCalledWith(503, expect.objectContaining({ 'Retry-After': '17' }));
+        }
+        assertNoProviderPenalty(manager);
+    });
+});
+
+describe('error status precedence', () => {
+    afterEach(() => jest.restoreAllMocks());
+
+    test.each(['stream', 'unary'])('a provider-remapped status wins over the raw response status in the %s response', async mode => {
+        // Qwen maps a daily-quota 403 to 429 while retaining the raw response.
+        const error = Object.assign(new Error('quota exhausted'), { status: 429, skipErrorCount: true,
+            response: { status: 403, headers: {} } });
+        const backend = { generateContent: async () => { throw error; }, generateContentStream: async function* () { throw error; } };
+        const res = response(), manager = pool();
+        if (mode === 'stream') {
+            await handleStreamRequest(res, backend, MODEL, body(), 'claude', 'openai-qwen-oauth', 'none', null, manager, 'node', null,
+                { CONFIG: {}, currentRetry: 0, maxRetries: 0 });
+            expect(res.write.mock.calls.flat().join('')).toContain('"type":"rate_limit_error"');
+        } else {
+            await handleUnaryRequest(res, backend, MODEL, body(), 'claude', 'openai-qwen-oauth', 'none', null, manager, 'node', null,
+                { CONFIG: {}, currentRetry: 0, maxRetries: 0 });
+            expect(res.writeHead).toHaveBeenCalledWith(429, expect.any(Object));
+            expect(JSON.parse(res.end.mock.calls[0][0]).error.type).toBe('rate_limit_error');
+        }
+    });
+
+    test('an Axios-style error without a numeric status uses its response status', async () => {
+        const error = Object.assign(new Error('Request failed with status code 429'), { code: 'ERR_BAD_RESPONSE',
+            skipErrorCount: true, response: { status: 429, headers: { 'retry-after': '9' } } });
+        const backend = { generateContent: async () => { throw error; } };
+        const res = response();
+        await handleUnaryRequest(res, backend, MODEL, body(), 'claude', 'openai-qwen-oauth', 'none', null, pool(), 'node', null,
+            { CONFIG: {}, currentRetry: 0, maxRetries: 0 });
+        expect(res.writeHead).toHaveBeenCalledWith(429, expect.objectContaining({ 'Retry-After': '9' }));
+    });
+});
+
 describe('Kiro retry configuration reaches public handlers', () => {
     afterEach(() => jest.restoreAllMocks());
 

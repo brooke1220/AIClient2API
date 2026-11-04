@@ -128,6 +128,21 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         CRON_NEAR_MINUTES: 15,
         CRON_REFRESH_TOKEN: false,
         KIRO_DYNAMIC_MODELS: false,
+        KIRO_CC_BUFFERED: false,
+        KIRO_MAX_BUFFERED_RESPONSE_BYTES: 32 * 1024 * 1024,
+        KIRO_SESSION_AFFINITY: true,
+        KIRO_ACCOUNT_MIN_INTERVAL_MS: 0,
+        KIRO_ACCOUNT_REQUESTS_PER_MINUTE: 0,
+        KIRO_IMAGE_MAX_SOURCE_BYTES: 10 * 1024 * 1024,
+        KIRO_IMAGE_MAX_PIXELS: 40000000,
+        KIRO_IMAGE_MAX_EDGE: 1568,
+        KIRO_IMAGE_MAX_BASE64_BYTES: 400000,
+        KIRO_REQUEST_TRACE: false,
+        KIRO_PROMPT_CACHE_MODE: 'off', // off | observe | estimate; native usage always wins
+        KIRO_PROMPT_CACHE_POLICY: 'auto', // auto | explicit | history
+        KIRO_PROMPT_CACHE_DEFAULT_TTL_MS: 300000,
+        KIRO_PROMPT_CACHE_MAX_ENTRIES: 65536,
+        KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL: {},
         KIRO_MODEL_CACHE_TTL_MS: 300000,
         KIRO_REFRESH_AHEAD_MINUTES: 10, // 有效凭证提前续期，不暂停正常请求
         KIRO_REFRESH_JITTER_MS: 30000, // 按凭据错开提前续期时间

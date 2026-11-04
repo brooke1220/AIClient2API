@@ -73,7 +73,7 @@ export async function handleAPIRequests(method, path, req, res, currentConfig, a
             await handleContentGenerationRequest(req, res, apiService, ENDPOINT_TYPE.CLAUDE_MESSAGE, currentConfig, promptLogFilename, providerPoolManager, currentConfig.uuid, path);
             return true;
         }
-        // Claude Code 专用缓冲流端点：先收集全部上游事件，用真实 input_tokens 一次性输出
+        // Claude Code 专用端点：默认实时输出；KIRO_CC_BUFFERED=true 时收集全部上游事件后用真实 input_tokens 一次性输出
         if (path === '/cc/v1/messages') {
             await handleContentGenerationRequest(req, res, apiService, ENDPOINT_TYPE.CLAUDE_CC_MESSAGE, currentConfig, promptLogFilename, providerPoolManager, currentConfig.uuid, path);
             return true;

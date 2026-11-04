@@ -2,9 +2,11 @@ import { jest } from '@jest/globals';
 jest.mock('open', () => ({ __esModule: true, default: jest.fn() }));
 jest.mock('../src/utils/logger.js', () => ({ __esModule: true, default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() } }));
 import { service, tick, collect, model, request } from './helpers/kiro-safety-fixtures.js';
-import { KiroModelCache } from '../src/providers/claude/kiro-model-cache.js';
+import { KiroModelCache, kiroModelCapabilityScope } from '../src/providers/claude/kiro-model-cache.js';
+import * as serviceManager from '../src/services/service-manager.js';
 
 describe('opt-in, isolated model capability discovery', () => {
+    afterEach(() => jest.restoreAllMocks());
     test('discovery is disabled by default and does not contact upstream', async () => {
         const backend = service(); backend.axiosInstance = { request: jest.fn() };
         expect((await backend.listModels()).models.length).toBeGreaterThan(0); expect(backend.axiosInstance.request).not.toHaveBeenCalled();
@@ -60,6 +62,23 @@ describe('opt-in, isolated model capability discovery', () => {
         }) };
         await backend.listModels();
         expect(backend.axiosInstance.request.mock.calls.map(([config]) => config.headers.Authorization)).toEqual(['Bearer mock-only', 'Bearer mock-only']);
+    });
+    test('an in-flight discovery publishes its original configuration scope after a configuration edit', async () => {
+        const manager = { updateKiroModelCapabilities: jest.fn() };
+        jest.spyOn(serviceManager, 'getProviderPoolManager').mockReturnValue(manager);
+        const backend = service([], { KIRO_DYNAMIC_MODELS: true, KIRO_OAUTH_CREDS_FILE_PATH: '/mock/old.json' });
+        backend.uuid = 'account-a';
+        const originalScope = kiroModelCapabilityScope(backend.config);
+        let release;
+        backend.axiosInstance = { request: jest.fn(() => new Promise(resolve => { release = resolve; })) };
+        const pending = backend.listModels();
+        await tick();
+        backend.config.KIRO_OAUTH_CREDS_FILE_PATH = '/mock/new.json';
+        release({ data: { models: [{ modelId: 'old-model' }] } });
+        await pending;
+        expect(manager.updateKiroModelCapabilities).toHaveBeenCalledWith(
+            'claude-kiro-oauth', 'account-a', ['old-model'], 300000, originalScope);
+        expect(originalScope).not.toBe(kiroModelCapabilityScope(backend.config));
     });
     test('metadata caches have a bounded entry count and expired entries refresh', async () => {
         const cache = new KiroModelCache(2); const loader = jest.fn(async () => ({ models: [] }));

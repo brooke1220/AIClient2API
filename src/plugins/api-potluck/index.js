@@ -1,3 +1,4 @@
+import { extractNormalizedUsage as extractUsage, mergeNormalizedUsage as mergeUsage } from '../../utils/usage-normalizer.js';
 /**
  * API 大锅饭插件 - 标准插件格式
  * 
@@ -37,90 +38,6 @@ import logger from '../../utils/logger.js';
 import { handlePotluckApiRoutes, handlePotluckUserApiRoutes } from './api-routes.js';
 
 const pendingUsage = new Map();
-
-function toNumber(value) {
-    const num = Number(value);
-    return Number.isFinite(num) ? num : 0;
-}
-
-function normalizeUsageCandidate(candidate) {
-    if (!candidate || typeof candidate !== 'object') {
-        return null;
-    }
-    if (Array.isArray(candidate)) {
-        return candidate.reduce((usage, item) => mergeUsage(usage, normalizeUsageCandidate(item)), {
-            promptTokens: 0,
-            completionTokens: 0,
-            totalTokens: 0,
-            cachedTokens: 0
-        });
-    }
-
-    const usage = candidate.usage || candidate.message?.usage || candidate.usageMetadata || candidate.response?.usage || null;
-    const reasoningTokens = toNumber(
-        candidate.completion_tokens_details?.reasoning_tokens ??
-        candidate.output_tokens_details?.reasoning_tokens ??
-        usage?.completion_tokens_details?.reasoning_tokens ??
-        usage?.output_tokens_details?.reasoning_tokens ??
-        usage?.thoughtsTokenCount
-    );
-    const promptTokens = toNumber(
-        candidate.prompt_tokens ??
-        usage?.prompt_tokens ??
-        usage?.input_tokens ??
-        usage?.promptTokenCount ??
-        usage?.inputTokenCount
-    );
-    const completionTokens = toNumber(
-        candidate.completion_tokens ??
-        usage?.completion_tokens ??
-        usage?.output_tokens ??
-        usage?.candidatesTokenCount ??
-        usage?.outputTokenCount
-    ) + reasoningTokens;
-    const totalTokens = toNumber(
-        candidate.total_tokens ??
-        usage?.total_tokens ??
-        usage?.totalTokenCount
-    );
-
-    const cachedTokens = toNumber(
-        candidate.cached_tokens ??
-        usage?.cached_tokens ??
-        candidate.prompt_tokens_details?.cached_tokens ??
-        candidate.input_tokens_details?.cached_tokens ??
-        usage?.prompt_tokens_details?.cached_tokens ??
-        usage?.input_tokens_details?.cached_tokens ??
-        usage?.cache_read_input_tokens ??
-        usage?.cachedContentTokenCount
-    );
-
-    return {
-        promptTokens,
-        completionTokens,
-        totalTokens: totalTokens || (promptTokens + completionTokens),
-        cachedTokens
-    };
-}
-
-function mergeUsage(baseUsage, nextUsage) {
-    if (!nextUsage) return baseUsage;
-    return {
-        promptTokens: Math.max(baseUsage.promptTokens, nextUsage.promptTokens),
-        completionTokens: Math.max(baseUsage.completionTokens, nextUsage.completionTokens),
-        totalTokens: Math.max(baseUsage.totalTokens, nextUsage.totalTokens),
-        cachedTokens: Math.max(baseUsage.cachedTokens || 0, nextUsage.cachedTokens || 0)
-    };
-}
-
-function extractUsage(...candidates) {
-    return candidates.reduce((usage, candidate) => mergeUsage(usage, normalizeUsageCandidate(candidate)), {
-        promptTokens: 0,
-        completionTokens: 0,
-        totalTokens: 0,
-        cachedTokens: 0
-    });
-}
 
 function getTrackedRequestIds(hookContext = {}) {
     return [...new Set([

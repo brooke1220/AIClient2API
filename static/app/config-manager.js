@@ -13,8 +13,74 @@ const kiroNumberFields = [
     { key: 'KIRO_MODEL_CACHE_TTL_MS', id: 'kiroModelCacheTtlMs', label: 'modelCacheTtl', defaultValue: 300000, allowZero: true, integer: true, max: Number.MAX_SAFE_INTEGER },
     { key: 'KIRO_REFRESH_AHEAD_MINUTES', id: 'kiroRefreshAheadMinutes', label: 'refreshAhead', defaultValue: 10, allowZero: false, integer: false, max: Number.MAX_SAFE_INTEGER / 60000 },
     { key: 'KIRO_REFRESH_JITTER_MS', id: 'kiroRefreshJitterMs', label: 'refreshJitter', defaultValue: 30000, allowZero: true, integer: true, max: Number.MAX_SAFE_INTEGER },
-    { key: 'KIRO_REFRESH_WAIT_TIMEOUT_MS', id: 'kiroRefreshWaitTimeoutMs', label: 'refreshWaitTimeout', defaultValue: 15000, allowZero: false, integer: true, max: 2147483647 }
+    { key: 'KIRO_REFRESH_WAIT_TIMEOUT_MS', id: 'kiroRefreshWaitTimeoutMs', label: 'refreshWaitTimeout', defaultValue: 15000, allowZero: false, integer: true, max: 2147483647 },
+    { key: 'KIRO_PROMPT_CACHE_DEFAULT_TTL_MS', id: 'kiroPromptCacheTtlSeconds', label: 'cacheTtl', defaultValue: 300000, allowZero: false, integer: true, max: 3600000, scale: 1000 },
+    { key: 'KIRO_PROMPT_CACHE_MAX_ENTRIES', id: 'kiroPromptCacheMaxEntries', label: 'cacheMaxEntries', defaultValue: 65536, allowZero: false, integer: true, max: 1048576 }
 ];
+
+const kiroCacheSelectFields = [
+    { key: 'KIRO_PROMPT_CACHE_MODE', id: 'kiroPromptCacheMode', defaultValue: 'off', choices: ['off', 'observe', 'estimate'] },
+    { key: 'KIRO_PROMPT_CACHE_POLICY', id: 'kiroPromptCachePolicy', defaultValue: 'auto', choices: ['auto', 'explicit', 'history'] }
+];
+let kiroCacheModelRowId = 0;
+
+function addKiroCacheModelRow(model = '', minimum = '') {
+    const container = document.getElementById('kiroPromptCacheModels');
+    if (!container) return null;
+    const row = document.createElement('div');
+    const id = ++kiroCacheModelRowId;
+    row.className = 'kiro-cache-model-row';
+    row.innerHTML = `
+        <div class="form-group">
+            <label for="kiroCacheModel${id}" data-i18n="config.kiroSettings.cacheModelId">${t('config.kiroSettings.cacheModelId')}</label>
+            <input type="text" id="kiroCacheModel${id}" class="form-control kiro-cache-model-id" placeholder="claude-sonnet-4.5" required>
+        </div>
+        <div class="form-group">
+            <label for="kiroCacheMinimum${id}" data-i18n="config.kiroSettings.cacheMinimum">${t('config.kiroSettings.cacheMinimum')}</label>
+            <input type="number" id="kiroCacheMinimum${id}" class="form-control kiro-cache-model-minimum" min="1" max="9007199254740991" step="1" required>
+        </div>
+        <button type="button" class="btn btn-danger kiro-cache-model-remove"><i class="fas fa-trash" aria-hidden="true"></i><span data-i18n="config.kiroSettings.cacheRemoveModel">${t('config.kiroSettings.cacheRemoveModel')}</span></button>
+    `;
+    row.querySelector('.kiro-cache-model-id').value = model;
+    row.querySelector('.kiro-cache-model-minimum').value = minimum;
+    row.querySelector('.kiro-cache-model-remove').addEventListener('click', () => row.remove());
+    container.appendChild(row);
+    return row;
+}
+
+function loadKiroCacheModels(thresholds) {
+    const container = document.getElementById('kiroPromptCacheModels');
+    if (!container) return;
+    container.replaceChildren();
+    if (!thresholds || typeof thresholds !== 'object' || Array.isArray(thresholds)) return;
+    for (const [model, minimum] of Object.entries(thresholds)) addKiroCacheModelRow(model, minimum);
+}
+
+function readKiroCacheModels() {
+    const container = document.getElementById('kiroPromptCacheModels');
+    if (!container) return undefined;
+    const entries = [];
+    const seen = new Set();
+    for (const row of container.querySelectorAll('.kiro-cache-model-row')) {
+        const modelInput = row.querySelector('.kiro-cache-model-id');
+        const minimumInput = row.querySelector('.kiro-cache-model-minimum');
+        const model = modelInput.value.trim();
+        if (!model || ['__proto__', 'constructor', 'prototype'].includes(model) || seen.has(model)) {
+            showToast(t('common.error'), t('config.kiroSettings.cacheInvalidModel'), 'error');
+            modelInput.focus();
+            return null;
+        }
+        const minimum = Number(minimumInput.value);
+        if (!Number.isSafeInteger(minimum) || minimum <= 0 || !String(minimumInput.value).trim()) {
+            showToast(t('common.error'), t('config.kiroSettings.invalidNumber', { field: t('config.kiroSettings.cacheMinimum') }), 'error');
+            minimumInput.focus();
+            return null;
+        }
+        seen.add(model);
+        entries.push([model, minimum]);
+    }
+    return Object.fromEntries(entries);
+}
 
 function getSelectedModelProviders() {
     const modelProviderEl = document.getElementById('modelProvider');
@@ -224,6 +290,9 @@ function showChangePasswordModal() {
 }
 
 function initConfigPageHelpers() {
+    bindOnce(document.getElementById('kiroPromptCacheAddModel'), 'click', () => {
+        addKiroCacheModelRow()?.querySelector('.kiro-cache-model-id').focus();
+    }, 'kiroPromptCacheAddModel');
     const apiKeyEl = document.getElementById('apiKey');
     if (apiKeyEl && !apiKeyEl.dataset.handoffBound) {
         const update = () => updateConfigHandoffSummary();
@@ -423,10 +492,15 @@ async function loadConfiguration() {
 
         const kiroDynamicModelsEl = document.getElementById('kiroDynamicModels');
         if (kiroDynamicModelsEl) kiroDynamicModelsEl.checked = data.KIRO_DYNAMIC_MODELS === true;
-        for (const { key, id, defaultValue } of kiroNumberFields) {
+        for (const { key, id, defaultValue, scale = 1 } of kiroNumberFields) {
             const input = document.getElementById(id);
-            if (input) input.value = data[key] ?? defaultValue;
+            if (input) input.value = (data[key] ?? defaultValue) / scale;
         }
+        for (const { key, id, defaultValue, choices } of kiroCacheSelectFields) {
+            const input = document.getElementById(id);
+            if (input) input.value = choices.includes(data[key]) ? data[key] : defaultValue;
+        }
+        loadKiroCacheModels(data.KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL);
 
         // 初始化替换规则 UI
         initReplacementsUI();
@@ -702,18 +776,33 @@ async function saveConfiguration(options = {}) {
 
     const kiroDynamicModelsEl = document.getElementById('kiroDynamicModels');
     if (kiroDynamicModelsEl) config.KIRO_DYNAMIC_MODELS = kiroDynamicModelsEl.checked;
-    for (const { key, id, label, allowZero, integer, max } of kiroNumberFields) {
+    for (const { key, id, label, allowZero, integer, max, scale = 1 } of kiroNumberFields) {
         const input = document.getElementById(id);
         if (!input) continue;
-        const value = Number(input.value);
+        const scaled = Number(input.value) * scale;
+        const value = scale === 1 ? scaled : Math.round(scaled);
         if (String(input.value).trim() === '' || !Number.isFinite(value) ||
-            (allowZero ? value < 0 : value <= 0) || (integer && !Number.isInteger(value)) || value > max) {
+            (allowZero ? value < 0 : value <= 0) || (integer && !Number.isInteger(value)) || value > max
+            || Math.abs(value - scaled) > 1e-6) {
             showToast(t('common.error'), t('config.kiroSettings.invalidNumber', { field: t(`config.kiroSettings.${label}`) }), 'error');
             input.focus();
             return;
         }
         config[key] = value;
     }
+    for (const { key, id, choices } of kiroCacheSelectFields) {
+        const input = document.getElementById(id);
+        if (!input) continue;
+        if (!choices.includes(input.value)) {
+            showToast(t('common.error'), t('config.kiroSettings.cacheInvalidSelection'), 'error');
+            input.focus();
+            return;
+        }
+        config[key] = input.value;
+    }
+    const cacheModels = readKiroCacheModels();
+    if (cacheModels === null) return;
+    if (cacheModels !== undefined) config.KIRO_PROMPT_CACHE_MIN_TOKENS_BY_MODEL = cacheModels;
 
     // 获取后台登录密码（如果有输入）
     const adminPassword = document.getElementById('adminPassword')?.value || '';

@@ -1,3 +1,18 @@
+import { createHash } from 'node:crypto';
+import path from 'node:path';
+import { kiroBudgetKeyForConfig, kiroCredentialFileForConfig } from './kiro-account-budget.js';
+
+/** Stable configuration source for pool capabilities; excludes UUID and rotating access tokens. */
+export function kiroModelCapabilityScope(config = {}) {
+    return createHash('sha256').update(JSON.stringify([
+        kiroBudgetKeyForConfig(config), path.resolve(kiroCredentialFileForConfig(config)),
+        config.KIRO_MODELS_URL || null, config.KIRO_BASE_URL || null,
+        config.KIRO_API_KEY_BASE_URL || null, config.KIRO_API_KEY_RUNTIME_ENABLED === true,
+        config.NODE_PROXY_URL || null, config.PROXY_URL || null, config.KIRO_SIDECAR_PROXY_URL || null,
+        config.TLS_SIDECAR_PROXY_URL || null, config.USE_SYSTEM_PROXY_KIRO === true
+    ])).digest('hex');
+}
+
 /** Per-service, bounded metadata cache. Keys include authentication and proxy identity. */
 export class KiroModelCache {
     constructor(limit = 16) { this.limit = limit; this.entries = new Map(); this.inflight = new Map(); }

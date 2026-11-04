@@ -405,6 +405,19 @@ export function cleanJsonSchemaForOpenAI(schema) {
 }
 
 /**
+ * OpenAI/Gemini prompt totals already include cache reads, whereas Claude's
+ * input_tokens excludes them. Split one total so the two protocols agree.
+ * @param {number} totalInputTokens - 含缓存读取的输入总数
+ * @param {number} cachedTokens - 缓存读取数
+ * @returns {{input_tokens: number, cache_read_input_tokens: number}}
+ */
+export function toClaudeInputUsage(totalInputTokens, cachedTokens) {
+    const total = Math.max(0, Number(totalInputTokens) || 0);
+    const cached = Math.min(total, Math.max(0, Number(cachedTokens) || 0));
+    return { input_tokens: total - cached, cache_read_input_tokens: cached };
+}
+
+/**
  * 映射结束原因
  * @param {string} reason - 结束原因
  * @param {string} sourceFormat - 源格式

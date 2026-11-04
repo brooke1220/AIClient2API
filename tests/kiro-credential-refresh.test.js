@@ -599,3 +599,48 @@ describe('credential rejections across a completed refresh', () => {
         expect(refresh).toHaveBeenCalledTimes(2);
     });
 });
+
+describe('usage queries', () => {
+    const usage = { usageBreakdownList: [] };
+
+    test('an expired idle token is refreshed before the usage request is sent', async () => {
+        const manager = pool();
+        const pending = deferred();
+        const refresh = refreshAdapter(pending);
+        const value = backend(manager, -1);
+        value.loadCredentials = jest.fn(async () => { value.accessToken = 'fresh-token'; });
+        value.axiosInstance.request.mockResolvedValue({ data: usage });
+        const operation = value.getUsageLimits();
+        await tick();
+        expect(refresh).toHaveBeenCalledTimes(1);
+        expect(value.axiosInstance.request).not.toHaveBeenCalled();
+        pending.resolve(true);
+        await expect(operation).resolves.toEqual(usage);
+        expect(value.axiosInstance.request).toHaveBeenCalledTimes(1);
+        expect(value.axiosInstance.request.mock.calls[0][0].headers.Authorization).toBe('Bearer fresh-token');
+    });
+
+    test('a failed refresh reports its cause without calling upstream', async () => {
+        const manager = pool();
+        const pending = deferred();
+        refreshAdapter(pending);
+        const value = backend(manager, -1);
+        const operation = value.getUsageLimits();
+        pending.promise.catch(() => {});
+        pending.reject(new Error('Token refresh failed (HTTP 400): invalid_grant'));
+        await expect(operation).rejects.toThrow('Kiro credential refresh failed before request: Token refresh failed (HTTP 400): invalid_grant');
+        expect(value.axiosInstance.request).not.toHaveBeenCalled();
+    });
+
+    test.each([
+        ['unhealthy', { isHealthy: false }],
+        ['suspended', { isHealthy: false, kiroAccountSuspended: true }],
+        ['cooldown', { isHealthy: false, scheduledRecoveryTime: new Date(Date.now() + 60000).toISOString() }]
+    ])('a %s account can still be queried', async (_, state) => {
+        const manager = pool([{ uuid: 'account', ...state }]);
+        const value = backend(manager, 60);
+        value.axiosInstance.request.mockResolvedValue({ data: usage });
+        await expect(value.getUsageLimits()).resolves.toEqual(usage);
+        expect(getServiceAdapter).not.toHaveBeenCalled();
+    });
+});

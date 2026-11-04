@@ -12,6 +12,7 @@ import { ProviderStrategyFactory } from './provider-strategies.js';
 import { getPluginManager } from '../core/plugin-manager.js';
 import { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
 import { isKiroProviderType } from '../providers/kiro-account-state.js';
+import { createKiroSessionContext, kiroClientScope } from '../providers/claude/kiro-session.js';
 
 // ==================== 时间与时区 ====================
 
@@ -351,7 +352,9 @@ function getPositiveInteger(value, fallback) {
  * Returns null when cooldown is disabled or the error is not an HTTP 429.
  */
 export function getRateLimitCooldownRecoveryTime(error, config = {}, now = Date.now(), providerType) {
-    if (!config?.RATE_LIMIT_COOLDOWN_ENABLED || Number(getErrorStatusCode(error)) !== 429 || error?.isKiroAccountUnavailable) {
+    if (isKiroProviderType(providerType) && error?.kiroErrorKind === 'capacity_throttled') return null;
+    const accountThrottle = isKiroProviderType(providerType) && error?.kiroAccountRateLimited === true;
+    if ((!config?.RATE_LIMIT_COOLDOWN_ENABLED && !accountThrottle) || Number(getErrorStatusCode(error)) !== 429 || error?.isKiroAccountUnavailable) {
         return null;
     }
 
@@ -935,7 +938,7 @@ export function isAuthorized(req, requestUrl, REQUIRED_API_KEY) {
  * @param {Object} responsePayload - The actual response payload (string for unary, object for stream chunks).
  * @param {boolean} isStream - Whether the response is a stream.
  */
-export async function handleUnifiedResponse(res, responsePayload, isStream, statusCode = 200) {
+export async function handleUnifiedResponse(res, responsePayload, isStream, statusCode = 200, extraHeaders = {}) {
     const validatedStatusCode = ensureValidStatusCode(statusCode);
     if (isStream) {
         res.writeHead(200, {
@@ -949,7 +952,7 @@ export async function handleUnifiedResponse(res, responsePayload, isStream, stat
         // not count as model output and must not disable empty-response retries.
         res.flushHeaders?.();
     } else {
-        res.writeHead(validatedStatusCode, { 'Content-Type': 'application/json' });
+        res.writeHead(validatedStatusCode, { 'Content-Type': 'application/json', ...extraHeaders });
     }
 
     if (isStream) {
@@ -1441,6 +1444,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             providerPoolManager?.assertProviderAvailable?.(toProvider, pooluuid, availability);
             if (retryContext?.slotLease?.assertUsable) generationOptions.kiroAccountLease = retryContext.slotLease;
             generationOptions.kiroTiming = kiroTiming;
+            generationOptions.kiroSession = retryContext.kiroSession;
         }
         const nativeStream = await service.generateContentStream(model, requestBody, generationOptions);
         
@@ -1777,7 +1781,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     acquireSlot: true,
                     signal: upstreamAbortController.signal,
                     excludeUuids: exhaustedUuids,
-                    preferOtherUuids: refreshTriedUuids
+                    preferOtherUuids: refreshTriedUuids,
+                    kiroSession: retryContext.kiroSession
                 });
                 
                 if (result && result.service) {
@@ -1945,6 +1950,8 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
             retryContext?.slotLease?.assertUsable?.(availability);
             providerPoolManager?.assertProviderAvailable?.(toProvider, pooluuid, availability);
             if (retryContext?.slotLease?.assertUsable) generationOptions.kiroAccountLease = retryContext.slotLease;
+            generationOptions.kiroSession = retryContext?.kiroSession;
+            generationOptions.kiroTiming = retryContext?.kiroTiming;
         }
         // fs.writeFile('oldRequest'+Date.now()+'.json', JSON.stringify(requestBody));
         const nativeResponse = await service.generateContent(model, requestBody, generationOptions);
@@ -2112,7 +2119,8 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                     acquireSlot: true,
                     signal: retryContext?.upstreamAbortController?.signal,
                     excludeUuids: exhaustedUuids,
-                    preferOtherUuids: refreshTriedUuids
+                    preferOtherUuids: refreshTriedUuids,
+                    kiroSession: retryContext.kiroSession
                 });
                 
                 if (result && result.service) {
@@ -2155,9 +2163,10 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
 
         // 使用新方法创建符合 fromProvider 格式的错误响应
         const errorResponse = createErrorResponse(error, fromProvider);
-        const rawStatusCode = error.status || error.code || (error.response && error.response.status) || 500;
+        // Providers may deliberately remap error.status while retaining the raw response.
+        const rawStatusCode = error.status || error.response?.status || error.code || 500;
         const statusCode = ensureValidStatusCode(rawStatusCode);
-        await handleUnifiedResponse(res, JSON.stringify(errorResponse), false, statusCode);
+        await handleUnifiedResponse(res, JSON.stringify(errorResponse), false, statusCode, retryAfterResponseHeaders(error));
     } finally {
         // 确保在请求结束或出错时释放插槽
         releaseCurrentSlot();
@@ -2384,10 +2393,11 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         // - 使用号池/AUTO 时按模型重选并支持 fallback
         // 注意：仅在号池场景开启 acquireSlot，占用并发名额或进入队列
         const shouldSelectByPool = providerPoolManager && (CONFIG.MODEL_PROVIDER === MODEL_PROVIDER.AUTO || (CONFIG.providerPools && CONFIG.providerPools[CONFIG.MODEL_PROVIDER]));
+        const kiroSession = createKiroSessionContext(originalRequestBody, kiroClientScope(req, CONFIG));
         const selectionStartedAt = performance.now();
         if (!service || shouldSelectByPool) {
             const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-            const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: shouldSelectByPool, signal: cancellation.controller.signal });
+            const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: shouldSelectByPool, signal: cancellation.controller.signal, kiroSession });
 
             ownedSlotLease = result.slotLease || null;
             cancellation.controller.signal.throwIfAborted();
@@ -2425,10 +2435,10 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
             processedRequestBody._requestBaseUrl = CONFIG.requestBaseUrl;
         }
 
-        // Claude Code 缓冲模式：/cc/v1/messages 端点收集全部上游事件后一次性输出，
-        // 以提供精确的 input_tokens（而非估算值）
+        // CC streams immediately by default; final usage arrives in message_delta.
         if (endpointType === ENDPOINT_TYPE.CLAUDE_CC_MESSAGE) {
-            processedRequestBody._ccBuffered = true;
+            processedRequestBody._ccBuffered = CONFIG.KIRO_CC_BUFFERED === true;
+            processedRequestBody._ccEndpoint = true;
         }
 
         // fs.writeFile('originalRequestBody'+Date.now()+'.json', JSON.stringify(originalRequestBody));
@@ -2477,7 +2487,7 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         const credentialSwitchMaxRetries = isKiroProviderType(toProvider)
             ? kiroRetryCount(CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES, 5)
             : CONFIG.CREDENTIAL_SWITCH_MAX_RETRIES || 5;
-        const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, slotLease: ownedSlotLease, upstreamAbortController: cancellation.controller, kiroTiming: { startedAt: requestStartedAt } };
+        const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, slotLease: ownedSlotLease, upstreamAbortController: cancellation.controller, kiroSession, kiroTiming: { startedAt: requestStartedAt } };
         if (isStream && isKiroProviderType(toProvider)) {
             logger.info(`[Kiro Timing] Request preparation: body: ${Math.round(bodyReadFinishedAt - requestStartedAt)}ms; account selection: ${Math.round(selectionMs)}ms; preprocessing: ${Math.round(performance.now() - preprocessingStartedAt)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
         }
@@ -2615,6 +2625,7 @@ function _applyCustomModelParameters(requestBody, customConfig, provider) {
 export function handleError(res, error, provider = null, fromProvider = null, req = null) {
     const rawStatusCode = error.response?.status || error.statusCode || error.status || error.code || 500;
     const statusCode = ensureValidStatusCode(rawStatusCode);
+    const headers = { 'Content-Type': 'application/json', ...retryAfterResponseHeaders(error) };
     
     // 如果没有提供 fromProvider 但提供了 req，尝试从路径推断
     if (!fromProvider && req && req.url) {
@@ -2627,7 +2638,7 @@ export function handleError(res, error, provider = null, fromProvider = null, re
     if (fromProvider) {
         const errorResponse = createErrorResponse(error, fromProvider);
         if (!res.headersSent) {
-            res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+            res.writeHead(statusCode, headers);
         }
         res.end(JSON.stringify(errorResponse));
         return;
@@ -2688,7 +2699,7 @@ export function handleError(res, error, provider = null, fromProvider = null, re
     }
 
     if (!res.headersSent) {
-        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.writeHead(statusCode, headers);
     }
 
     const errorPayload = {
@@ -2984,9 +2995,23 @@ export function formatToLocal(dateInput) {
  * @param {string} fromProvider - 客户端期望的提供商格式
  * @returns {Object} 格式化的错误响应对象
  */
+function retryAfterResponseHeaders(error) {
+    const value = getHeaderValue(error.response?.headers, 'retry-after');
+    if ((typeof value === 'string' && value.length <= 128 && !/[\r\n]/.test(value)) ||
+        (typeof value === 'number' && Number.isFinite(value) && value >= 0)) return { 'Retry-After': String(value) };
+    return {};
+}
+
+function kiroErrorMetadata(error) {
+    if (!error.kiroErrorKind) return {};
+    const retryAfter = retryAfterResponseHeaders(error)['Retry-After'];
+    return { status: error.status || error.response?.status,
+        ...(retryAfter !== undefined ? { retry_after: retryAfter } : {}) };
+}
+
 function createErrorResponse(error, fromProvider) {
     const protocolPrefix = getProtocolPrefix(fromProvider);
-    const rawStatusCode = error.status || error.code || 500;
+    const rawStatusCode = error.status || error.response?.status || error.code || 500;
     const statusCode = ensureValidStatusCode(rawStatusCode);
     const errorMessage = error.message || "An error occurred during processing.";
     
@@ -3015,6 +3040,7 @@ function createErrorResponse(error, fromProvider) {
             // OpenAI 非流式错误格式
             return {
                 error: {
+                    ...kiroErrorMetadata(error),
                     message: errorMessage,
                     type: getErrorType(statusCode),
                     code: error.responseFailureCode || getErrorType(statusCode)  // Preserve normalized upstream failure codes
@@ -3025,6 +3051,7 @@ function createErrorResponse(error, fromProvider) {
             // OpenAI Responses API 非流式错误格式
             return {
                 error: {
+                    ...kiroErrorMetadata(error),
                     type: getErrorType(statusCode),
                     message: errorMessage,
                     code: error.responseFailureCode || getErrorType(statusCode)
@@ -3036,6 +3063,7 @@ function createErrorResponse(error, fromProvider) {
             return {
                 type: "error",  // 核心区分标记
                 error: {
+                    ...kiroErrorMetadata(error),
                     type: getErrorType(statusCode),  // Claude 使用 error.type 作为核心判断
                     message: errorMessage
                 }
@@ -3045,6 +3073,7 @@ function createErrorResponse(error, fromProvider) {
             // Gemini 非流式错误格式（遵循 Google Cloud 标准）
             return {
                 error: {
+                    ...kiroErrorMetadata(error),
                     code: statusCode,
                     message: errorMessage,
                     status: getGeminiStatus(statusCode)  // Gemini 使用 status 作为核心判断
@@ -3055,6 +3084,7 @@ function createErrorResponse(error, fromProvider) {
             // 默认使用 OpenAI 格式
             return {
                 error: {
+                    ...kiroErrorMetadata(error),
                     message: errorMessage,
                     type: getErrorType(statusCode),
                     code: getErrorType(statusCode)
@@ -3072,7 +3102,7 @@ function createErrorResponse(error, fromProvider) {
  */
 function createStreamErrorResponse(error, fromProvider, sequenceNumber = 0) {
     const protocolPrefix = getProtocolPrefix(fromProvider);
-    const rawStatusCode = error.status || error.code || 500;
+    const rawStatusCode = error.status || error.response?.status || error.code || 500;
     const statusCode = ensureValidStatusCode(rawStatusCode);
     const errorMessage = error.message || "An error occurred during streaming.";
     
@@ -3101,6 +3131,7 @@ function createStreamErrorResponse(error, fromProvider, sequenceNumber = 0) {
             // OpenAI 流式错误格式（SSE data 块）
             const openaiError = {
                 error: {
+                    ...kiroErrorMetadata(error),
                     message: errorMessage,
                     type: getErrorType(statusCode),
                     code: error.responseFailureCode || null
@@ -3112,6 +3143,7 @@ function createStreamErrorResponse(error, fromProvider, sequenceNumber = 0) {
             // OpenAI Responses API 流式错误格式（SSE event + data）
             const responsesError = {
                 type: 'error',
+                ...kiroErrorMetadata(error),
                 sequence_number: sequenceNumber,
                 code: error.responseFailureCode || getErrorType(statusCode),
                 message: errorMessage,
@@ -3124,6 +3156,7 @@ function createStreamErrorResponse(error, fromProvider, sequenceNumber = 0) {
             const claudeError = {
                 type: "error",
                 error: {
+                    ...kiroErrorMetadata(error),
                     type: getErrorType(statusCode),
                     message: errorMessage
                 }
@@ -3136,6 +3169,7 @@ function createStreamErrorResponse(error, fromProvider, sequenceNumber = 0) {
             // 所以这里也需要使用 data: 前缀，保持与正常流式响应一致
             const geminiError = {
                 error: {
+                    ...kiroErrorMetadata(error),
                     code: statusCode,
                     message: errorMessage,
                     status: getGeminiStatus(statusCode)
@@ -3147,6 +3181,7 @@ function createStreamErrorResponse(error, fromProvider, sequenceNumber = 0) {
             // 默认使用 OpenAI SSE 格式
             const defaultError = {
                 error: {
+                    ...kiroErrorMetadata(error),
                     message: errorMessage,
                     type: getErrorType(statusCode),
                     code: error.responseFailureCode || null

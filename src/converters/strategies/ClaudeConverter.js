@@ -48,6 +48,12 @@ function getClaudeTokenUsage(usage) {
     };
 }
 
+function getClaudeCreditUsage(usage) {
+    if (!Number.isFinite(usage?.credit_usage) || usage.credit_usage < 0 || typeof usage.credit_unit !== 'string') return {};
+    return { credit_usage: usage.credit_usage, credit_unit: usage.credit_unit,
+        ...(typeof usage.credit_unit_plural === 'string' ? { credit_unit_plural: usage.credit_unit_plural } : {}) };
+}
+
 export class ClaudeConverter extends BaseConverter {
     constructor() {
         super('claude');
@@ -452,6 +458,8 @@ export class ClaudeConverter extends BaseConverter {
             finishReason = 'length';
         } else if (claudeResponse.stop_reason === 'tool_use') {
             finishReason = 'tool_calls';
+        } else if (claudeResponse.stop_reason === 'refusal') {
+            finishReason = 'content_filter';
         } else if (claudeResponse.stop_reason) {
             finishReason = claudeResponse.stop_reason;
         }
@@ -470,6 +478,7 @@ export class ClaudeConverter extends BaseConverter {
                 prompt_tokens: inputTokens,
                 completion_tokens: outputTokens,
                 total_tokens: inputTokens + outputTokens,
+                ...getClaudeCreditUsage(claudeResponse.usage),
                 cached_tokens: cachedTokens,
                 prompt_tokens_details: {
                     cached_tokens: cachedTokens
@@ -692,6 +701,7 @@ export class ClaudeConverter extends BaseConverter {
             let finishReason = stopReason === 'end_turn' || stopReason === 'stop_sequence' ? 'stop' :
                                 stopReason === 'max_tokens' ? 'length' :
                                 stopReason === 'tool_use' ? 'tool_calls' :
+                                stopReason === 'refusal' ? 'content_filter' :
                                 stopReason || null;
             // Preserve later usage-only metadata, but never terminate twice.
             if (state.finishSent) finishReason = null;
@@ -717,6 +727,7 @@ export class ClaudeConverter extends BaseConverter {
                     prompt_tokens: inputTokens,
                     completion_tokens: outputTokens,
                     total_tokens: inputTokens + outputTokens,
+                    ...getClaudeCreditUsage(state.usage),
                     cached_tokens: cachedTokens,
                     prompt_tokens_details: {
                         cached_tokens: cachedTokens
@@ -2143,14 +2154,14 @@ export class ClaudeConverter extends BaseConverter {
             });
         }
 
-        const incomplete = claudeResponse.stop_reason === 'max_tokens';
+        const incomplete = ['max_tokens', 'refusal'].includes(claudeResponse.stop_reason);
 
         return {
             background: false,
             created_at: createdAt,
             error: null,
             id: responseId,
-            incomplete_details: incomplete ? { reason: "max_output_tokens" } : null,
+            incomplete_details: incomplete ? { reason: claudeResponse.stop_reason === 'refusal' ? 'content_filter' : 'max_output_tokens' } : null,
             max_output_tokens: null,
             max_tool_calls: null,
             metadata: {},
@@ -2176,6 +2187,7 @@ export class ClaudeConverter extends BaseConverter {
             truncation: "disabled",
             usage: {
                 input_tokens: inputTokens,
+                ...getClaudeCreditUsage(claudeResponse.usage),
                 input_tokens_details: {
                     cached_tokens: cachedTokens
                 },
@@ -2278,18 +2290,19 @@ export class ClaudeConverter extends BaseConverter {
             state.stopReason = claudeChunk.delta?.stop_reason || state.stopReason;
         } else if (claudeChunk.type === 'message_stop') {
             for (const entry of state.items) this._finishOpenAIResponsesItem(state, entry, emit);
-            const incomplete = state.stopReason === 'max_tokens';
+            const incomplete = ['max_tokens', 'refusal'].includes(state.stopReason);
             const { inputTokens, outputTokens, cachedTokens } = getClaudeTokenUsage(state.usage);
             emit({
                 type: incomplete ? 'response.incomplete' : 'response.completed',
                 response: {
                     ...state.template,
                     status: incomplete ? 'incomplete' : 'completed',
-                    incomplete_details: incomplete ? { reason: 'max_output_tokens' } : null,
+                    incomplete_details: incomplete ? { reason: state.stopReason === 'refusal' ? 'content_filter' : 'max_output_tokens' } : null,
                     completed_at: incomplete ? null : Math.floor(Date.now() / 1000),
                     output: state.items.map(entry => this._snapshotOpenAIResponsesItem(entry)),
                     usage: {
                         input_tokens: inputTokens,
+                        ...getClaudeCreditUsage(state.usage),
                         input_tokens_details: { cached_tokens: cachedTokens },
                         output_tokens: outputTokens,
                         output_tokens_details: { reasoning_tokens: 0 },

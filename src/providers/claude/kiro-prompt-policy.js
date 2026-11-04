@@ -78,7 +78,7 @@ export function prepareKiroToolDescription(tool, wireName, config = {}) {
     if (!['reference', 'error'].includes(mode)) {
         throw policyError('KIRO_TOOL_DESCRIPTION_MODE must be reference or error');
     }
-    const original = tool.description;
+    const original = typeof tool.description === 'string' && tool.description.trim() ? tool.description : tool.name;
     const description = appendKiroPromptAdditions(original, [getKiroToolSizeHint(tool, config)]);
     if (Buffer.byteLength(description) <= KIRO_TOOL_DESCRIPTION_MAX_BYTES) return { description, documentation: '' };
     if (mode === 'error') throw policyError(`Kiro tool '${wireName}' description exceeds the ${KIRO_TOOL_DESCRIPTION_MAX_BYTES}-byte field budget; use KIRO_TOOL_DESCRIPTION_MODE=reference to preserve it`);

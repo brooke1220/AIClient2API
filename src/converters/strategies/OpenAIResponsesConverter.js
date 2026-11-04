@@ -14,7 +14,8 @@ import {
     CLAUDE_DEFAULT_MAX_TOKENS,
     GEMINI_DEFAULT_INPUT_TOKEN_LIMIT,
     GEMINI_DEFAULT_OUTPUT_TOKEN_LIMIT,
-    safeParseJSON
+    safeParseJSON,
+    toClaudeInputUsage
 } from '../utils.js';
 import {
     generateResponseCreated,
@@ -809,11 +810,7 @@ export class OpenAIResponsesConverter extends BaseConverter {
             content: content,
             model: model || responsesResponse.model,
             stop_reason: stop_reason,
-            usage: {
-                input_tokens: responsesResponse.usage?.input_tokens || 0,
-                output_tokens: responsesResponse.usage?.output_tokens || 0,
-                cache_read_input_tokens: responsesResponse.usage?.input_tokens_details?.cached_tokens || 0
-            }
+            usage: this._mapResponsesUsageToClaude(responsesResponse.usage)
         };
     }
 
@@ -832,11 +829,10 @@ export class OpenAIResponsesConverter extends BaseConverter {
         return this.claudeStreamStates.get(key);
     }
 
-    _mapResponsesUsageToClaude(usage = {}) {
+    _mapResponsesUsageToClaude(usage) {
         return {
-            input_tokens: usage.input_tokens || 0,
-            output_tokens: usage.output_tokens || 0,
-            cache_read_input_tokens: usage.input_tokens_details?.cached_tokens || 0
+            ...toClaudeInputUsage(usage?.input_tokens, usage?.input_tokens_details?.cached_tokens),
+            output_tokens: usage?.output_tokens || 0
         };
     }
 

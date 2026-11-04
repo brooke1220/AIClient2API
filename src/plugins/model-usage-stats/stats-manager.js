@@ -1,3 +1,4 @@
+import { extractNormalizedUsage as extractUsage, mergeNormalizedUsage as mergeUsage } from '../../utils/usage-normalizer.js';
 import { atomicWriteFile, atomicWriteFileSync } from '../../utils/file-lock.js';
 import { promises as fs } from 'fs';
 import { existsSync, mkdirSync, readFileSync } from 'fs';
@@ -38,6 +39,11 @@ function createEmptyUsage() {
         completionTokens: 0,
         totalTokens: 0,
         cachedTokens: 0,
+        cacheCreationTokens: 0,
+        cacheProviderRequests: 0,
+        cacheEstimatedRequests: 0,
+        cacheMixedRequests: 0,
+        cacheUnavailableRequests: 0,
         maxQps: 0,
         maxRpm: 0,
         maxTps: 0,
@@ -47,6 +53,8 @@ function createEmptyUsage() {
 
 function createDefaultStore() {
     return {
+        schemaVersion: 2,
+        cacheStatsStartedAt: new Date().toISOString(),
         updatedAt: null,
         summary: createEmptyUsage(),
         providers: {},
@@ -63,6 +71,11 @@ function normalizeUsageBlock(block) {
         completionTokens: toNumber(block.completionTokens),
         totalTokens: toNumber(block.totalTokens),
         cachedTokens: toNumber(block.cachedTokens),
+        cacheCreationTokens: toNumber(block.cacheCreationTokens),
+        cacheProviderRequests: toNumber(block.cacheProviderRequests),
+        cacheEstimatedRequests: toNumber(block.cacheEstimatedRequests),
+        cacheMixedRequests: toNumber(block.cacheMixedRequests),
+        cacheUnavailableRequests: block.cacheUnavailableRequests === undefined ? toNumber(block.requestCount) : toNumber(block.cacheUnavailableRequests),
         maxQps: toNumber(block.maxQps),
         maxRpm: toNumber(block.maxRpm),
         maxTps: toNumber(block.maxTps),
@@ -72,6 +85,8 @@ function normalizeUsageBlock(block) {
 
 function normalizeStore(store) {
     const normalizedStore = {
+        schemaVersion: 2,
+        cacheStatsStartedAt: store?.cacheStatsStartedAt || new Date().toISOString(),
         updatedAt: store?.updatedAt || null,
         summary: normalizeUsageBlock(store?.summary),
         providers: {},
@@ -130,7 +145,15 @@ function ensureLoaded() {
     try {
         if (existsSync(STATS_STORE_FILE)) {
             const content = readFileSync(STATS_STORE_FILE, 'utf8');
-            statsStore = normalizeStore(JSON.parse(content));
+            const stored = JSON.parse(content);
+            statsStore = normalizeStore(stored);
+            if (stored.schemaVersion !== 2 || !stored.cacheStatsStartedAt) {
+                // Persist the migration even without new traffic, so its start
+                // timestamp does not move forward on every process restart.
+                isDirty = true;
+                mutationVersion += 1;
+                syncWriteToFile();
+            }
             logger.info(`[Model Usage Stats] Loaded stats store: providers=${Object.keys(statsStore.providers).length}, requests=${statsStore.summary.requestCount}, totalTokens=${statsStore.summary.totalTokens}`);
         } else {
             statsStore = createDefaultStore();
@@ -239,97 +262,6 @@ function toNumber(value) {
     return Number.isFinite(Number(value)) ? Number(value) : 0;
 }
 
-function normalizeUsageCandidate(candidate) {
-    if (!candidate || typeof candidate !== 'object') {
-        return null;
-    }
-    if (Array.isArray(candidate)) {
-        const usage = candidate.reduce((merged, item) => mergeUsage(merged, normalizeUsageCandidate(item)), {
-            promptTokens: 0,
-            completionTokens: 0,
-            totalTokens: 0,
-            cachedTokens: 0
-        });
-        const hasUsage = usage.promptTokens > 0 || usage.completionTokens > 0 || usage.totalTokens > 0 || usage.cachedTokens > 0;
-        return hasUsage ? usage : null;
-    }
-
-    const usage = candidate.usage || candidate.message?.usage || candidate.usageMetadata || candidate.response?.usage || null;
-    const reasoningTokens = toNumber(
-        candidate.completion_tokens_details?.reasoning_tokens ??
-        candidate.output_tokens_details?.reasoning_tokens ??
-        usage?.completion_tokens_details?.reasoning_tokens ??
-        usage?.output_tokens_details?.reasoning_tokens ??
-        usage?.thoughtsTokenCount
-    );
-    const promptTokens = toNumber(
-        candidate.prompt_tokens ??
-        usage?.prompt_tokens ??
-        usage?.input_tokens ??
-        usage?.promptTokenCount ??
-        usage?.inputTokenCount
-    );
-    const completionTokens = toNumber(
-        candidate.completion_tokens ??
-        usage?.completion_tokens ??
-        usage?.output_tokens ??
-        usage?.candidatesTokenCount ??
-        usage?.outputTokenCount
-    ) + reasoningTokens;
-    const totalTokens = toNumber(
-        candidate.total_tokens ??
-        usage?.total_tokens ??
-        usage?.totalTokenCount
-    );
-    const cachedTokens = toNumber(
-        candidate.cached_tokens ??
-        usage?.cached_tokens ??
-        candidate.prompt_tokens_details?.cached_tokens ??
-        candidate.input_tokens_details?.cached_tokens ??
-        usage?.prompt_tokens_details?.cached_tokens ??
-        usage?.input_tokens_details?.cached_tokens ??
-        usage?.cache_read_input_tokens ??
-        usage?.cachedContentTokenCount
-    );
-
-    const hasUsage = promptTokens > 0 || completionTokens > 0 || totalTokens > 0 || cachedTokens > 0;
-    if (!hasUsage) {
-        return null;
-    }
-
-    return {
-        promptTokens,
-        completionTokens,
-        totalTokens: totalTokens || (promptTokens + completionTokens),
-        cachedTokens
-    };
-}
-
-function mergeUsage(baseUsage, nextUsage) {
-    if (!nextUsage) {
-        return baseUsage;
-    }
-
-    return {
-        promptTokens: Math.max(baseUsage.promptTokens, nextUsage.promptTokens),
-        completionTokens: Math.max(baseUsage.completionTokens, nextUsage.completionTokens),
-        totalTokens: Math.max(baseUsage.totalTokens, nextUsage.totalTokens || (nextUsage.promptTokens + nextUsage.completionTokens)),
-        cachedTokens: Math.max(baseUsage.cachedTokens, nextUsage.cachedTokens)
-    };
-}
-
-function extractUsage(...candidates) {
-    return candidates.reduce((usage, candidate) => {
-        const normalized = normalizeUsageCandidate(candidate);
-        return mergeUsage(usage, normalized);
-    }, {
-        promptTokens: 0,
-        completionTokens: 0,
-        totalTokens: 0,
-        cachedTokens: 0
-    });
-}
-
 function getPendingRequest(requestId, meta = {}) {
     ensureLoaded();
 
@@ -367,6 +299,9 @@ function applyUsage(target, usage, timestamp) {
     target.completionTokens += usage.completionTokens;
     target.totalTokens += usage.totalTokens || (usage.promptTokens + usage.completionTokens);
     target.cachedTokens += usage.cachedTokens;
+    target.cacheCreationTokens += usage.cacheCreationTokens || 0;
+    const sourceField = { provider: 'cacheProviderRequests', estimated: 'cacheEstimatedRequests', mixed: 'cacheMixedRequests' }[usage.cacheSource] || 'cacheUnavailableRequests';
+    target[sourceField] += 1;
     target.lastUsedAt = timestamp;
 }
 
@@ -376,6 +311,11 @@ function resetUsageBlockTokens(block) {
     block.completionTokens = 0;
     block.totalTokens = 0;
     block.cachedTokens = 0;
+    block.cacheCreationTokens = 0;
+    block.cacheProviderRequests = 0;
+    block.cacheEstimatedRequests = 0;
+    block.cacheMixedRequests = 0;
+    block.cacheUnavailableRequests = block.requestCount;
     block.maxQps = 0;
     block.maxRpm = 0;
     block.maxTps = 0;
@@ -415,7 +355,10 @@ export async function finalizeRequest({ requestId, model, provider, fromProvider
         return false;
     }
 
-    const state = getPendingRequest(requestId, { model, provider, fromProvider, isStream });
+    // Hooks can be delivered twice. A missing pending record is already
+    // finalized (or never observed), and must not create another request.
+    const state = pendingRequests.get(requestId);
+    if (!state) return false;
     
     // 防重逻辑：如果该请求已经处理过速率统计，则直接删除并返回
     if (state.rateRecorded) {
@@ -441,7 +384,9 @@ export async function finalizeRequest({ requestId, model, provider, fromProvider
         promptTokens: state.usage.promptTokens,
         completionTokens: state.usage.completionTokens,
         totalTokens: state.usage.totalTokens || (state.usage.promptTokens + state.usage.completionTokens),
-        cachedTokens: state.usage.cachedTokens
+        cachedTokens: state.usage.cachedTokens,
+        cacheCreationTokens: state.usage.cacheCreationTokens || 0,
+        cacheSource: state.usage.cacheSource || 'unavailable'
     };
 
     applyUsage(statsStore.summary, usage, timestamp);
@@ -528,6 +473,7 @@ export async function resetStats() {
 
 export async function resetTokenStats() {
     ensureLoaded();
+    statsStore.cacheStatsStartedAt = new Date().toISOString();
 
     resetUsageBlockTokens(statsStore.summary);
 

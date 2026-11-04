@@ -635,6 +635,40 @@ describe('Kiro real HTTP error-response cancellation', () => {
     beforeEach(() => jest.clearAllMocks());
     afterEach(() => jest.restoreAllMocks());
 
+    test.each([
+        [500, { reason: 'MODEL_TEMPORARILY_UNAVAILABLE' }, 503, 'KIRO_MODEL_UNAVAILABLE'],
+        [500, { message: 'Invalid request: messages must alternate' }, 400, 'KIRO_REQUEST_INVALID'],
+        [524, { message: 'Gateway timed out' }, 504, 'KIRO_GATEWAY_TIMEOUT'],
+        [429, { reason: 'INSUFFICIENT_MODEL_CAPACITY' }, 429, 'KIRO_CAPACITY_THROTTLED'],
+        [400, { reason: 'CONTENT_LENGTH_EXCEEDS_THRESHOLD' }, 413, 'KIRO_PAYLOAD_TOO_LARGE']
+    ])('real HTTP %s errors are normalized once and preserve Retry-After', async (status, body, normalized, code) => {
+        let attempts = 0;
+        const server = http.createServer((req, res) => {
+            attempts++; req.resume();
+            req.on('end', () => {
+                res.writeHead(status, { 'Content-Type': 'application/json', 'Retry-After': '19' });
+                res.end(JSON.stringify(body));
+            });
+        });
+        try {
+            await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+            const service = createService();
+            service.isInitialized = false; service.loadCredentials = jest.fn(async () => {});
+            await service.initialize();
+            service.baseUrl = `http://127.0.0.1:${server.address().port}/generateAssistantResponse`;
+            service._applySidecar = config => { config.proxy = false; };
+            service._requestWithBuilderEndpointRouting = KiroApiService.prototype._requestWithBuilderEndpointRouting;
+            const expected = { status: normalized, code, skipErrorCount: true, shouldSwitchCredential: false,
+                response: { status: normalized, headers: expect.objectContaining({ 'retry-after': '19' }) } };
+            await expect(bounded(service.generateContent(MODEL, request()))).rejects.toMatchObject(expected);
+            await expect(bounded(service.callApi('', MODEL, request()))).rejects.toMatchObject(expected);
+            expect(attempts).toBe(2);
+        } finally {
+            server.closeAllConnections();
+            await new Promise(resolve => server.close(resolve));
+        }
+    });
+
     test.each([400, 401, 402, 403, 429, 503])('disconnect cancels a stalled %i response body and releases the slot exactly once', async status => {
         const sockets = new Set();
         const server = http.createServer((req, res) => {
