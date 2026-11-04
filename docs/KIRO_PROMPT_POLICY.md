@@ -9,8 +9,9 @@
 - 转移后的文档仍占输入空间。最终请求超出 `KIRO_MAX_PAYLOAD_BYTES` 时按现有规则返回 413；旧历史裁剪仍必须显式开启，不能裁剪当前输入、工具参数或系统区来掩盖超限。
 - `KIRO_TOOL_SIZE_HINTS=true`：仅同时具备文件修改名称、文件上下文和内容参数信号的工具收到大小提醒。读取、搜索、任意命令、用户创建和数据库写入没有全局拆分指令。
 - `KIRO_TOOL_ARG_SOFT_LIMIT_BYTES=16384`：UTF-8 字节参考目标，不是真实上游硬限制。保持小操作单次调用，不牺牲原子性，不改变工具文档的执行语义。
-- `KIRO_THINKING_PROMPT_MODE=auto`：只有显式原生 thinking 控制才替代兼容 XML；仅有 effort 字段不是思考已启用的证据。当前映射只构造 effort，因此 Claude 显式思考请求继续保留启用 XML，不向其他模型添加 Claude XML。自适应兼容路径保留既有 XML 格式，并与结构化 effort 使用统一解析后的强度来源；XML 的旧兼容集合仍为 low/medium/high，更高档位保留在支持它们的结构化字段中，不凭空扩展 XML 协议。`legacy` 强制保留兼容 XML，`off` 仅关闭网关 XML；都不删除客户端已有指令或结构化 effort。这里没有新增未经验证的原生 thinking 请求字段，也不保证 XML 数字是上游真实思考额度。
-- Claude 强度来源优先级：`reasoning_effort` > `output_config.effort` > 活跃 `thinking.effort` > 既有模型默认值。空白字符串视为未设置；显式不支持的强度按已有模型规则回退，不擅自选择下一来源。`thinking.type=disabled` 或没有启用思考时，嵌套的 `thinking.effort` 不会隐式启用控制。仅 XML 的旧模型也使用相同来源优先级。GPT 保留原有命名空间和禁用逻辑。
+- `KIRO_THINKING_PROMPT_MODE=auto`：只有原生思考（模型常开，或显式 `thinking.type`）才替代兼容 XML；仅有 effort 字段不是思考已启用的证据。按 Kiro List-Available-Models 的模型 schema：opus-5、sonnet-5、opus-4.8/4.7/4.6、sonnet-4.6 允许 `thinking.type` 为 `adaptive`/`disabled`，客户端 `enabled`/`adaptive` 映射为 `adaptive`，`disabled` 原样发送，此时不注入 XML；opus-5.5、sonnet-5.5 只允许常开模式，不发送开关字段（与 Kiro IDE 一致），也不注入 XML；其余 Claude 模型仍走 XML，不向其他模型添加 Claude XML。2026-11-04 直连旧端点 `q.us-east-1.amazonaws.com` 实测：opus-5.5、sonnet-5.5、opus-5 不带 thinking 字段和 XML 时仍返回原生 `reasoningContentEvent`；sonnet-4.6 `adaptive` 在较难问题上返回原生思考，`disabled` 不返回思考；`disabled` 搭配 xhigh/max 正常返回，因此不像 Kiro IDE 那样把强度降为 high。客户端 `enabled` 的 `budget_tokens` 在原生路径上没有对应字段，只保留 effort。自适应兼容路径保留既有 XML 格式，并与结构化 effort 使用统一解析后的强度来源；XML 的旧兼容集合仍为 low/medium/high，更高档位保留在支持它们的结构化字段中，不凭空扩展 XML 协议。`legacy` 强制保留兼容 XML，`off` 仅关闭网关 XML；都不删除客户端已有指令或结构化 effort 和原生 thinking 字段。不保证 XML 数字是上游真实思考额度。
+- Claude 强度来源优先级：`reasoning_effort` > `output_config.effort` > 活跃 `thinking.effort` > 既有模型默认值。空白字符串视为未设置；模型不支持的已知档位降到最近的较低支持档位（如 sonnet-4.6 的 xhigh 降为 high），未知值回退到 medium，不擅自选择下一来源。`thinking.type=disabled` 或没有启用思考时，嵌套的 `thinking.effort` 不会隐式启用控制。仅 XML 的旧模型也使用相同来源优先级。GPT 保留原有命名空间和禁用逻辑。
+- Responses 请求发往 Kiro 时，原始 `reasoning.effort` 保留为内部 `reasoning_effort`，由模型映射规则决定最终档位；同时保留旧模型 XML 路径所需的 `budget_tokens`。`none` 只转换为禁用思考，不额外生成 effort 字段。普通 Claude 接口仍使用原有预算转换。
 - `KIRO_TRUNCATION_RECOVERY=true`：仅在正常结束的纯正文响应被网关实际观察到 `max_tokens` 后记录摘要；只有匹配同一模型、客户端 system、工具定义、完整历史和可用用户/会话标识的下一条用户消息得到恢复说明。不增加假的助手确认、不制造 tool_result、不自动继续生成。
 
 对于以 assistant 开头的恢复历史，只在上游协议需要时补最小的用户占位消息，不恢复旧身份前缀。首条历史或当前消息里的孤立工具结果仍按已有规则保留为带状态的文本，图片及其关联说明不丢失；有真实配对的工具结果仍作为 toolResults 发送。
@@ -61,7 +62,7 @@ npm test -- --runInBand --testPathIgnorePatterns tests/api-integration.test.js
 1. 保留客户端指令，关闭大小提醒和恢复通知；
 2. 仅开启大小提醒；
 3. 再开启证据驱动的恢复通知；
-4. 分别验证 `auto` 与确实需要的 `legacy` 思考路径；只有确认目标 Kiro 路由有独立原生启用控制后，才考虑用 `off` 关闭兼容启用 XML。
+4. 分别验证 `auto` 与确实需要的 `legacy` 思考路径；`auto` 已对有原生思考控制的模型停用兼容 XML，`off` 只影响仍走 XML 的旧模型。
 
 保持长工具说明不丢失；记录任务完成率、产出测试通过率、工具格式错误率、首个可见输出时间、总耗时和真实 token 用量。不要以思考文本更长、身份自述或模拟预算数字证明底层模型能力提升。
 

@@ -234,11 +234,12 @@ function normalizeKiroToolInput(input) {
     return String(input);
 }
 
-// Per-model context window sizes for accurate token estimation
+// Per-model context window sizes for accurate token estimation; values follow
+// Kiro List-Available-Models tokenLimits.maxInputTokens.
 const MODEL_CONTEXT_TOKENS = {
-    "gpt-5.6-sol": 1000000,
-    "gpt-5.6-terra": 1000000,
-    "gpt-5.6-luna": 1000000,
+    "gpt-5.6-sol": 986000,
+    "gpt-5.6-terra": 986000,
+    "gpt-5.6-luna": 986000,
     "claude-opus-5-5": 1000000,
     "claude-sonnet-5-5": 1000000,
     "claude-sonnet-5": 1000000,
@@ -246,9 +247,9 @@ const MODEL_CONTEXT_TOKENS = {
     "claude-opus-4-8": 1000000,
     "claude-opus-4-7": 1000000,
     "claude-opus-4-6": 1000000,
-    "claude-opus-4-5": 1000000,
-    "claude-opus-4-5-20251101": 1000000,
-    "claude-sonnet-4-6": 200000,
+    "claude-opus-4-5": 200000,
+    "claude-opus-4-5-20251101": 200000,
+    "claude-sonnet-4-6": 1000000,
     "claude-sonnet-4-5": 200000,
     "claude-sonnet-4-5-20250929": 200000,
     "claude-haiku-4-5": 200000,

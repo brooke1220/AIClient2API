@@ -202,7 +202,10 @@ describe('thinking transport selection', () => {
         ['claude-sonnet-4.6', { thinking: { type: 'disabled' } }, {}, false],
         ['claude-sonnet-4.6', { thinking: { type: 'unverified' } }, {}, true],
         ['claude-sonnet-4.5', undefined, { KIRO_THINKING_PROMPT_MODE: 'off' }, false],
-        ['gpt-5.6-sol', undefined, { KIRO_THINKING_PROMPT_MODE: 'legacy' }, false]
+        ['gpt-5.6-sol', undefined, { KIRO_THINKING_PROMPT_MODE: 'legacy' }, false],
+        ['claude-opus-5.5', { output_config: { effort: 'xhigh' } }, {}, false],
+        ['claude-sonnet-5.5', undefined, {}, false],
+        ['claude-opus-5.5', { output_config: { effort: 'xhigh' } }, { KIRO_THINKING_PROMPT_MODE: 'legacy' }, true]
     ])('%s fields=%p mode=%p selects legacy XML=%s', (name, fields, config, expected) => {
         expect(shouldUseKiroThinkingPrompt(name, fields, config)).toBe(expected);
     });
@@ -214,30 +217,35 @@ describe('thinking transport selection', () => {
         await expect(value.generateContent(model, body())).rejects.toMatchObject({ status: 400, skipErrorCount: true });
         expect(value._requestWithBuilderEndpointRouting).not.toHaveBeenCalled();
     });
-    test('effort-only fields do not suppress the requested thinking activation', async () => {
+    test('an enabled thinking request is sent as native adaptive instead of activation XML', async () => {
         const result = await backend().buildCodewhispererRequest(body().messages, 'claude-sonnet-4.6', null, null, { type: 'enabled', budget_tokens: 10000 });
-        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort: 'medium' } });
-        expect(current(result).content).toBe('<thinking_mode>enabled</thinking_mode><max_thinking_length>10000</max_thinking_length>\n\nhello');
+        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort: 'medium' }, thinking: { type: 'adaptive' } });
+        expect(current(result).content).toBe('hello');
     });
-    test.each(['low', 'high'])('adaptive %s retains the established activation XML and the requested wire effort', async effort => {
+    test.each(['low', 'high'])('adaptive %s sends native thinking and the requested wire effort without XML', async effort => {
         const result = await backend().buildCodewhispererRequest(body().messages, 'claude-sonnet-4.6', null, null, { type: 'adaptive', effort });
-        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort } });
-        expect(current(result).content).toBe(`<thinking_mode>adaptive</thinking_mode><thinking_effort>${effort}</thinking_effort>\n\nhello`);
+        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort }, thinking: { type: 'adaptive' } });
+        expect(current(result).content).toBe('hello');
     });
     test.each([
         [{ effort: 'medium' }, 'low', 'low'],
         [{ effort: 'low' }, null, 'low'],
         [null, null, 'high']
-    ])('the actual request uses one effective intensity for output=%p reasoning=%p', async (outputConfig, reasoningEffort, expected) => {
-        const result = await backend().buildCodewhispererRequest(body().messages, 'claude-sonnet-4.6', null, null, { type: 'adaptive', effort: 'high' }, outputConfig, reasoningEffort);
-        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort: expected } });
+    ])('legacy XML and the wire share one effective intensity for output=%p reasoning=%p', async (outputConfig, reasoningEffort, expected) => {
+        const result = await backend({ KIRO_THINKING_PROMPT_MODE: 'legacy' }).buildCodewhispererRequest(body().messages, 'claude-sonnet-4.6', null, null, { type: 'adaptive', effort: 'high' }, outputConfig, reasoningEffort);
+        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort: expected }, thinking: { type: 'adaptive' } });
         expect(current(result).content).toContain('<thinking_mode>adaptive</thinking_mode>');
         expect(current(result).content).toContain(`<thinking_effort>${expected}</thinking_effort>`);
     });
-    test('a model-specific effort fallback is consistent with the compatibility XML', async () => {
-        const result = await backend().buildCodewhispererRequest(body().messages, 'claude-sonnet-4.6', null, null, { type: 'adaptive', effort: 'unsupported' });
-        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort: 'medium' } });
+    test('a model-specific effort fallback is consistent with the legacy compatibility XML', async () => {
+        const result = await backend({ KIRO_THINKING_PROMPT_MODE: 'legacy' }).buildCodewhispererRequest(body().messages, 'claude-sonnet-4.6', null, null, { type: 'adaptive', effort: 'unsupported' });
+        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort: 'medium' }, thinking: { type: 'adaptive' } });
         expect(current(result).content).toContain('<thinking_effort>medium</thinking_effort>');
+    });
+    test('always-on Opus 5.5 sends xhigh effort without a toggle or activation XML', async () => {
+        const result = await backend().buildCodewhispererRequest(body().messages, 'claude-opus-5-5', null, null, { type: 'adaptive' }, { effort: 'xhigh' });
+        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort: 'xhigh' } });
+        expect(current(result).content).toBe('hello');
     });
     test('effort without a thinking request does not inject an activation prompt', async () => {
         const result = await backend().buildCodewhispererRequest(body().messages, 'claude-sonnet-4.6', null, null, null, { effort: 'high' });
@@ -251,12 +259,12 @@ describe('thinking transport selection', () => {
     });
     test('off removes only gateway XML while preserving structured effort and client rules', async () => {
         const result = await backend({ KIRO_THINKING_PROMPT_MODE: 'off' }).buildCodewhispererRequest(body().messages, 'claude-sonnet-4.6', null, 'Client rules', { type: 'adaptive', effort: 'high' });
-        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort: 'high' } });
+        expect(result.additionalModelRequestFields).toEqual({ output_config: { effort: 'high' }, thinking: { type: 'adaptive' } });
         expect(current(result).content).toBe('Client rules\n\nhello');
     });
-    test('disabled thinking is not implicitly enabled by a nested effort', async () => {
+    test('disabled thinking is sent natively and not re-enabled by a nested effort', async () => {
         const result = await backend().buildCodewhispererRequest(body().messages, 'claude-sonnet-4.6', null, null, { type: 'disabled', effort: 'high' });
-        expect(result.additionalModelRequestFields).toBeUndefined();
+        expect(result.additionalModelRequestFields).toEqual({ thinking: { type: 'disabled' } });
         expect(current(result).content).toBe('hello');
     });
     test('legacy fallback preserves its budget clamp without a new instruction to reveal reasoning', async () => {

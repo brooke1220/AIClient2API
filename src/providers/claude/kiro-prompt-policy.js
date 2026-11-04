@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isKiroAlwaysOnThinkingModel } from './kiro-effort.js';
 
 // Conservative application-side field budget, not a claim about every Kiro endpoint.
 export const KIRO_TOOL_DESCRIPTION_MAX_BYTES = 9216;
@@ -35,9 +36,10 @@ export function shouldUseKiroThinkingPrompt(model, additionalFields, config = {}
     // Claude's legacy XML must never be injected into another model family.
     if (mode === 'off' || !/^claude[-.]/i.test(String(model).replace(/^[^:]+:/, ''))) return false;
     if (mode === 'legacy') return true;
-    // Effort adjusts intensity; it is not an activation control. The current
-    // model mapper emits effort-only fields, so auto retains the established XML
-    // path. Only an explicit native thinking control can make it redundant.
+    // Effort adjusts intensity; it is not an activation control. Only native
+    // thinking (always on for some models, or an explicit thinking.type) makes
+    // the XML redundant.
+    if (isKiroAlwaysOnThinkingModel(model)) return false;
     const nativeType = additionalFields?.thinking?.type;
     const hasNativeThinkingControl = typeof nativeType === 'string'
         && ['enabled', 'adaptive', 'disabled'].includes(nativeType.trim().toLowerCase());

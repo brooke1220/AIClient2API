@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { BaseConverter } from '../BaseConverter.js';
 import { CodexConverter } from './CodexConverter.js';
 import { MODEL_PROTOCOL_PREFIX } from '../../utils/common.js';
+import { isKiroProviderType } from '../../providers/kiro-account-state.js';
 import {
     extractAndProcessSystemMessages as extractSystemMessages,
     extractTextFromMessageContent as extractText,
@@ -50,12 +51,12 @@ export class OpenAIResponsesConverter extends BaseConverter {
     /**
      * 转换请求到目标协议
      */
-    convertRequest(data, toProtocol) {
+    convertRequest(data, toProtocol, requestId = null, context = {}) {
         switch (toProtocol) {
             case MODEL_PROTOCOL_PREFIX.OPENAI:
                 return this.toOpenAIRequest(data);
             case MODEL_PROTOCOL_PREFIX.CLAUDE:
-                return this.toClaudeRequest(data);
+                return this.toClaudeRequest(data, context);
             case MODEL_PROTOCOL_PREFIX.GEMINI:
                 return this.toGeminiRequest(data);
             case MODEL_PROTOCOL_PREFIX.CODEX:
@@ -640,7 +641,7 @@ export class OpenAIResponsesConverter extends BaseConverter {
     /**
      * 将 OpenAI Responses 请求转换为 Claude 请求
      */
-    toClaudeRequest(responsesRequest) {
+    toClaudeRequest(responsesRequest, { toProvider } = {}) {
         const claudeRequest = {
             model: responsesRequest.model,
             messages: [],
@@ -657,6 +658,10 @@ export class OpenAIResponsesConverter extends BaseConverter {
         const thinking = this._mapReasoningToClaudeThinking(responsesRequest.reasoning);
         if (thinking) {
             claudeRequest.thinking = thinking;
+            // Kiro's native path uses effort; retain the budget for legacy models.
+            if (isKiroProviderType(toProvider) && thinking.type === 'enabled') {
+                claudeRequest.reasoning_effort = String(responsesRequest.reasoning.effort).toLowerCase().trim();
+            }
         }
 
         // 处理 input 数组中的消息
