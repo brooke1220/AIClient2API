@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { countTextTokens, ESTIMATED_IMAGE_TOKENS } from '../../utils/token-utils.js';
+import { approximateTextTokens, countTextTokens, exactTextTokens, ESTIMATED_IMAGE_TOKENS } from '../../utils/token-utils.js';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const frame = value => { const text = JSON.stringify(value); return `${Buffer.byteLength(text)}:${text}`; };
@@ -42,6 +42,29 @@ export function kiroCacheMinTokens(model, config = {}) {
     return /sonnet/i.test(model) ? 1024 : 4096;
 }
 
+// Stable history and tool blocks repeat on every turn. Keep only content
+// hashes and token counts, never the text, so repeat profiles skip retokenizing.
+const MEMO_MIN_CHARS = 256;
+const MEMO_MAX_ENTRIES = 4096;
+const tokenMemo = new Map();
+
+function memoizedTokenCount(text) {
+    if (typeof text !== 'string' || text.length < MEMO_MIN_CHARS) return countTextTokens(text);
+    const key = hash(text);
+    const known = tokenMemo.get(key);
+    if (known !== undefined) {
+        tokenMemo.delete(key);
+        tokenMemo.set(key, known);
+        return known;
+    }
+    const tokens = exactTextTokens(text);
+    // A failure's approximation must not outlive the failure.
+    if (tokens === null) return approximateTextTokens(text);
+    tokenMemo.set(key, tokens);
+    if (tokenMemo.size > MEMO_MAX_ENTRIES) tokenMemo.delete(tokenMemo.keys().next().value);
+    return tokens;
+}
+
 function sourceTextParts(content) {
     return typeof content === 'string' ? [{ type: 'text', text: content }]
         : Array.isArray(content) ? content : [];
@@ -49,7 +72,7 @@ function sourceTextParts(content) {
 
 /** Fingerprints contain upstream content, including image bytes and tool IDs.
  * Neither hashes nor token totals include cache_control or transport headers. */
-export function buildKiroCacheProfile(payload, sourceInfo, config = {}, count = countTextTokens) {
+export function buildKiroCacheProfile(payload, sourceInfo, config = {}, count = memoizedTokenCount) {
     const state = payload?.conversationState;
     const current = state?.currentMessage?.userInputMessage;
     const model = current?.modelId || '';

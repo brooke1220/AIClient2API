@@ -397,13 +397,32 @@ function findRealTag(text, tag, startIndex = 0) {
     }
 }
 
+// `\n` escapes are decoded one delta at a time, so a delta must not end inside
+// a run of backslashes: the escape can continue in the next wire event.
+function escapeSafeLength(text, end = text.length) {
+    while (end > 0 && text[end - 1] === '\\') end--;
+    return end;
+}
+
+// Retain only a possible split tag, plus its quote context. Reserving a full
+// tag's length on every delta stalls short replies until EOF in thinking mode.
+function safeThinkingTextLength(text, tag) {
+    let keep = 0;
+    for (let length = 1; length < tag.length; length++) {
+        if (text.endsWith(tag.slice(0, length))) keep = length;
+    }
+    let end = text.length - keep;
+    if (isQuoteCharAt(text, end - 1)) end--;
+    return escapeSafeLength(text, end);
+}
+
 function isWhitespaceOnly(text) {
     if (text === null || text === undefined) return true;
     return String(text).trim().length === 0;
 }
 
 /**
- * Find a "real" thinking end tag that is not quoted/backticked and is followed by '\n\n'.
+ * Find a "real" thinking end tag followed by an LF or CRLF blank line.
  * This avoids prematurely closing a thinking block when the model mentions `</thinking>`
  * inside the thinking content.
  */
@@ -413,7 +432,7 @@ function findRealThinkingEndTag(buffer, startIndex = 0) {
         const pos = findRealTag(buffer, KIRO_THINKING.END_TAG, searchStart);
         if (pos === -1) return -1;
         const after = buffer.slice(pos + KIRO_THINKING.END_TAG.length);
-        if (after.startsWith('\n\n')) return pos;
+        if (after.startsWith('\n\n') || after.startsWith('\r\n\r\n')) return pos;
         searchStart = pos + 1;
     }
 }
@@ -2077,14 +2096,16 @@ async saveCredentialsToFile(filePath, newData) {
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
+                error.kiroAccountScoped = true;
                 throw error;
             }
-            
-            // Handle 429 (Too Many Requests) - wait baseDelay then switch credential
+
+            // Handle 429 (Too Many Requests) - switch credential; only account-scoped throttles skip the baseDelay wait
             if (status === 429) {
-                logger.info(`[Kiro] Received 429 (Too Many Requests). Waiting ${baseDelay}ms before switching credential...`);
+                const delay = error.kiroAccountScoped ? 0 : baseDelay;
+                logger.info(`[Kiro] Received 429 (Too Many Requests). Waiting ${delay}ms before switching credential...`);
                 await normalizeProviderErrorMessage(error, { status: 429, context: 'callApi' });
-                await new Promise(resolve => setTimeout(resolve, baseDelay));
+                if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
@@ -2373,6 +2394,7 @@ async saveCredentialsToFile(filePath, newData) {
         // Mark error for credential switch without recording error count
         error.shouldSwitchCredential = true;
         error.skipErrorCount = true;
+        error.kiroAccountScoped = true;
         throw error;
     }
 
@@ -2623,7 +2645,13 @@ async saveCredentialsToFile(filePath, newData) {
             stream = response.data;
             signal?.addEventListener('abort', onAbort, { once: true });
             signal?.throwIfAborted();
-            logger.info(`[Kiro Stream] Upstream headers: ${Math.round(performance.now() - upstreamStartedAt)}ms; queue: ${Math.round(upstreamStartedAt - queuedAt)}ms; build: ${Math.round(buildMs)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
+            const headersAt = performance.now();
+            // Local CPU work that only needs to finish before the first event
+            // overlaps the model's time to first token instead of delaying dispatch.
+            // A failing hook is not a transport failure; the caller recomputes and surfaces it.
+            try { options.onUpstreamHeaders?.(); } catch { /* retried lazily by the caller */ }
+            const hookMs = performance.now() - headersAt;
+            logger.info(`[Kiro Stream] Upstream headers: ${Math.round(headersAt - upstreamStartedAt)}ms; queue: ${Math.round(upstreamStartedAt - queuedAt)}ms; build: ${Math.round(buildMs)}ms; input estimate: ${Math.round(hookMs)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
             let firstEventLogged = false;
             let buffer = Buffer.alloc(0);
 
@@ -2776,14 +2804,17 @@ async saveCredentialsToFile(filePath, newData) {
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
+                error.kiroAccountScoped = true;
                 throw error;
             }
-            
-            // Handle 429 (Too Many Requests) - wait baseDelay then switch credential
+
+            // Handle 429 (Too Many Requests) - switch credential; only account-scoped throttles skip the baseDelay wait
             if (status === 429) {
-                logger.info(`[Kiro] Received 429 (Too Many Requests) in stream. Waiting ${baseDelay}ms before switching credential...`);
+                // An account-scoped throttle is already cooled down; the next account need not wait.
+                const delay = error.kiroAccountScoped ? 0 : baseDelay;
+                logger.info(`[Kiro] Received 429 (Too Many Requests) in stream. Waiting ${delay}ms before switching credential...`);
                 await normalizeProviderErrorMessage(error, { status: 429, context: 'stream', signal });
-                await sleep(baseDelay, undefined, { signal });
+                if (delay > 0) await sleep(delay, undefined, { signal });
                 // Mark error for credential switch without recording error count
                 error.shouldSwitchCredential = true;
                 error.skipErrorCount = true;
@@ -2848,7 +2879,7 @@ async saveCredentialsToFile(filePath, newData) {
         }
     }
 
-    // 真正的流式传输实现（内部原始生成器：立即产出 message_start，随后产出实时事件）
+    // 真正的流式传输实现（内部原始生成器：在首个上游事件前产出 message_start，随后产出实时事件）
     //
     // 注意：这个方法本身不对外暴露——对外的 generateContentStream 是下面的薄包装，
     // 它会缓存这里第一次产出的 message_start，直到确认收到过至少一个有意义的事件
@@ -2921,6 +2952,7 @@ async saveCredentialsToFile(filePath, newData) {
         const requestedTools = new Set(Array.isArray(requestBody.tools) ? requestBody.tools.map(tool => tool?.name).filter(Boolean) : []);
         const bracketParser = new KiroBracketToolParser(name => name === KIRO_PLACEHOLDER_TOOL_NAME ||
             requestedTools.has(toolNameMaps.fromKiroName(name)), () => toolAssembler.maxBytes - toolAssembler.bytes);
+        const hasTextBeforeThinking = () => streamState.hasTextOutput || bracketParser.hasPendingContent;
         const nativeToolSignatures = new Set();
         const legacyToolSignatures = new Set();
         const unmatchedLegacyTools = new Set();
@@ -3104,32 +3136,42 @@ async saveCredentialsToFile(filePath, newData) {
             const ignoredToolUseIds = new Set();
             let ignoredLegacyTool = false;
 
-            const inputCountStartedAt = performance.now();
-            const estimatedInputTokens = this.estimateInputTokens(requestBody);
-            logger.info(`[Kiro Timing] Provider preparation: initialize: ${Math.round(authStartedAt - streamStartedAt)}ms; auth: ${Math.round(authFinishedAt - authStartedAt)}ms; models: ${Math.round(modelsFinishedAt - authFinishedAt)}ms; input count: ${Math.round(performance.now() - inputCountStartedAt)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
+            logger.info(`[Kiro Timing] Provider preparation: initialize: ${Math.round(authStartedAt - streamStartedAt)}ms; auth: ${Math.round(authFinishedAt - authStartedAt)}ms; models: ${Math.round(modelsFinishedAt - authFinishedAt)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
 
-            // 1. 先发送 message_start 事件
-            yield {
-                type: "message_start",
-                message: {
-                    id: messageId,
-                    type: "message",
-                    role: "assistant",
-                    model: model,
-                    stop_reason: null,
-                    stop_sequence: null,
-                    usage: {
-                        input_tokens: kiroCacheMode(this.config) === 'estimate' ? 0 : estimatedInputTokens,
-                        output_tokens: 0,
-                        cache_creation_input_tokens: 0,
-                        cache_read_input_tokens: 0
-                    },
-                    content: []
-                }
+            // The local estimate is only a fallback for missing upstream usage.
+            // Tokenizing a large prompt is synchronous, so compute it once the
+            // upstream request is in flight rather than before dispatch.
+            let estimatedInputTokens;
+            const getEstimatedInputTokens = () => estimatedInputTokens ??= this.estimateInputTokens(requestBody);
+            let messageStartSent = false;
+            // 1. 先发送 message_start 事件（在首个上游事件之前）
+            const messageStart = () => {
+                if (messageStartSent) return [];
+                messageStartSent = true;
+                return [{
+                    type: "message_start",
+                    message: {
+                        id: messageId,
+                        type: "message",
+                        role: "assistant",
+                        model: model,
+                        stop_reason: null,
+                        stop_sequence: null,
+                        usage: {
+                            input_tokens: kiroCacheMode(this.config) === 'estimate' ? 0 : getEstimatedInputTokens(),
+                            output_tokens: 0,
+                            cache_creation_input_tokens: 0,
+                            cache_read_input_tokens: 0
+                        },
+                        content: []
+                    }
+                }];
             };
 
             // 2. 流式接收并发送每个 content_block_delta
-            for await (const event of this.streamApiReal('', finalModel, requestBody, false, 0, options)) {
+            for await (const event of this.streamApiReal('', finalModel, requestBody, false, 0,
+                { ...options, onUpstreamHeaders: getEstimatedInputTokens })) {
+                yield* pushEvents(messageStart());
                 if (event.type === 'contextUsage' && event.contextUsagePercentage) {
                     // 捕获上下文使用百分比（包含输入和输出的总使用量）
                     contextUsagePercentage = event.contextUsagePercentage;
@@ -3176,11 +3218,14 @@ async saveCredentialsToFile(filePath, newData) {
                             if (startPos !== -1) {
                                 const before = streamState.buffer.slice(0, startPos);
                                 const beforeCombined = `${streamState.pendingTextBeforeThinking}${before}`;
-                                // Avoid creating meaningless text blocks before thinking.
-                                if (beforeCombined && !isWhitespaceOnly(beforeCombined)) {
+                                // Pending tool-marker text also owns its following whitespace.
+                                if (beforeCombined && (hasTextBeforeThinking() || !isWhitespaceOnly(beforeCombined))) {
                                     events.push(...createTextDeltaEvents(beforeCombined));
                                 }
                                 streamState.pendingTextBeforeThinking = '';
+                                // Inline thinking is the same content boundary as native reasoning:
+                                // emit tentative text here and reject unfinished declared tools.
+                                events.push(...emitLegacyParts(bracketParser.finish()));
 
                                 streamState.buffer = streamState.buffer.slice(startPos + KIRO_THINKING.START_TAG.length);
                                 streamState.inThinking = true;
@@ -3188,11 +3233,11 @@ async saveCredentialsToFile(filePath, newData) {
                                 continue;
                             }
 
-                            const safeLen = Math.max(0, streamState.buffer.length - KIRO_THINKING.START_TAG.length);
+                            const safeLen = safeThinkingTextLength(streamState.buffer, KIRO_THINKING.START_TAG);
                             if (safeLen > 0) {
                                 const safeText = streamState.buffer.slice(0, safeLen);
                                 if (safeText) {
-                                    if (isWhitespaceOnly(safeText)) {
+                                    if (isWhitespaceOnly(safeText) && !hasTextBeforeThinking()) {
                                         // Buffer whitespace until we know whether a thinking block appears.
                                         // This prevents a leading text block from being created before thinking.
                                         const maxKeep = 1024;
@@ -3214,6 +3259,7 @@ async saveCredentialsToFile(filePath, newData) {
                         if (streamState.inThinking) {
                             // Strip a single leading newline after `<thinking>` (may be split across chunks).
                             if (streamState.stripThinkingLeadingNewline) {
+                                if (streamState.buffer === '\r') break;
                                 if (streamState.buffer.startsWith('\r\n')) {
                                     streamState.buffer = streamState.buffer.slice(2);
                                     streamState.stripThinkingLeadingNewline = false;
@@ -3243,7 +3289,7 @@ async saveCredentialsToFile(filePath, newData) {
                                 continue;
                             }
 
-                            const safeLen = Math.max(0, streamState.buffer.length - KIRO_THINKING.END_TAG.length);
+                            const safeLen = safeThinkingTextLength(streamState.buffer, KIRO_THINKING.END_TAG);
                             if (safeLen > 0) {
                                 const safeThinking = streamState.buffer.slice(0, safeLen);
                                 if (safeThinking) events.push(...createThinkingDeltaEvents(safeThinking));
@@ -3256,10 +3302,18 @@ async saveCredentialsToFile(filePath, newData) {
                             let rest = streamState.buffer;
                             streamState.buffer = '';
                             if (streamState.stripTextLeadingNewlinesAfterThinking) {
+                                // The separator itself can straddle wire events.
+                                if (['\n\n', '\r\n\r\n'].some(separator => separator.startsWith(rest) && rest.length < separator.length)) {
+                                    streamState.buffer = rest;
+                                    break;
+                                }
                                 if (rest.startsWith('\r\n\r\n')) rest = rest.slice(4);
                                 else if (rest.startsWith('\n\n')) rest = rest.slice(2);
                                 streamState.stripTextLeadingNewlinesAfterThinking = false;
                             }
+                            const end = escapeSafeLength(rest);
+                            streamState.buffer = rest.slice(end);
+                            rest = rest.slice(0, end);
                             if (rest) events.push(...createTextDeltaEvents(rest));
                             break;
                         }
@@ -3284,7 +3338,11 @@ async saveCredentialsToFile(filePath, newData) {
                     yield* pushEvents(emitCompletedTools(completed));
                 } else if (event.type === 'metadata') {
                     const reason = event.data.stopReason ?? event.data.stop_reason;
-                    if (reason !== undefined && reason !== null && (typeof reason !== 'string' || !normalizeKiroStopReason(reason))) throw kiroIntegrityError('unsupported upstream stop reason');
+                    if (reason !== undefined && reason !== null && (typeof reason !== 'string' || !normalizeKiroStopReason(reason))) {
+                        // Record the raw value so the mapping can be extended from evidence, not guesses.
+                        logger.warn(`[Kiro Stream] Unsupported upstream stop reason: ${String(JSON.stringify(reason)).slice(0, 80)}`);
+                        throw kiroIntegrityError('unsupported upstream stop reason');
+                    }
                     upstreamStopReason = normalizeKiroStopReason(reason) || upstreamStopReason;
                     if (upstreamStopReason === 'refusal') refusalText = kiroRefusalText(event.data);
                     const snapshot = readKiroTokenUsage(event.data.tokenUsage);
@@ -3302,6 +3360,7 @@ async saveCredentialsToFile(filePath, newData) {
                     metering = event.data;
                 }
             }
+            yield* pushEvents(messageStart());
             if (this.config.KIRO_REQUIRE_STOP_REASON === true && !upstreamStopReason) {
                 throw kiroIntegrityError('missing upstream stop reason');
             }
@@ -3355,7 +3414,7 @@ async saveCredentialsToFile(filePath, newData) {
                     logger.info(`[Kiro] Token calculation from contextUsagePercentage: total=${totalTokens}, output=${outputTokens}, input=${inputTokens}`);
                 } else {
                     logger.warn('[Kiro Stream] contextUsagePercentage not received, using estimation');
-                    inputTokens = estimatedInputTokens;
+                    inputTokens = getEstimatedInputTokens();
                 }
                 if (Number.isFinite(actualInput) && actualInput >= 0) inputTokens = actualInput;
                 if (Number.isFinite(actualOutput) && actualOutput >= 0) outputTokens = actualOutput;
@@ -3376,7 +3435,7 @@ async saveCredentialsToFile(filePath, newData) {
                         || normalizeContextLength(modelInfo?.tokenLimits?.maxInputTokens)
                         || getContextTokensForModel(model, this.config, finalModel)) * contextUsagePercentage / 100) : null;
                 cacheInputTotal = hasProviderTotal ? providerTotalInput
-                    : contextTotal !== null ? Math.max(0, contextTotal - outputTokens) : estimatedInputTokens;
+                    : contextTotal !== null ? Math.max(0, contextTotal - outputTokens) : getEstimatedInputTokens();
             }
             const { usage: finalUsage, details: usageDetails } = resolveKiroCacheUsage({
                 inputTokens: cacheInputTotal, outputTokens, nativeUsage, metering,

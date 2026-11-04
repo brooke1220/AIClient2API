@@ -4,12 +4,13 @@
 
 ## 默认生效的保护
 
-- `/cc/v1/messages` 与普通消息端点默认实时输出。`message_start.usage` 先提供估算值（开启缓存 `estimate` 模式时输入与缓存改为零占位），最终用量在 `message_delta.usage` 更新；要求起始事件携带最终输入用量的旧客户端可以显式开启缓冲。
+- `/cc/v1/messages` 与普通消息端点默认实时输出。`message_start.usage` 先提供估算值（开启缓存 `estimate` 模式时输入与缓存改为零占位），最终用量在 `message_delta.usage` 更新；要求起始事件携带最终输入用量的旧客户端可以显式开启缓冲。本地输入估算只在收到上游响应头后、等待首个事件期间计算，不再推迟上游请求的发出；`[Kiro Stream] Upstream headers` 日志的 `input estimate` 记录其耗时。
+- thinking 兼容标签只保留可能构成未完成标签的尾部及相邻引号，不再固定积压末尾 10–11 个字符；短正文和短思考片段无需等待下一段或 EOF。跨片段的标签、引用标签和 CRLF 分隔符仍保留语义；片段末尾的反斜杠留到下一段，跨片段的 `\n` 转义仍解码为换行。
 - 原生 `metadataEvent.tokenUsage` 的非缓存输入、输出、缓存读取和缓存写入分别映射到 Claude 用量字段。同一调用的重复快照取最新有效值，不累加；缺失或非法字段保留已知值或原有估算。OpenAI/Responses 输入总数包含缓存读取和写入，缓存读取仍单独列出。
 - `CONTENT_FILTERED` 输出明确的拒答与 `stop_reason=refusal`，不会作为损坏流重试。原生思考签名和隐藏思考内容在 Claude 流式与非流式响应中保留；OpenAI Chat 使用 `finish_reason=content_filter`，Responses 使用 `incomplete_details.reason=content_filter`。
 - `meteringEvent` 的 `usage` 是本次调用的 credit 用量快照，不是 token。Claude、OpenAI Chat 和 Responses 的最终 `usage` 通过 `credit_usage`、`credit_unit` 和可选 `credit_unit_plural` 扩展字段返回最近一次有效值，不累加重复快照。
 - 显式模型不可用返回 503；上游错误地以 5xx 返回的明确请求格式错误转为 400；明确网关超时转为 504；请求体超过上游阈值转为 413。这些情况不会处罚账号或触发凭证切换。未知 5xx 保留原有恢复策略。
-- 明确账号限流（`USER_REQUEST_RATE_EXCEEDED`、`CREDIT_CONSUMPTION_RATE_EXCEEDED`、`SERVICE_REQUEST_RATE_EXCEEDED` 等）触发账号短冷却和切换，即使通用冷却开关关闭。明确模型容量不足的 429 直接返回，不处罚账号。非流式保留 `Retry-After` 响应头；SSE 已发出响应头时，在错误事件的 `error.retry_after` 返回原值（Responses 错误事件使用顶层 `retry_after`），同时带 `status`。模型暂不可用且上游未给重试时间时默认 5 秒。
+- 明确账号限流（`USER_REQUEST_RATE_EXCEEDED`、`CREDIT_CONSUMPTION_RATE_EXCEEDED`、`SERVICE_REQUEST_RATE_EXCEEDED` 等）触发账号短冷却和切换，即使通用冷却开关关闭。明确账号限流、402（含额度耗尽）与 403 换号前只等待 0–500ms 随机抖动，这类账号限流也不再先等 `REQUEST_BASE_DELAY`；`SERVICE_REQUEST_RATE_EXCEEDED` 可能覆盖所有账号，保留原有等待。凭证刷新仍不等待，未分类错误保留原有 0–10 秒抖动。明确模型容量不足的 429 直接返回，不处罚账号。非流式保留 `Retry-After` 响应头；SSE 已发出响应头时，在错误事件的 `error.retry_after` 返回原值（Responses 错误事件使用顶层 `retry_after`），同时带 `status`。模型暂不可用且上游未给重试时间时默认 5 秒。
 - HTTP 请求按客户端 API Key 的哈希隔离会话，优先读取 `metadata.session_id`、JSON `metadata.user_id.session_id`、Claude Code 的 `user_…_session_UUID`、`session_id` 或 `conversation_id`；缺失时从 system 与首条 user 消息生成稳定 ID。会话 ID 使用带客户端作用域的哈希派生 UUID，不在日志或上游载荷中暴露客户端 Key。
 - 会话账号绑定仅在上游返回成功响应头后建立，保存于内存，最多 8192 条，1 小时过期。优先使用仍健康、支持模型且有空闲并发的绑定账号；冷却、停用、刷新、排除和并发满时按现有选择规则继续恢复。绑定跟随账号状态，能够跨 UUID 轮换保留。共享同一个 API Key 的客户端属于同一作用域；应提供明确 session ID 以区分独立对话。
 - 图片按实际字节识别 PNG/JPEG/GIF/WebP，并验证可解码性；声明 MIME 不一致时纠正格式。默认将大图限制在长边 1568 像素、base64 400000 字节内；转换为 JPEG 时保持比例、透明区域铺白底。需要重编码的动画只保留首帧。源字节与解码像素都有预算，损坏图片在请求上游前返回 400，源体积超限或无法满足输出预算返回 413。
@@ -19,7 +20,7 @@
 - 相同文本增量仍逐段保留，不以字符串相等判定重发。
 - 按工具调用 ID 缓冲并验证参数，按到达顺序输出合法、无重叠的 Claude 内容块。文本保持实时；工具参数在完整校验后输出，避免下游执行截断参数。
 - 工具参数按新增片段累计字节数，避免反复扫描完整参数；跨片段的 UTF-16 代理对按拼接后的实际 UTF-8 字节计数。工具边界先输出此前缓存的文本/思考。
-- 流式与非流式共用文本形式 `[Called ... with args: {...}]` 的增量解码，只识别请求中声明的工具；引用、代码块、思考内的标记仍是文本。参数必须是完整合法的 JSON 对象，不修复损坏参数；复用工具参数/调用数预算并过滤 no-op 占位调用。
+- 流式与非流式共用文本形式 `[Called ... with args: {...}]` 的增量解码，只识别请求中声明的工具；引用、代码块、思考内的标记仍是文本。进入内联思考前先输出暂存的标记文本及其空白，已识别但尚未完成的工具调用在该边界报完整性错误，不跨思考块拼接。参数必须是完整合法的 JSON 对象，不修复损坏参数；复用工具参数/调用数预算并过滤 no-op 占位调用。
 - 原生与文本形式的同一调用不会重复输出，独立原生调用 ID 不因参数相同而合并。Claude Message 保留必需的可空 `stop_reason` / `stop_sequence` 字段。
 - 先解析业务端点，再配置代理或 TLS Sidecar。
 - 同时开启 `KIRO_SIDECAR_ENABLED`、`TLS_SIDECAR_ENABLED`，且 `TLS_SIDECAR_ENABLED_PROVIDERS` 匹配 Kiro 时，已就绪的 Sidecar 使用 `Node.js → Rust → Go uTLS → 上游代理（如有）→ AWS`。仅开启 Rust 时仍由 Rust 直接出站；仅开启 TLS Sidecar 时保留原有 Go 路径。令牌刷新、模型发现和额度查询保留原有路径。
@@ -40,6 +41,7 @@
 - 当前账号等待凭据刷新不消耗跨账号切换预算；`CREDENTIAL_SWITCH_MAX_RETRIES=0` 或预算用尽时仍可等待当前账号的共享刷新，保留等待期限、取消和发送前的账号状态检查。
 - 动态模型发现沿用生成调用的健康检查、人工恢复选项；获准执行的恢复检测不会被内部模型发现再次作为普通请求拒绝。
 - Kiro 的完整工具调用优先于正常 `end_turn`；明确的 `max_tokens`、上下文超限等终止原因保持原样。
+- 无法识别的终止原因仍按完整性失败处理，不改写为 `end_turn`；警告日志 `[Kiro Stream] Unsupported upstream stop reason` 记录截断后的原始值，用于依据真实流量补充映射。
 
 ## 配置
 

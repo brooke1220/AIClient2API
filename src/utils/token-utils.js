@@ -109,19 +109,30 @@ export function processContent(content) {
 }
 
 /**
- * Count tokens for a given text using Claude's official tokenizer
+ * Exact tokenizer count, or null when the tokenizer failed (it is reset for the next call).
+ * Callers that cache counts must not cache the approximation that replaces a failure.
  */
-export function countTextTokens(text) {
-    if (!text) return 0;
+export function exactTextTokens(text) {
     try {
         // Match the package's countTokens normalization and special-token policy.
         return tokenizer().encode(text.normalize('NFKC'), 'all').length;
     } catch (error) {
         disposeTokenizer();
-        // Fallback to estimation if tokenizer fails
         logger.warn('[TokenUtils] Tokenizer error, falling back to estimation:', error.message);
-        return Math.ceil((text || '').length / 4);
+        return null;
     }
+}
+
+export function approximateTextTokens(text) {
+    return Math.ceil((text || '').length / 4);
+}
+
+/**
+ * Count tokens for a given text using Claude's official tokenizer
+ */
+export function countTextTokens(text) {
+    if (!text) return 0;
+    return exactTextTokens(text) ?? approximateTextTokens(text);
 }
 
 /**

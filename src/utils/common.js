@@ -379,6 +379,16 @@ function kiroRetryCount(value, fallback) {
     return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
+// An explicit Kiro account failure says nothing about the next account; a
+// short jitter is enough to spread concurrent switches.
+const KIRO_ACCOUNT_SWITCH_JITTER_MS = 500;
+
+function credentialSwitchDelayMs(error, cooldown, isCredentialRefresh, providerType) {
+    if (cooldown.quotaExhausted || isCredentialRefresh) return 0;
+    const accountScoped = isKiroProviderType(providerType) && error?.kiroAccountScoped === true;
+    return Math.floor(Math.random() * (accountScoped ? KIRO_ACCOUNT_SWITCH_JITTER_MS : 10000));
+}
+
 function formatQuotaRecovery(recoveryTime) {
     if (!(recoveryTime instanceof Date) || Number.isNaN(recoveryTime.getTime())) return '';
     return ` Quota is expected to recover at ${recoveryTime.toISOString()}.`;
@@ -1763,7 +1773,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (credentialMarkedUnhealthy && quotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             // 额度耗尽立即换号；其它错误保留抖动，并在等待前释放当前插槽。
             releaseCurrentSlot();
-            const randomDelay = cooldown.quotaExhausted || isCredentialRefresh ? 0 : Math.floor(Math.random() * 10000);
+            const randomDelay = credentialSwitchDelayMs(error, cooldown, isCredentialRefresh, toProvider);
             logger.info(`[Stream Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
             if (randomDelay > 0) await sleep(randomDelay, undefined, { signal: upstreamAbortController.signal }).catch(() => {});
             // 客户端在等待期间断开：不再占用新凭证的并发插槽，也无需写错误响应
@@ -2106,7 +2116,7 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         if (credentialMarkedUnhealthy && quotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             // 额度耗尽立即换号；其它错误保留抖动，并在等待前释放当前插槽。
             releaseCurrentSlot();
-            const randomDelay = cooldown.quotaExhausted || isCredentialRefresh ? 0 : Math.floor(Math.random() * 10000);
+            const randomDelay = credentialSwitchDelayMs(error, cooldown, isCredentialRefresh, toProvider);
             logger.info(`[Unary Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
             if (randomDelay > 0) await sleep(randomDelay, undefined, { signal: retryContext?.upstreamAbortController?.signal }).catch(() => {});
             if (retryContext?.upstreamAbortController?.signal.aborted) return;

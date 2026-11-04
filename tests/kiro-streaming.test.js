@@ -127,9 +127,9 @@ function adapterFor(service) {
     return adapter;
 }
 
-function runHandler(service, response, pool = null, retryContext = { CONFIG: {}, maxRetries: 0 }) {
+function runHandler(service, response, pool = null, retryContext = { CONFIG: {}, maxRetries: 0 }, provider = 'claude-kiro-oauth') {
     return handleStreamRequest(
-        response, adapterFor(service), MODEL, request(), 'claude', 'claude-kiro-oauth',
+        response, adapterFor(service), MODEL, request(), 'claude', provider,
         'none', null, pool, pool ? 'test-account' : null, null, retryContext
     );
 }
@@ -350,6 +350,96 @@ describe('Kiro streaming latency and lifecycle', () => {
         }
     });
 
+    test.each(['好', 'OK', '这是短回复'])('thinking-enabled plain text %s arrives before upstream EOF', async content => {
+        const service = createService();
+        const upstream = openStream();
+        service._requestWithBuilderEndpointRouting.mockResolvedValue({ data: upstream });
+        const iterator = service.generateContentStream('claude-opus-5-5', {
+            ...request(), thinking: { type: 'adaptive' }, output_config: { effort: 'xhigh' }
+        });
+        const pending = firstText(iterator);
+        upstream.push(textFrame(content));
+        try {
+            expect(await bounded(pending, 250)).toBe(content);
+            expect(upstream.readableEnded).toBe(false);
+            upstream.push(null);
+            expect((await collect(iterator)).at(-1)).toEqual({ type: 'message_stop' });
+        } finally {
+            upstream.destroy();
+            await iterator.return();
+        }
+    });
+
+    test('short inline reasoning arrives without waiting for a closing tag', async () => {
+        const service = createService();
+        const upstream = openStream();
+        service._requestWithBuilderEndpointRouting.mockResolvedValue({ data: upstream });
+        const iterator = service.generateContentStream(MODEL, { ...request(), thinking: { type: 'enabled', budget_tokens: 1024 } });
+        const pending = (async () => {
+            for await (const event of iterator) {
+                if (event.delta?.type === 'thinking_delta') return event.delta.thinking;
+            }
+            throw new Error('No thinking received');
+        })();
+        upstream.push(textFrame('<thinking>想'));
+        try {
+            expect(await bounded(pending, 250)).toBe('想');
+            expect(upstream.readableEnded).toBe(false);
+        } finally {
+            upstream.destroy();
+            await iterator.return();
+        }
+    });
+
+    test.each([
+        ['before<thinking>reason</thinking>\n\nafter', 'beforeafter', 'reason'],
+        ['before<thinking>\r\nreason</thinking>\r\n\r\nafter', 'beforeafter', 'reason'],
+        ['先说`<thinking>`和"<thinking>"，<thinking>引用`</thinking>`和"</thinking>"后思考</thinking>\n\n答复',
+            '先说`<thinking>`和"<thinking>"，答复', '引用`</thinking>`和"</thinking>"后思考']
+    ])('thinking tags and quoted mentions survive every split: %s', async (source, expectedText, expectedThinking) => {
+        for (let split = 0; split < source.length; split++) {
+            const service = createService();
+            const fragments = split === 0 ? [...source] : [source.slice(0, split), source.slice(split)];
+            service._requestWithBuilderEndpointRouting.mockResolvedValue({ data: Readable.from(fragments.map(textFrame)) });
+            const events = await collect(service.generateContentStream(MODEL, { ...request(), thinking: { type: 'enabled', budget_tokens: 1024 } }));
+            expect(events.filter(event => event.delta?.type === 'text_delta').map(event => event.delta.text).join('')).toBe(expectedText);
+            expect(events.filter(event => event.delta?.type === 'thinking_delta').map(event => event.delta.thinking).join('')).toBe(expectedThinking);
+        }
+    });
+
+    test.each([
+        ['a\\nb', 'a\nb', ''],
+        ['<thinking>x\\ny</thinking>\n\nz', 'z', 'x\ny'],
+        ['<thinking>x</thinking>\n\na\\nb', 'a\nb', 'x'],
+        ['a\\\\nb', 'a\\\\nb', ''],
+        ['a\\', 'a\\', ''],
+        ['a\\<thinking>x</thinking>\n\nz', 'a\\z', 'x'],
+        ['<thinking>x\\</thinking>\n\nz', 'z', 'x\\'],
+        ['text \n<thinking>r</thinking>\n\nz', 'text \nz', 'r']
+    ])('escaped newlines and text whitespace survive every split in thinking mode: %j', async (source, expectedText, expectedThinking) => {
+        for (let split = 0; split < source.length; split++) {
+            const service = createService();
+            const fragments = split === 0 ? [...source] : [source.slice(0, split), source.slice(split)];
+            service._requestWithBuilderEndpointRouting.mockResolvedValue({ data: Readable.from(fragments.map(textFrame)) });
+            const events = await collect(service.generateContentStream(MODEL, { ...request(), thinking: { type: 'enabled', budget_tokens: 1024 } }));
+            expect(events.filter(event => event.delta?.type === 'text_delta').map(event => event.delta.text).join('')).toBe(expectedText);
+            expect(events.filter(event => event.delta?.type === 'thinking_delta').map(event => event.delta.thinking).join('')).toBe(expectedThinking);
+        }
+    });
+
+    test('a held-back trailing backslash is emitted before a native reasoning block', async () => {
+        const service = createService();
+        service._requestWithBuilderEndpointRouting.mockResolvedValue({ data: Readable.from([
+            textFrame('a\\'), awsFrame('reasoningContentEvent', { text: 'r' })
+        ]) });
+        const events = await collect(service.generateContentStream(MODEL, { ...request(), thinking: { type: 'enabled', budget_tokens: 1024 } }));
+        const deltas = events.filter(event => event.delta?.type === 'text_delta' || event.delta?.type === 'thinking_delta');
+        const firstThinking = deltas.findIndex(event => event.delta.type === 'thinking_delta');
+        // All held text, including the backslash, precedes the reasoning block.
+        expect(deltas.slice(0, firstThinking).map(event => event.delta.text).join('')).toBe('a\\');
+        expect(deltas.slice(firstThinking).map(event => event.delta.thinking).join('')).toBe('r');
+    });
+
     test('tool calls retain streamed JSON fragments and their stop reason', async () => {
         const service = createService();
         service._requestWithBuilderEndpointRouting.mockResolvedValue({ data: Readable.from([
@@ -421,6 +511,86 @@ describe('Kiro streaming latency and lifecycle', () => {
         expect(http.globalAgent.keepAlive).toBe(true);
         expect(https.globalAgent.keepAlive).toBe(true);
         expect(service.axiosInstance.defaults.headers.Connection).toBeUndefined();
+    });
+
+    test('the local input estimate runs after dispatch and still backs missing upstream usage', async () => {
+        const service = createService();
+        const order = [];
+        service.estimateInputTokens.mockImplementation(() => { order.push('estimate'); return 7; });
+        service._requestWithBuilderEndpointRouting.mockImplementation(async () => {
+            order.push('dispatch');
+            return { data: Readable.from([textFrame('hello')]) };
+        });
+        const events = await bounded(collect(service.generateContentStream(MODEL, request())));
+        expect(order).toEqual(['dispatch', 'estimate']);
+        expect(events[0]).toMatchObject({ type: 'message_start', message: { usage: { input_tokens: 7 } } });
+        expect(events.find(event => event.type === 'message_delta').usage.input_tokens).toBe(7);
+    });
+
+    test('the local input estimate is computed while waiting for the first upstream event', async () => {
+        const service = createService();
+        const upstream = openStream();
+        service._requestWithBuilderEndpointRouting.mockResolvedValue({ data: upstream });
+        const iterator = service.generateContentStream(MODEL, request());
+        const pending = iterator.next();
+        try {
+            await waitFor(() => service.estimateInputTokens.mock.calls.length === 1);
+            upstream.push(textFrame('hello'));
+            upstream.push(null);
+            expect((await bounded(pending)).value).toMatchObject({ type: 'message_start' });
+            await bounded(collect(iterator));
+            expect(service.estimateInputTokens).toHaveBeenCalledTimes(1);
+        } finally {
+            upstream.destroy();
+            await iterator.return();
+        }
+    });
+
+    test('a failing local estimate surfaces once without replaying the upstream request', async () => {
+        const service = createService();
+        service.estimateInputTokens.mockImplementation(() => { throw new TypeError('estimate failed'); });
+        await expect(bounded(collect(service.generateContentStream(MODEL, request())))).rejects.toThrow('estimate failed');
+        expect(service._requestWithBuilderEndpointRouting).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('Kiro credential switches wait only as long as the failure requires', () => {
+    beforeEach(() => jest.clearAllMocks());
+    afterEach(() => jest.restoreAllMocks());
+
+    test.each([
+        ['an explicit account failure', { kiroAccountScoped: true }, 250, undefined],
+        ['an unclassified failure', {}, 5000, undefined],
+        ['a non-Kiro provider carrying the Kiro flag', { kiroAccountScoped: true }, 5000, 'openai-custom']
+    ])('%s waits the expected jitter before switching', async (_label, flags, waitMs, provider) => {
+        const service = createService();
+        service._requestWithBuilderEndpointRouting.mockRejectedValue(
+            Object.assign(new Error('switch me'), { shouldSwitchCredential: true, skipErrorCount: true, ...flags })
+        );
+        jest.spyOn(Math, 'random').mockReturnValue(0.5);
+        jest.spyOn(serviceManager, 'getApiServiceWithFallback').mockResolvedValue(null);
+        const pool = { releaseSlot: jest.fn(), markProviderHealthy: jest.fn(), markProviderUnhealthy: jest.fn() };
+        const response = responseMock();
+        const pending = runHandler(service, response, pool, { CONFIG: {}, maxRetries: 1 }, provider);
+        await waitFor(logged('info', 'Credential marked unhealthy. Waiting'));
+        expect(logged('info', `Waiting ${waitMs}ms before retry`)()).toBe(true);
+        response.emit('close');
+        await bounded(pending, 6000);
+    }, 10000);
+
+    test.each([
+        ['USER_REQUEST_RATE_EXCEEDED', 0, true],
+        ['SERVICE_REQUEST_RATE_EXCEEDED', 25, false],
+        ['SOMETHING_ELSE', 25, undefined]
+    ])('429 %s waits %ims inside the provider before switching', async (reason, waitMs, scoped) => {
+        const service = createService({ REQUEST_BASE_DELAY: 25 });
+        service._requestWithBuilderEndpointRouting.mockRejectedValue(Object.assign(new Error('throttled'), {
+            response: { status: 429, headers: {}, data: JSON.stringify({ reason, message: 'throttled' }) }
+        }));
+        const failure = await bounded(collect(service.generateContentStream(MODEL, request()))).catch(error => error);
+        expect(failure).toMatchObject({ shouldSwitchCredential: true, skipErrorCount: true });
+        expect(failure.kiroAccountScoped).toBe(scoped);
+        expect(logged('info', `Waiting ${waitMs}ms before switching credential`)()).toBe(true);
     });
 });
 
@@ -831,6 +1001,8 @@ describe('Kiro completed HTTP errors retain credential handling', () => {
             expect(service._markCredentialUnhealthyWithRecovery).toHaveBeenCalledTimes(1);
         }
         if (status === 403) expect(service._markCredentialUnhealthy).toHaveBeenCalledTimes(1);
+        // Only explicit account failures take the short switch jitter.
+        expect(error.kiroAccountScoped).toBe([402, 403].includes(status) ? true : undefined);
     });
 });
 

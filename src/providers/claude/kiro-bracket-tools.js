@@ -21,6 +21,10 @@ export class KiroBracketToolParser {
         this.literalEscape = false;
     }
 
+    get hasPendingContent() {
+        return this.pending.length > 0 || this.candidate !== null;
+    }
+
     flushDelimiter() {
         if (!this.delimiterRun) return;
         if (!this.codeDelimiter) {

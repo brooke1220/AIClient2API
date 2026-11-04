@@ -118,6 +118,47 @@ describe('Kiro review regressions', () => {
         expectSerialBlocks(result.events);
     });
 
+    test.each(['unary', 'stream'])('%s preserves tentative bracket text before inline thinking across every split', async mode => {
+        for (const prefix of ['[', '[Ca', '[Called', '[Called read_file']) {
+            for (const whitespace of ['', '\n', ' \t\r\n']) {
+                const source = `${prefix}${whitespace}<thinking>reason</thinking>\n\nanswer`;
+                const fragmentations = [[source], [...source]];
+                for (let split = 1; split < source.length; split++) {
+                    fragmentations.push([source.slice(0, split), source.slice(split)]);
+                }
+                for (const fragments of fragmentations) {
+                    const result = await output(fragments.map(text), { ...request(), thinking }, mode);
+                    expect(result.content).toEqual([
+                        { type: 'text', text: `${prefix}${whitespace}` },
+                        { type: 'thinking', thinking: 'reason' },
+                        { type: 'text', text: 'answer' }
+                    ]);
+                    expectSerialBlocks(result.events);
+                }
+            }
+        }
+    });
+
+    test.each(['unary', 'stream'])('%s does not join tool marker fragments across an inline thinking boundary', async mode => {
+        const result = await output([
+            text('[Ca'), text('<thinking>reason</thinking>\n\n'), text('lled read_file with args: {}]')
+        ], { ...toolRequest(), thinking }, mode);
+        expect(result.content).toEqual([
+            { type: 'text', text: '[Ca' },
+            { type: 'thinking', thinking: 'reason' },
+            { type: 'text', text: 'lled read_file with args: {}]' }
+        ]);
+        expect(result.stop_reason).toBe('end_turn');
+        expectSerialBlocks(result.events);
+    });
+
+    test.each(['unary', 'stream'])('%s rejects an unfinished tool at an inline thinking boundary', async mode => {
+        await expect(output([
+            text('[Called read_file with args: {"path":'),
+            text('<thinking>reason</thinking>\n\n"README.md"}]')
+        ], { ...toolRequest(), thinking }, mode)).rejects.toMatchObject({ status: 502, skipErrorCount: true });
+    });
+
     test.each(['unary', 'stream'])('%s restores split bracket tool calls without leaking their wire markers', async mode => {
         const marker = '[Called read_file with args: {"path":"README.md","nested":["]",{"x":1}]}]';
         const frames = [text('before '), ...marker.match(/.{1,3}/g).map(text), text(' after')];

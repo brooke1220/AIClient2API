@@ -20,6 +20,8 @@ export function applyKiroErrorPolicy(error, body) {
     } else if (status === 429 && /^(?:SERVICE_REQUEST_RATE_EXCEEDED|USER_REQUEST_RATE_EXCEEDED|CREDIT_CONSUMPTION_RATE_EXCEEDED|ACCOUNT_RATE_LIMIT_EXCEEDED)$/.test(reason)) {
         error.status = 429;
         error.kiroAccountRateLimited = true;
+        // A service-level throttle may cover every account; it keeps the full switch wait.
+        error.kiroAccountScoped = reason !== 'SERVICE_REQUEST_RATE_EXCEEDED';
         error.kiroErrorKind = 'account_throttled';
     } else if (status === 429 && /^(?:CAPACITY_EXCEEDED|INSUFFICIENT_MODEL_CAPACITY|MODEL_TEMPORARILY_UNAVAILABLE)$/.test(reason)) {
         // Capacity throttles are not evidence that an account is unhealthy.

@@ -1,6 +1,8 @@
 import { jest } from '@jest/globals';
 jest.mock('../src/utils/logger.js', () => ({ __esModule: true, default: { info: jest.fn(), warn: jest.fn(), error: jest.fn() } }));
 import { buildKiroCacheProfile, captureKiroCacheSources } from '../src/providers/claude/kiro-cache-profile.js';
+import * as tokenUtils from '../src/utils/token-utils.js';
+import { countTextTokens } from '../src/utils/token-utils.js';
 import { KiroCacheMeter } from '../src/providers/claude/kiro-cache-meter.js';
 import { KIRO_USAGE_DETAILS, resolveKiroCacheUsage, splitKiroCacheUsage } from '../src/providers/claude/kiro-cache-usage.js';
 
@@ -128,6 +130,30 @@ describe('deterministic Kiro prefix accounting', () => {
         const unmapped = buildKiroCacheProfile({ conversationState: { currentMessage: { userInputMessage: wire } } },
             captureKiroCacheSources([{ wire, content: parts }], { messages: [{ content: parts }] }), config);
         expect(unmapped).toMatchObject({ breakpoints: [], reason: 'unmapped_breakpoint' });
+    });
+    const build = parts => {
+        const wire = { modelId: model, origin: 'IDE', content: parts.map(part => part.text).join('') };
+        return buildKiroCacheProfile({ conversationState: { conversationId: 'memo', currentMessage: { userInputMessage: wire } } },
+            captureKiroCacheSources([{ wire, content: parts }], { messages: [{ content: parts }] }), config);
+    };
+    test('a tokenizer failure is not memoized as the block count', () => {
+        const text = 'memo fallback check '.repeat(30);
+        expect(countTextTokens(text)).not.toBe(Math.ceil(text.length / 4));
+        const failure = jest.spyOn(tokenUtils, 'exactTextTokens').mockReturnValueOnce(null);
+        try {
+            expect(build([block(text, true)]).blocks[0].tokens).toBe(Math.ceil(text.length / 4));
+        } finally {
+            failure.mockRestore();
+        }
+        expect(build([block(text, true)]).blocks[0].tokens).toBe(countTextTokens(text));
+    });
+    test('memoized default token counts match direct tokenization on repeated and distinct blocks', () => {
+        const first = 'function a() { return 1; }\n中文说明🟢 '.repeat(40);
+        const second = 'const b = [1, 2, 3].map(x => x * 2);\n'.repeat(40);
+        const parts = [block(first, true), block(second, true)];
+        const expected = [countTextTokens(first), countTextTokens(first) + countTextTokens(second)];
+        for (let round = 0; round < 2; round++) expect(build(parts).blocks.map(item => item.tokens)).toEqual(expected);
+        expect(build([block(second, true)]).blocks.map(item => item.tokens)).toEqual([countTextTokens(second)]);
     });
 });
 

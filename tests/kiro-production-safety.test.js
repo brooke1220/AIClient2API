@@ -3,6 +3,7 @@ import { Readable } from 'node:stream';
 import { jest } from '@jest/globals';
 jest.mock('open', () => ({ __esModule: true, default: jest.fn() }));
 jest.mock('../src/utils/logger.js', () => ({ __esModule: true, default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() } }));
+import logger from '../src/utils/logger.js';
 import { crc32, decodeKiroFrames, decodeKiroFramesResilient } from '../src/providers/claude/kiro-event-stream.js';
 import { KiroApiService } from '../src/providers/claude/claude-kiro.js';
 import { KiroToolAssembler } from '../src/providers/claude/kiro-tool-assembler.js';
@@ -77,6 +78,14 @@ describe('AWS wire integrity and truthful termination', () => {
     });
     test.each(['unknown-stop', 'constructor', '__proto__'])('explicit unknown stop reason %s cannot be inherited or rewritten into successful end_turn', async stopReason => {
         await expect(collect(service([text('prefix'), frame('metadataEvent', { stopReason })]).generateContentStream(model, request()))).rejects.toThrow(/unsupported/);
+    });
+    test('an unsupported stop reason logs its bounded raw value for later mapping', async () => {
+        logger.warn.mockClear();
+        const stopReason = `NEW_REASON_${'x'.repeat(200)}`;
+        await expect(collect(service([text('prefix'), frame('metadataEvent', { stopReason })]).generateContentStream(model, request()))).rejects.toThrow(/unsupported/);
+        const line = logger.warn.mock.calls.map(([message]) => String(message)).find(message => message.includes('Unsupported upstream stop reason'));
+        expect(line).toContain('"NEW_REASON_');
+        expect(line.length).toBeLessThan(140);
     });
     test('real max-token termination and real usage survive conversion to native Claude events', async () => {
         const backend = service([text('partial'), frame('metadataEvent', { stopReason: 'max_tokens', usage: { inputTokens: 10, outputTokens: 4 } })]);
