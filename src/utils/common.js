@@ -13,6 +13,7 @@ import { getPluginManager } from '../core/plugin-manager.js';
 import { MODEL_PROTOCOL_PREFIX, MODEL_PROVIDER } from './constants.js';
 import { isKiroProviderType } from '../providers/kiro-account-state.js';
 import { createKiroSessionContext, kiroClientScope } from '../providers/claude/kiro-session.js';
+import { hasKiroToolArguments } from '../providers/claude/kiro-tool-assembler.js';
 
 // ==================== 时间与时区 ====================
 
@@ -1076,6 +1077,28 @@ async function resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, log
     }
 }
 
+/** Classify a written Kiro client record for opt-in timing; tool arguments are only checked for emptiness. */
+function classifyKiroDownstreamChunk(chunk) {
+    if (!chunk || typeof chunk !== 'object') return null;
+    const type = chunk.type;
+    if (type === 'content_block_delta') {
+        const delta = chunk.delta || {};
+        if (delta.type === 'thinking_delta') return delta.thinking ? 'Reasoning' : null;
+        if (delta.type === 'text_delta') return typeof delta.text === 'string' && delta.text.trim() ? 'Text' : null;
+        if (delta.type === 'input_json_delta') return hasKiroToolArguments(delta.partial_json) ? 'ToolArgs' : null;
+        return null;
+    }
+    if (type === 'content_block_start') return chunk.content_block?.type === 'redacted_thinking' ? 'Reasoning' : null;
+    if (type === 'response.reasoning_summary_text.delta' || type === 'response.reasoning_text.delta') return chunk.delta ? 'Reasoning' : null;
+    if (type === 'response.output_text.delta') return typeof chunk.delta === 'string' && chunk.delta.trim() ? 'Text' : null;
+    if (type === 'response.function_call_arguments.delta') return hasKiroToolArguments(chunk.delta) ? 'ToolArgs' : null;
+    const delta = chunk.choices?.[0]?.delta;
+    if (!delta) return null;
+    if (Array.isArray(delta.tool_calls) && delta.tool_calls.some(call => hasKiroToolArguments(call?.function?.arguments))) return 'ToolArgs';
+    if (delta.reasoning_content) return 'Reasoning';
+    return typeof delta.content === 'string' && delta.content.trim() ? 'Text' : null;
+}
+
 export async function handleStreamRequest(res, service, model, requestBody, fromProvider, toProvider, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME, providerPoolManager, pooluuid, customName, retryContext = null) {
     let fullResponseText = '';
     let fullResponseJson = '';
@@ -1140,14 +1163,38 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     let writeChain = Promise.resolve();
     // Kiro writes, including comments/errors/terminal records, share one bounded
     // writer. A failed client write cancels generation without penalizing an account.
+    // Opt-in (KIRO_REQUEST_TRACE): every Kiro write that needs drain counts,
+    // including heartbeats and terminal records, not only model events.
+    const recordKiroDrain = needsDrain => {
+        if (!needsDrain || !kiroTiming?.traceId) return;
+        const downstream = kiroTiming.downstream ||= { events: 0, bytes: 0, drainWaits: 0 };
+        downstream.drainWaits++;
+        return downstream;
+    };
     const writeStreamRecord = (chunk, onWritten = () => {}, signal = upstreamAbortController.signal) => {
         if (!isKiroStream) return writeWithBackpressure(res, chunk, signal, onWritten);
         pendingDownstreamWrites++;
         const operation = writeChain.then(async () => {
             try {
                 if (clientDisconnected.value) throw upstreamAbortController.signal.reason || new Error('Client connection closed');
-                await writeWithBackpressure(res, chunk, signal, onWritten, { timeoutMs: writeTimeoutMs });
+                let needsDrain = false;
+                let drainTiming;
+                await writeWithBackpressure(res, chunk, signal, draining => {
+                    onWritten(draining);
+                    needsDrain = draining;
+                    drainTiming = recordKiroDrain(draining);
+                }, { timeoutMs: writeTimeoutMs });
+                if (needsDrain && kiroTiming?.traceId) {
+                    // Use the end of the wait: a heartbeat can start draining
+                    // before arguments arrive and still delay their first write.
+                    // Record this after onWritten so a call's own first argument
+                    // write never counts as prior backpressure for that call.
+                    // The trace can be created while an early heartbeat waits.
+                    const downstream = drainTiming || recordKiroDrain(true);
+                    downstream.lastDrainMs = Math.round(performance.now() - kiroTiming.startedAt);
+                }
             } catch (error) {
+                if (error.isDownstreamWriteError && kiroTiming) kiroTiming.downstreamWriteTimeout = true;
                 onClientError(error);
                 responseClosed = true;
                 if (!res.destroyed && !res.writableEnded) {
@@ -1163,7 +1210,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         return operation;
     };
 
-    const onModelEventWritten = chunk => {
+    const onModelEventWritten = (chunk, record, toolTrace) => {
         anyDataSent = true;
         if (!kiroTiming) return;
         // res.write accepted the record; this does not measure client receipt.
@@ -1180,6 +1227,21 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 kiroTiming.firstTextWritten = true;
                 logger.info(`[Kiro Timing] First downstream text accepted: ${Math.round(performance.now() - kiroTiming.startedAt)}ms elapsed`);
             }
+        }
+        if (!kiroTiming.traceId) return;
+        // Opt-in classified timing (KIRO_REQUEST_TRACE): kinds, counts and sizes only.
+        const now = Math.round(performance.now() - kiroTiming.startedAt);
+        const downstream = kiroTiming.downstream ||= { events: 0, bytes: 0, drainWaits: 0 };
+        downstream.events++;
+        if (typeof record === 'string') downstream.bytes += Buffer.byteLength(record);
+        const kind = classifyKiroDownstreamChunk(chunk);
+        if (kind) downstream[`first${kind}Ms`] ??= now;
+        if (toolTrace && kind === 'ToolArgs' && toolTrace.firstWriteMs === undefined) {
+            toolTrace.firstWriteMs = now;
+            // Prior writes whose drain waits ended after the arguments arrived
+            // delayed this call, including waits that started before arrival.
+            toolTrace.backpressure = Number.isFinite(downstream.lastDrainMs) && Number.isFinite(toolTrace.firstArgsMs)
+                && downstream.lastDrainMs >= toolTrace.firstArgsMs;
         }
     };
 
@@ -1455,6 +1517,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             if (retryContext?.slotLease?.assertUsable) generationOptions.kiroAccountLease = retryContext.slotLease;
             generationOptions.kiroTiming = kiroTiming;
             generationOptions.kiroSession = retryContext.kiroSession;
+            // Trusted from the endpoint, never the request body: protocols that keep argument deltas.
+            kiroTiming.toolGate = [MODEL_PROTOCOL_PREFIX.CLAUDE, MODEL_PROTOCOL_PREFIX.OPENAI,
+                MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES].includes(clientProtocol);
         }
         const nativeStream = await service.generateContentStream(model, requestBody, generationOptions);
         
@@ -1467,6 +1532,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 为每个请求生成唯一 ID，用于在单例 converter 中隔离并发流状态。
         streamRequestId = `req_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 
+        // Native tool block index -> timing record, so a converted argument write pairs with its own call.
+        const kiroToolTraceByIndex = new Map();
         nativeLoop: for await (const nativeChunk of nativeStream) {
             // 检查客户端是否已断开连接
             if (clientDisconnected.value) {
@@ -1486,6 +1553,17 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             const chunkText = extractResponseText(nativeChunk, toProvider);
             if (chunkText && !Array.isArray(chunkText)) {
                 fullResponseText += chunkText;
+            }
+
+            // Opt-in tool timing: converters emit each argument delta synchronously,
+            // so records written for this native chunk belong to the same call.
+            let toolTrace;
+            const toolTraces = kiroTiming?.toolTraces;
+            if (toolTraces && nativeChunk?.type === 'content_block_start' && nativeChunk.content_block?.type === 'tool_use') {
+                const trace = toolTraces.get(nativeChunk.content_block.id);
+                if (trace) kiroToolTraceByIndex.set(nativeChunk.index, trace);
+            } else if (toolTraces && nativeChunk?.type === 'content_block_delta' && nativeChunk.delta?.type === 'input_json_delta') {
+                toolTrace = kiroToolTraceByIndex.get(nativeChunk.index);
             }
 
             // Convert the complete chunk object to the client's format (fromProvider), if necessary.
@@ -1594,7 +1672,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 if (!clientDisconnected.value && !res.writableEnded) {
                     try {
                         const eventHeader = isKiroStream && addEvent ? `event: ${chunk.type}\n` : '';
-                        await writeStreamRecord(`${eventHeader}data: ${JSON.stringify(chunk)}\n\n`, () => onModelEventWritten(chunk));
+                        const record = `${eventHeader}data: ${JSON.stringify(chunk)}\n\n`;
+                        await writeStreamRecord(record, () => onModelEventWritten(chunk, record, toolTrace));
                         if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES) {
                             const sequence = chunk?.sequence_number;
                             nextResponseSequenceNumber = Number.isInteger(sequence) && sequence >= 0
@@ -1631,6 +1710,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 uuid: pooluuid
             });
         }
+        // Shared across retry frames, including a fallback to another provider.
+        // A successful final attempt clears earlier, recoverable failures.
+        if (retryContext.kiroTiming) retryContext.kiroTiming.downstreamError = false;
 
     }  catch (error) {
         // 如果客户端已断开，不需要发送错误响应
@@ -1639,6 +1721,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             responseClosed = true;
             return;
         }
+        // Cover every terminal error branch; a successful retry resets this.
+        if (retryContext.kiroTiming) retryContext.kiroTiming.downstreamError = true;
 
         if (error.isKiroAccountUnavailable) logger.info(`[Stream] Kiro account unavailable (${error.kiroUnavailableReason}); evaluating recovery`);
         else logger.error('\n[Server] Error during stream processing:', error.stack);
@@ -1924,6 +2008,14 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         // 只在首次请求时记录日志（避免重试时重复记录）
         if (!isRetry) {
             await logConversation('output', fullResponseText, PROMPT_LOG_MODE, PROMPT_LOG_FILENAME);
+        }
+        // One request-level downstream summary, separate from the per-attempt upstream traces.
+        if (!isRetry && kiroTiming?.traceId) {
+            logger.info(`[Kiro Downstream] ${JSON.stringify({ requestId: kiroTiming.traceId, attempts: kiroTiming.attempt,
+                mode: kiroTiming.mode, protocol: clientProtocol,
+                outcome: kiroTiming.downstreamWriteTimeout ? 'write_timeout'
+                    : clientDisconnected.value ? 'client_closed' : kiroTiming.downstreamError ? 'error' : 'completed',
+                endMs: Math.round(performance.now() - kiroTiming.startedAt), ...kiroTiming.downstream })}`);
         }
         // fs.writeFile('oldResponseChunk'+Date.now()+'.json', fullOldResponseJson);
         // fs.writeFile('responseChunk'+Date.now()+'.json', fullResponseJson);

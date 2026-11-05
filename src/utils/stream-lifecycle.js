@@ -1,4 +1,4 @@
-/** Write one record without reading more upstream data while the client is slow. */
+/** Write one record, reporting whether this write needs drain before waiting for it. */
 export function writeWithBackpressure(res, chunk, signal, onWritten = () => {}, options = {}) {
     return new Promise((resolve, reject) => {
         let settled = false;
@@ -28,7 +28,7 @@ export function writeWithBackpressure(res, chunk, signal, onWritten = () => {}, 
             if (signal?.aborted) return onAbort();
             if (res.destroyed || res.writableEnded) return onClose();
             const writable = res.write(chunk);
-            onWritten();
+            onWritten(writable === false);
             if (writable !== false) finish();
             else if (!settled && Number.isSafeInteger(options.timeoutMs) && options.timeoutMs > 0) {
                 timer = setTimeout(() => {

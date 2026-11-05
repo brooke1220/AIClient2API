@@ -11,8 +11,11 @@ describe('SSE backpressure and early routing cancellation', () => {
     afterEach(() => jest.restoreAllMocks());
     test('writing pauses until drain and removes its temporary listeners', async () => {
         const res = response(); res.write.mockReturnValue(false); let completed = false;
-        const pending = writeWithBackpressure(res, 'data: x\n\n').then(() => { completed = true; });
-        await tick(); expect(completed).toBe(false); res.emit('drain'); await pending;
+        const written = jest.fn();
+        const pending = writeWithBackpressure(res, 'data: x\n\n', undefined, written).then(() => { completed = true; });
+        await tick(); expect(completed).toBe(false); expect(written).toHaveBeenCalledWith(true);
+        res.emit('drain'); await pending;
+        expect(written).toHaveBeenCalledTimes(1);
         expect(res.listenerCount('drain')).toBe(0); expect(res.listenerCount('close')).toBe(0);
     });
     test.each(['abort', 'close', 'error'])('%s interrupts a pending drain without leaking listeners', async failure => {

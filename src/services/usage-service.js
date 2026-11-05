@@ -279,12 +279,13 @@ export function formatKiroUsage(usageData) {
     const items = [];
     const now = Date.now();
     const THREE_MONTHS_MS = 90 * 24 * 60 * 60 * 1000; // 约3个月
-    
-    // 检查时间戳是否在当前时间前后3个月内
+
+    // 只隐藏3个月前就已重置/过期的旧记录；未来到期的额度（如一年期试用）照常显示，
+    // 已过期的额度由 EXPIRED 状态标记。
     const isWithinWindow = (ts) => {
         if (!ts) return true;
         const val = ts < 10000000000 ? ts * 1000 : ts;
-        return Math.abs(val - now) <= THREE_MONTHS_MS;
+        return val >= now - THREE_MONTHS_MS;
     };
     
     breakdownList.forEach(breakdown => {

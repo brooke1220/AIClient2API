@@ -1,9 +1,15 @@
 import { v4 as uuidv4 } from 'uuid';
 import { kiroIntegrityError } from './kiro-event-stream.js';
 
+/** True when input carries real tool parameters — not empty, whitespace, or a bare `{}`. */
+export const hasKiroToolArguments = input => typeof input === 'string'
+    ? input.trim().length > 0 && !/^\s*\{\s*\}\s*$/.test(input)
+    : !!input && typeof input === 'object' && Object.keys(input).length > 0;
+
 /** Buffer individual tools until validated, then emit in arrival order. */
 export class KiroToolAssembler {
-    constructor(maxBytes = 4 * 1024 * 1024, maxCalls = 1024) {
+    /** `clock` (ms since the request origin) enables opt-in per-call timing and snapshot counts. */
+    constructor(maxBytes = 4 * 1024 * 1024, maxCalls = 1024, clock = null) {
         this.calls = new Map();
         this.order = [];
         this.emitted = 0;
@@ -11,6 +17,10 @@ export class KiroToolAssembler {
         this.maxBytes = Number.isFinite(Number(maxBytes)) && Number(maxBytes) > 0 ? Number(maxBytes) : 4 * 1024 * 1024;
         this.maxCalls = Number.isFinite(Number(maxCalls)) && Number(maxCalls) > 0 ? Number(maxCalls) : 1024;
         this.bytes = 0;
+        this.clock = typeof clock === 'function' ? clock : null;
+        // Non-empty objects arriving after string fragments, and how many keep the
+        // accumulated string as a prefix. Empty-object placeholders are counted apart.
+        this.stats = this.clock ? { objectAfterString: 0, prefixMatch: 0, emptyObjects: 0 } : null;
     }
 
     feed(event, { legacy = false } = {}) {
@@ -44,23 +54,36 @@ export class KiroToolAssembler {
                 call = { id, name: event.name, arguments: '', argumentBytes: 0, trailingHighSurrogate: false,
                     done: false, synthetic: !event.toolUseId, legacy };
                 this.order.push(call);
+                // The ordinal survives a later ID migration because it lives on the call.
+                if (this.clock) call.trace = { callKey: this.order.length, native: !legacy };
             }
             this.calls.set(id, call);
         }
         if (!call || call.done) throw kiroIntegrityError('orphan or completed tool fragment');
         if (event.name && event.name !== call.name) throw kiroIntegrityError('tool name changed within a call');
         if (!legacy) this.lastId = id;
+        if (call.trace && !call.synthetic) call.trace.identityMs ??= this.clock();
         if (event.input !== undefined && event.input !== null) {
             const previousBytes = call.argumentBytes;
             if (typeof event.input === 'object') {
                 if (Object.keys(event.input).length) {
-                    call.arguments = JSON.stringify(event.input);
+                    const serialized = JSON.stringify(event.input);
+                    if (this.stats && call.trace?.stringFragments) {
+                        this.stats.objectAfterString++;
+                        if (serialized.startsWith(call.arguments)) this.stats.prefixMatch++;
+                    }
+                    if (hasKiroToolArguments(serialized)) this.markArgs(call);
+                    call.arguments = serialized;
                     call.argumentBytes = Buffer.byteLength(call.arguments);
                     call.trailingHighSurrogate = false;
+                } else if (this.stats) {
+                    this.stats.emptyObjects++;
                 }
             } else {
                 const fragment = String(event.input);
                 if (fragment) {
+                    if (hasKiroToolArguments(fragment)) this.markArgs(call);
+                    if (call.trace) call.trace.stringFragments = true;
                     const first = fragment.charCodeAt(0);
                     // Two lone UTF-16 surrogates cost 6 UTF-8 bytes separately,
                     // but form one 4-byte character when joined across deltas.
@@ -78,6 +101,15 @@ export class KiroToolAssembler {
         return this.drain();
     }
 
+    /** First non-empty arguments: record whether identity was ready and an earlier call was still open. */
+    markArgs(call) {
+        const trace = call.trace;
+        if (!trace || trace.firstArgsMs !== undefined) return;
+        trace.firstArgsMs = this.clock();
+        trace.identityReadyAtArgs = !call.synthetic;
+        trace.priorOpenAtArgs = this.order.slice(0, this.order.indexOf(call)).some(earlier => !earlier.done);
+    }
+
     complete(call) {
         let input;
         try { input = JSON.parse(call.arguments || '{}'); }
@@ -90,7 +122,13 @@ export class KiroToolAssembler {
             this.bytes += 2;
             if (this.bytes > this.maxBytes) throw kiroIntegrityError('tool argument buffer limit exceeded');
         }
+        if (call.trace) call.trace.validatedMs ??= this.clock();
         call.done = true;
+    }
+
+    /** Internal timing record for a drained call; never part of the drained object. */
+    traceFor(id) {
+        return this.calls.get(id)?.trace;
     }
 
     drain() {

@@ -60,7 +60,7 @@
 | `KIRO_IMAGE_MAX_PIXELS` | 40000000 | 单图解码像素预算，防止压缩图展开后过大。 |
 | `KIRO_IMAGE_MAX_EDGE` | 1568 | 自动缩放后的长边上限，不放大小图。 |
 | `KIRO_IMAGE_MAX_BASE64_BYTES` | 400000 | 单图发送给上游的 base64 字节预算，仍受最终 JSON 总体预算限制。 |
-| `KIRO_REQUEST_TRACE` | false | 每次生成上游尝试输出一条 `[Kiro Trace]` JSON 日志；同一请求重试共享 requestId，并递增 attempt。记录账号摘要、模型、路径类型、耗时、状态、首事件、原生用量与 credit。最终 `[Kiro Usage]` 记录实际返回用量、来源与可用的缓存计量详情，不记录提示词、工具参数、图片或凭证。 |
+| `KIRO_REQUEST_TRACE` | false | 每次生成上游尝试输出一条 `[Kiro Trace]` JSON 日志；同一请求重试共享 requestId，并递增 attempt。记录账号摘要、模型、路径类型、`attemptStartMs`（尝试相对请求起点的偏移）、耗时、状态、首事件、原生用量与 credit。最终 `[Kiro Usage]` 记录实际返回用量、来源与可用的缓存计量详情，不记录提示词、工具参数、图片或凭证。`[Kiro Trace]` 另记 `headersMs`、`firstReasoningMs`、`firstContentMs`、`firstToolMs`（工具开始）和 `firstToolArgsMs`（首段非空参数；空白或 `{}` 不计），以请求起点计时，占位工具不计入；旧 XML 思考模型的 `<thinking>` 文本仍计为正文。`[Kiro Tool Trace]` 每次生成（含账号切换后的新生成）在有工具调用或参数快照时输出一条，`attempt` 为该次生成内最后一次上游尝试的序号；按本地序号 `callKey` 记录每个工具调用的首段参数、身份就绪、完整校验、生成与首次写入时间，以及前序工具阻塞、身份未就绪、此前已输出文本形式工具（`priorLegacyEmitted`）和背压标记（其他写入等待 drain 的区间与工具参数到达至该调用首次参数写入之间重叠时为 true，包含参数到达前已开始、到达后才结束的等待；该调用自身超过 socket highWaterMark 的写入不算），并统计字符串片段之后收到非空完整对象的次数、前缀一致次数与空对象占位次数，不记录工具 ID 或参数。整段缓冲与非流式模式不记录 `firstWriteMs`。`[Kiro Downstream]` 每个请求一条，记录模式、客户端协议、结果（`completed`、`error`、`client_closed`、`write_timeout`）、下游首段思考、正文、非空工具参数的写入时间（写入被接受，不代表客户端已收到；空白或 `{}` 不计），模型事件数与字节数（不含心跳、错误和结束标记），以及所有 Kiro 写入（含心跳和结束标记）等待 drain 的次数。 |
 | `KIRO_PROMPT_CACHE_MODE` | off | `observe` 只记录本地缓存估算日志，`estimate` 补全缺失的缓存字段；明确的上游值和零值优先。 |
 | `KIRO_PROMPT_CACHE_POLICY` | auto | 有缓存声明时使用 `explicit`，否则使用 `history`；可显式固定其中一种策略。 |
 | `KIRO_PROMPT_CACHE_DEFAULT_TTL_MS` | 300000 | 未声明 TTL 时的本地默认有效期，从上游请求发起时计算，最多 1 小时。 |

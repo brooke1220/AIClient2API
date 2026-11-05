@@ -4,7 +4,7 @@ import { applyKiroErrorPolicy } from './kiro-error-policy.js';
 import { normalizeKiroImages } from './kiro-images.js';
 import { createKiroSessionContext } from './kiro-session.js';
 import { kiroAccountBudget, kiroBudgetKey } from './kiro-account-budget.js';
-import { createKiroRequestTrace } from './kiro-request-trace.js';
+import { createKiroRequestTrace, logKiroToolTrace } from './kiro-request-trace.js';
 import { appendKiroPromptAdditions, getKiroIdentityPrompt, prepareKiroToolDescription, shouldUseKiroThinkingPrompt } from './kiro-prompt-policy.js';
 import { KiroTruncationRecovery } from './kiro-truncation-recovery.js';
 import { convertKiroUserContent, getKiroHistoryImageMessageWindow, getKiroImagePayloadStats } from './kiro-message-content.js';
@@ -15,6 +15,7 @@ import { captureKiroCacheSources } from './kiro-cache-profile.js';
 import { kiroCacheMode, prepareKiroCacheAttempt } from './kiro-cache-meter.js';
 import { copyKiroUsageDetails, resolveKiroCacheUsage } from './kiro-cache-usage.js';
 import { KiroBracketToolParser } from './kiro-bracket-tools.js';
+import { getKiroRemainingCredits, KIRO_CREDIT_EPSILON } from './kiro-usage-credits.js';
 import { markKiroSidecarError, requestViaKiroSidecar, selectKiroSidecarTransport } from './kiro-sidecar-transport.js';
 import { atomicWriteFile } from '../../utils/file-lock.js';
 import axios from 'axios';
@@ -2373,12 +2374,19 @@ async saveCredentialsToFile(filePath, newData) {
             // Verify usage limits to confirm quota exhaustion
             const usageLimits = await this.getUsageLimits({ signal });
             signal?.throwIfAborted();
-            // 真实响应字段为 usageBreakdownList[].currentUsage / usageLimit
-            const breakdown = usageLimits?.usageBreakdownList?.[0];
-            logger.info(`[Kiro] Quota confirmed exhausted: ${breakdown?.currentUsage}/${breakdown?.usageLimit}`);
-            // Calculate recovery time: 1st day of next month at 00:00:00 UTC
-            const nextMonth = this._getNextMonthFirstDay();
-            this._markCredentialUnhealthyWithRecovery(verifiedReason, error, nextMonth);
+            // 基础额度用完后试用/奖励额度仍可用，需合计剩余额度再决定是否锁号
+            const remaining = getKiroRemainingCredits(usageLimits);
+            if (remaining !== null && remaining >= KIRO_CREDIT_EPSILON) {
+                // 账号仍有额度但本次请求被拒（如试用额度不覆盖该模型）：只让本次请求换号，
+                // 不锁到下月，避免把剩余额度闲置并让整个号池返回 503。
+                logger.warn(`[Kiro] 402 in ${context} but ${remaining.toFixed(2)} credits remain (trial/bonus). Switching credential for this request without marking unhealthy.`);
+                error.quotaExhausted = true;
+            } else {
+                logger.info(`[Kiro] Quota confirmed exhausted: ${remaining === null ? 'no usage breakdown' : `${remaining.toFixed(2)} credits remain`}`);
+                // Calculate recovery time: 1st day of next month at 00:00:00 UTC
+                const nextMonth = this._getNextMonthFirstDay();
+                this._markCredentialUnhealthyWithRecovery(verifiedReason, error, nextMonth);
+            }
         } catch (usageError) {
             signal?.throwIfAborted();
             logger.warn('[Kiro] Failed to verify usage limits:', usageError.message);
@@ -2457,7 +2465,7 @@ async saveCredentialsToFile(filePath, newData) {
     async generateContent(model, requestBody, options = {}) {
         let message;
         const blocks = new Map();
-        for await (const event of this.generateContentStream(model, requestBody, options)) {
+        for await (const event of this.generateContentStream(model, requestBody, { ...options, kiroOutputMode: 'unary' })) {
             if (event.type === 'message_start') message = { ...event.message,
                 stop_reason: event.message.stop_reason ?? null, stop_sequence: event.message.stop_sequence ?? null, content: [] };
             else if (event.type === 'content_block_start') blocks.set(event.index, { ...event.content_block });
@@ -2604,7 +2612,7 @@ async saveCredentialsToFile(filePath, newData) {
             if (meaningfulEventSeen && ms > 0) idleTimer = setTimeout(() => expire('stream idle'), ms);
         };
         const clearTimers = () => { clearTimeout(firstTimer); clearTimeout(idleTimer); clearTimeout(totalTimer); };
-        const trace = createKiroRequestTrace(this, model, options);
+        const trace = createKiroRequestTrace(this, model, options, KIRO_PLACEHOLDER_TOOL_NAME);
         let attemptError;
         let upstreamComplete = false;
 
@@ -2647,6 +2655,7 @@ async saveCredentialsToFile(filePath, newData) {
             signal?.addEventListener('abort', onAbort, { once: true });
             signal?.throwIfAborted();
             const headersAt = performance.now();
+            trace?.headers();
             // Local CPU work that only needs to finish before the first event
             // overlaps the model's time to first token instead of delaying dispatch.
             // A failing hook is not a transport failure; the caller recomputes and surfaces it.
@@ -2890,6 +2899,7 @@ async saveCredentialsToFile(filePath, newData) {
         const streamStartedAt = performance.now();
         options = { ...options, kiroTiming: options.kiroTiming || { startedAt: streamStartedAt } };
         const requestStartedAt = options.kiroTiming.startedAt;
+        options.kiroTiming.mode = options.kiroOutputMode || 'stream';
         const { signal } = options;
         signal?.throwIfAborted();
         validateKiroGenerationRequest(model, requestBody);
@@ -2948,7 +2958,12 @@ async saveCredentialsToFile(filePath, newData) {
         };
         const textForTokenCount = [];
         const toolCalls = [];
-        const toolAssembler = new KiroToolAssembler(this.config.KIRO_MAX_TOOL_ARGUMENT_BYTES, this.config.KIRO_MAX_TOOL_CALLS);
+        // Opt-in per-call tool timing; the clock shares the request origin with the downstream summary.
+        const toolOrigin = Number.isFinite(requestStartedAt) ? requestStartedAt : streamStartedAt;
+        const toolClock = this.config.KIRO_REQUEST_TRACE === true ? () => Math.round(performance.now() - toolOrigin) : null;
+        const toolAssembler = new KiroToolAssembler(this.config.KIRO_MAX_TOOL_ARGUMENT_BYTES, this.config.KIRO_MAX_TOOL_CALLS, toolClock);
+        // Internal toolUseId -> timing record so the writer can pair downstream writes; never logged.
+        if (toolClock) options.kiroTiming.toolTraces = new Map();
         const toolNameMaps = buildKiroToolNameMaps(requestBody.tools);
         const requestedTools = new Set(Array.isArray(requestBody.tools) ? requestBody.tools.map(tool => tool?.name).filter(Boolean) : []);
         const bracketParser = new KiroBracketToolParser(name => name === KIRO_PLACEHOLDER_TOOL_NAME ||
@@ -3051,6 +3066,9 @@ async saveCredentialsToFile(filePath, newData) {
         const emitCompletedTools = (completed) => {
             const events = [];
             for (const call of completed) {
+                // Only signatures that passed deduplication and produced output
+                // count as an earlier legacy emission, not merely parsed tools.
+                const priorLegacyEmitted = legacyToolSignatures.size > 0;
                 const signature = toolSignature(call.name, call.input);
                 if (call.legacy) {
                     if (nativeToolSignatures.has(signature) || legacyToolSignatures.has(signature)) continue;
@@ -3064,6 +3082,12 @@ async saveCredentialsToFile(filePath, newData) {
                 }
                 events.push(...stopBlock(streamState.textBlockIndex), ...stopBlock(streamState.thinkingBlockIndex));
                 const index = streamState.nextBlockIndex++;
+                const toolTrace = toolClock ? toolAssembler.traceFor(call.toolUseId) : null;
+                if (toolTrace) {
+                    toolTrace.emittedMs ??= toolClock();
+                    toolTrace.priorLegacyEmitted = priorLegacyEmitted;
+                    options.kiroTiming.toolTraces?.set(call.toolUseId, toolTrace);
+                }
                 events.push({ type: 'content_block_start', index, content_block: { type: 'tool_use', id: call.toolUseId, name: call.name, input: {} } });
                 events.push({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: call.arguments } });
                 events.push({ type: 'content_block_stop', index });
@@ -3468,6 +3492,10 @@ async saveCredentialsToFile(filePath, newData) {
                 logger.error('[Kiro] Error in streaming generation:', error?.stack || error?.message || String(error));
             }
             throw error;
+        } finally {
+            // Live streams finish here only after every yielded event was written,
+            // so downstream write times are already recorded for paired calls.
+            if (toolClock) logKiroToolTrace(options.kiroTiming, toolAssembler);
         }
     }
 
@@ -3526,7 +3554,7 @@ async saveCredentialsToFile(filePath, newData) {
      */
     async * generateContentStreamBuffered(model, requestBody, options = {}) {
         const cacheAccounting = {};
-        const rawGenerator = this._generateContentStreamRaw(model, requestBody, { ...options, kiroCacheAccounting: cacheAccounting });
+        const rawGenerator = this._generateContentStreamRaw(model, requestBody, { ...options, kiroCacheAccounting: cacheAccounting, kiroOutputMode: 'buffered' });
         const events = [];
         const configuredLimit = Number(this.config.KIRO_MAX_BUFFERED_RESPONSE_BYTES);
         const maxBytes = Number.isSafeInteger(configuredLimit) && configuredLimit > 0
