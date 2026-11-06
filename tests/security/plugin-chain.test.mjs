@@ -10,7 +10,8 @@ import AdmZip from 'adm-zip';
 // Use native ESM and a disposable working directory: exercise real imports, disk
 // persistence and HTTP dispatch without modifying the developer's credentials.
 const originalCwd = process.cwd();
-const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'aiclient2api-plugin-security-'));
+// Match process.cwd() when the system temporary directory uses a symlink.
+const tempDir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'aiclient2api-plugin-security-')));
 let server;
 let logger;
 after(async () => {

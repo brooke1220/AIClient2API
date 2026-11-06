@@ -1,6 +1,6 @@
 import { KiroModelCache, kiroModelCapabilityScope } from './kiro-model-cache.js';
 import { readKiroTokenUsage, readKiroMetering, kiroRefusalText } from './kiro-response-metadata.js';
-import { applyKiroErrorPolicy } from './kiro-error-policy.js';
+import { applyKiroErrorPolicy, kiroErrorReason, kiroThrottleLogDetail } from './kiro-error-policy.js';
 import { normalizeKiroImages } from './kiro-images.js';
 import { createKiroSessionContext } from './kiro-session.js';
 import { kiroAccountBudget, kiroBudgetKey } from './kiro-account-budget.js';
@@ -2091,7 +2091,7 @@ async saveCredentialsToFile(filePath, newData) {
             // Handle 429 (Too Many Requests) - switch credential; only account-scoped throttles skip the baseDelay wait
             if (status === 429) {
                 const delay = error.kiroAccountScoped ? 0 : baseDelay;
-                logger.info(`[Kiro] Received 429 (Too Many Requests). Waiting ${delay}ms before switching credential...`);
+                logger.info(`[Kiro] Received 429 (Too Many Requests), ${kiroThrottleLogDetail(error)}. Waiting ${delay}ms before switching credential...`);
                 await normalizeProviderErrorMessage(error, { status: 429, context: 'callApi' });
                 if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
                 // Mark error for credential switch without recording error count
@@ -2350,6 +2350,14 @@ async saveCredentialsToFile(filePath, newData) {
     async _handle402Error(error, context = 'unknown', options = {}) {
         const { signal } = options;
         logger.info(`[Kiro] Received 402 (Quota Exceeded) in ${context}. Verifying usage limits...`);
+        // Read a streamed body once so its upstream reason can be logged; normalization reuses it.
+        const body = error.response?.data;
+        if (typeof body?.on === 'function' && typeof body.read === 'function') {
+            const raw = await getNormalizedErrorResponseText(error, { rawBody: true, signal });
+            try { error.response.data = JSON.parse(raw); } catch { error.response.data = raw; }
+        }
+        // Kiro IDE distinguishes usage limits from OVERAGE_REQUEST_LIMIT_EXCEEDED by this field.
+        const upstreamReason = kiroErrorReason(error.response?.data) || 'none';
         const { reason: verifiedReason } = await normalizeProviderErrorMessage(error, {
             ...options,
             status: 402,
@@ -2365,12 +2373,12 @@ async saveCredentialsToFile(filePath, newData) {
             if (remaining !== null && remaining >= KIRO_CREDIT_EPSILON) {
                 // 账号仍有额度但本次请求被拒（如试用额度不覆盖该模型）：只让本次请求换号，
                 // 不锁到下月，避免把剩余额度闲置并让整个号池返回 503。
-                logger.warn(`[Kiro] 402 in ${context} but ${remaining.toFixed(2)} credits remain (trial/bonus). Switching credential for this request without marking unhealthy.`);
+                logger.warn(`[Kiro] 402 in ${context} but ${remaining.toFixed(2)} credits remain (trial/bonus), upstream reason: ${upstreamReason}. Switching credential for this request without marking unhealthy.`);
                 error.quotaExhausted = true;
                 // 同一模型大概率继续被拒；上层据此对（账号, 模型）短暂冷却，账号对其他模型仍可用。
                 error.kiroModelRejected = true;
             } else {
-                logger.info(`[Kiro] Quota confirmed exhausted: ${remaining === null ? 'no usage breakdown' : `${remaining.toFixed(2)} credits remain`}`);
+                logger.info(`[Kiro] Quota confirmed exhausted: ${remaining === null ? 'no usage breakdown' : `${remaining.toFixed(2)} credits remain`}, upstream reason: ${upstreamReason}`);
                 // Calculate recovery time: 1st day of next month at 00:00:00 UTC
                 const nextMonth = this._getNextMonthFirstDay();
                 this._markCredentialUnhealthyWithRecovery(verifiedReason, error, nextMonth);
@@ -2813,7 +2821,7 @@ async saveCredentialsToFile(filePath, newData) {
             if (status === 429) {
                 // An account-scoped throttle is already cooled down; the next account need not wait.
                 const delay = error.kiroAccountScoped ? 0 : baseDelay;
-                logger.info(`[Kiro] Received 429 (Too Many Requests) in stream. Waiting ${delay}ms before switching credential...`);
+                logger.info(`[Kiro] Received 429 (Too Many Requests) in stream, ${kiroThrottleLogDetail(error)}. Waiting ${delay}ms before switching credential...`);
                 await normalizeProviderErrorMessage(error, { status: 429, context: 'stream', signal });
                 if (delay > 0) await sleep(delay, undefined, { signal });
                 // Mark error for credential switch without recording error count
@@ -3148,6 +3156,7 @@ async saveCredentialsToFile(filePath, newData) {
             let nativeUsage = null;
             let metering = null;
             let refusalText = null;
+            let loggedLenientStopReason = false;
             // 记录被忽略的占位工具调用 id（详见 KIRO_PLACEHOLDER_TOOL_NAME 说明）
             const ignoredToolUseIds = new Set();
             let ignoredLegacyTool = false;
@@ -3353,7 +3362,9 @@ async saveCredentialsToFile(filePath, newData) {
                     if (tc.name || completed.length) yield* pushEvents(flushPendingContent());
                     yield* pushEvents(emitCompletedTools(completed));
                 } else if (event.type === 'metadata') {
-                    const reason = event.data.stopReason ?? event.data.stop_reason;
+                    const rawReason = event.data.stopReason ?? event.data.stop_reason;
+                    // UNKNOWN is a declared Kiro value; Kiro IDE treats it as no reported reason.
+                    const reason = typeof rawReason === 'string' && rawReason.toUpperCase() === 'UNKNOWN' ? null : rawReason;
                     if (reason !== undefined && reason !== null && (typeof reason !== 'string' || !normalizeKiroStopReason(reason))) {
                         // Record the raw value so the mapping can be extended from evidence, not guesses.
                         logger.warn(`[Kiro Stream] Unsupported upstream stop reason: ${String(JSON.stringify(reason)).slice(0, 80)}`);
@@ -3362,6 +3373,11 @@ async saveCredentialsToFile(filePath, newData) {
                         const error = kiroIntegrityError('unsupported upstream stop reason');
                         error.isRetryableUpstreamResponseFailure = false;
                         throw error;
+                    }
+                    if (!loggedLenientStopReason && typeof rawReason === 'string' && (reason === null || /pause/i.test(reason))) {
+                        // UNKNOWN and PAUSE_TURN end the turn like Kiro IDE; the log shows how often, in case answers look cut short.
+                        logger.info(`[Kiro Stream] Upstream stop reason ${JSON.stringify(rawReason).slice(0, 40)} treated as end of turn`);
+                        loggedLenientStopReason = true;
                     }
                     upstreamStopReason = normalizeKiroStopReason(reason) || upstreamStopReason;
                     if (upstreamStopReason === 'refusal') refusalText = kiroRefusalText(event.data);

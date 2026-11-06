@@ -7,7 +7,8 @@ import http from 'node:http';
 import AdmZip from 'adm-zip';
 
 const originalCwd = process.cwd();
-const root = await fs.mkdtemp(path.join(os.tmpdir(), 'aiclient2api-regressions-'));
+// Match process.cwd() when the system temporary directory uses a symlink.
+const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'aiclient2api-regressions-')));
 let server, logger;
 const intervals = [];
 after(async () => {

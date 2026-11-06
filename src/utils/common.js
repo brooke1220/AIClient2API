@@ -3184,6 +3184,10 @@ function retryAfterResponseHeaders(error) {
     const value = getHeaderValue(error.response?.headers, 'retry-after');
     if ((typeof value === 'string' && value.length <= 128 && !/[\r\n]/.test(value)) ||
         (typeof value === 'number' && Number.isFinite(value) && value >= 0)) return { 'Retry-After': String(value) };
+    // A classified Kiro in-stream exception has no HTTP response; its delay came from the payload.
+    if (!error.response && error.kiroErrorKind && Number.isFinite(error.retryAfterMs) && error.retryAfterMs >= 0) {
+        return { 'Retry-After': String(Math.ceil(error.retryAfterMs / 1000)) };
+    }
     return {};
 }
 

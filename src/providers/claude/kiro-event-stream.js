@@ -1,5 +1,5 @@
 import { TextDecoder } from 'node:util';
-import { applyKiroStreamExceptionPolicy } from './kiro-error-policy.js';
+import { applyKiroStreamExceptionPolicy, isKiroExceptionEventType } from './kiro-error-policy.js';
 /** Strict AWS Event Stream decoding. No resynchronization after corruption. */
 const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
     let crc = value;
@@ -29,11 +29,18 @@ export function kiroIntegrityError(reason) {
     return error;
 }
 
+// Kiro IDE also throws an event frame whose `:event-type` names an error (e.g. `throttlingError`).
+function isUpstreamException(headers, messageType) {
+    return messageType === 'error' || messageType === 'exception' || Boolean(headers[':exception-type'] || headers[':error-code'])
+        || isKiroExceptionEventType(headers[':event-type']);
+}
+
 function upstreamExceptionError(headers, data, messageType) {
     const error = kiroIntegrityError('upstream exception');
-    error.upstreamCode = headers[':exception-type'] || headers[':error-code'];
-    error.message = `Kiro upstream ${error.upstreamCode || messageType}: ${String(headers[':error-message'] || data.message || 'upstream failure').slice(0, 500)}`;
-    return applyKiroStreamExceptionPolicy(error, error.upstreamCode, typeof data.reason === 'string' ? data.reason : '');
+    error.upstreamCode = headers[':exception-type'] || headers[':error-code']
+        || (isKiroExceptionEventType(headers[':event-type']) ? headers[':event-type'] : undefined);
+    error.message = `Kiro upstream ${error.upstreamCode || messageType}: ${String(headers[':error-message'] || data.message || data.Message || 'upstream failure').slice(0, 500)}`;
+    return applyKiroStreamExceptionPolicy(error, error.upstreamCode, typeof data.reason === 'string' ? data.reason : '', data);
 }
 
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
@@ -96,9 +103,7 @@ export function decodeKiroFrames(buffer, maxFrameBytes = 32 * 1024 * 1024) {
             catch { throw kiroIntegrityError('invalid event payload JSON'); }
         }
         if (!data || typeof data !== 'object' || Array.isArray(data)) throw kiroIntegrityError('event payload must be a JSON object');
-        if (messageType === 'error' || messageType === 'exception' || headers[':exception-type'] || headers[':error-code']) {
-            throw upstreamExceptionError(headers, data, messageType);
-        }
+        if (isUpstreamException(headers, messageType)) throw upstreamExceptionError(headers, data, messageType);
         if (messageType && messageType !== 'event') throw kiroIntegrityError('invalid event message type');
         frames.push({ headers, data });
         offset += length;
@@ -149,9 +154,7 @@ function tryDecodeOneFrame(buffer, offset, limit) {
         if (payload) { data = JSON.parse(payload); }
         if (!data || typeof data !== 'object' || Array.isArray(data)) return { status: 'parse_error', skip: length };
         // Upstream exceptions are still fatal — not recoverable corruption
-        if (messageType === 'error' || messageType === 'exception' || headers[':exception-type'] || headers[':error-code']) {
-            return { status: 'fatal', error: upstreamExceptionError(headers, data, messageType) };
-        }
+        if (isUpstreamException(headers, messageType)) return { status: 'fatal', error: upstreamExceptionError(headers, data, messageType) };
         if (messageType && messageType !== 'event') return { status: 'parse_error', skip: length };
         return { status: 'ok', frame: { headers, data }, advance: length };
     } catch (e) {
@@ -199,7 +202,8 @@ export function decodeKiroFramesResilient(buffer, maxFrameBytes = 32 * 1024 * 10
 export function normalizeKiroStopReason(value) {
     if (!value) return null;
     const normalized = String(value).replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
-    const reasons = { stop: 'end_turn', end_turn: 'end_turn', tool_use: 'tool_use', tool_calls: 'tool_use',
+    // PAUSE_TURN has no client-side continuation through Kiro; Kiro IDE ends the turn on it.
+    const reasons = { stop: 'end_turn', end_turn: 'end_turn', pause_turn: 'end_turn', tool_use: 'tool_use', tool_calls: 'tool_use',
         max_tokens: 'max_tokens', max_output_tokens: 'max_tokens', length: 'max_tokens',
         model_context_window_exceeded: 'max_tokens', stop_sequence: 'stop_sequence',
         content_filtered: 'refusal', refusal: 'refusal' };

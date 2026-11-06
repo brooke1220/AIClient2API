@@ -8,9 +8,9 @@ jest.mock('../src/utils/logger.js', () => ({
 }));
 
 import { handleStreamRequest, handleUnaryRequest, handleContentGenerationRequest, ENDPOINT_TYPE,
-    getRequestBody, createEmptyUpstreamResponseError } from '../src/utils/common.js';
+    getRequestBody, createEmptyUpstreamResponseError, getRateLimitCooldownRecoveryTime } from '../src/utils/common.js';
 import { kiroIntegrityError } from '../src/providers/claude/kiro-event-stream.js';
-import { applyKiroStreamExceptionPolicy } from '../src/providers/claude/kiro-error-policy.js';
+import { applyKiroErrorPolicy, applyKiroStreamExceptionPolicy, kiroErrorReason } from '../src/providers/claude/kiro-error-policy.js';
 import '../src/converters/register-converters.js';
 import { acquireProviderSlot } from '../src/providers/provider-slot-lease.js';
 import { ProviderPoolManager } from '../src/providers/provider-pool-manager.js';
@@ -693,6 +693,14 @@ describe('Kiro retry account selection matches the failure type', () => {
         else expect(res.write.mock.calls.map(([chunk]) => String(chunk)).join('')).toContain('"rate_limit_error"');
     });
 
+    test.each(['stream', 'unary'])('%s in-stream capacity throttle returns the payload retry delay to the client', async mode => {
+        const error = applyKiroStreamExceptionPolicy(kiroIntegrityError('upstream exception'), 'ThrottlingException',
+            'INSUFFICIENT_MODEL_CAPACITY', { retryAfterMilliseconds: 4200 });
+        const res = await run(mode, failing(error), pool());
+        if (mode === 'unary') expect(res.writeHead.mock.calls[0][1]).toMatchObject({ 'Retry-After': '5' });
+        else expect(res.write.mock.calls.map(([chunk]) => String(chunk)).join('')).toContain('"retry_after":"5"');
+    });
+
     test.each(['stream', 'unary'])('%s in-stream account throttle cools the account down and switches', async mode => {
         jest.spyOn(Math, 'random').mockReturnValue(0);
         const select = selectNext('next-node');
@@ -717,5 +725,58 @@ describe('in-stream throttle reasons share the HTTP classification', () => {
         const error = classify('');
         expect(error).toMatchObject({ status: 429, shouldSwitchCredential: true, kiroErrorKind: 'throttled' });
         expect(error.kiroAccountRateLimited).toBeUndefined();
+    });
+    test.each(['HOURLY_REQUEST_COUNT', 'DAILY_REQUEST_COUNT', 'WEEKLY_REQUEST_COUNT', 'MONTHLY_REQUEST_COUNT', 'USAGE_LIMIT_REACHED'])(
+        'the usage cap %s cools the account down like a rate limit', reason => {
+            expect(classify(reason)).toMatchObject({ status: 429, shouldSwitchCredential: true,
+                kiroAccountRateLimited: true, kiroAccountScoped: true, kiroErrorKind: 'account_throttled' });
+        });
+    test('a paused-new-user capacity message is an account block, not capacity', () => {
+        const error = kiroIntegrityError('upstream exception');
+        error.message = 'Kiro upstream ThrottlingException: Kiro temporarily paused new Free users at this time';
+        expect(applyKiroStreamExceptionPolicy(error, 'ThrottlingException', 'INSUFFICIENT_MODEL_CAPACITY')).toMatchObject({
+            status: 429, shouldSwitchCredential: true, kiroAccountRateLimited: true, kiroAccountScoped: true });
+    });
+});
+
+describe('HTTP Kiro errors follow Kiro IDE classification', () => {
+    const http = (status, body, headers = {}) => Object.assign(new Error(`HTTP ${status}`), { response: { status, headers: { ...headers } } });
+    test('the Kiro rate-limit header (milliseconds) drives the cooldown and the client Retry-After', () => {
+        const error = http(429, null, { 'x-amzn-kiro-ratelimit-retry-after': '90000' });
+        applyKiroErrorPolicy(error, { reason: 'USER_REQUEST_RATE_EXCEEDED' });
+        expect(error).toMatchObject({ retryAfterMs: 90000, kiroAccountRateLimited: true });
+        expect(error.response.headers['retry-after']).toBe('90');
+        expect(getRateLimitCooldownRecoveryTime(error, {}, 0, KIRO).getTime()).toBe(90000);
+    });
+    test('the payload retryAfterMilliseconds is used when the header is absent', () => {
+        const error = http(429);
+        applyKiroErrorPolicy(error, { reason: 'DAILY_REQUEST_COUNT', retryAfterMilliseconds: 1500 });
+        expect(error).toMatchObject({ retryAfterMs: 1500, kiroAccountRateLimited: true, kiroAccountScoped: true });
+        expect(error.response.headers['retry-after']).toBe('2');
+    });
+    test('an upstream Retry-After header is kept', () => {
+        const error = http(429, null, { 'Retry-After': '7' });
+        applyKiroErrorPolicy(error, { reason: 'USER_REQUEST_RATE_EXCEEDED', retryAfterMilliseconds: 1500 });
+        expect(error.response.headers).toEqual({ 'Retry-After': '7' });
+    });
+    test.each([{ message: 'Input is too long.' }, { message: 'Prompt is too long', reason: 'SOMETHING_ELSE' }])(
+        'a 400 that says the input is too long is a 413 (%o)', body => {
+            const error = http(400);
+            expect(applyKiroErrorPolicy(error, body)).toBe(true);
+            expect(error).toMatchObject({ status: 413, kiroErrorKind: 'payload_too_large', shouldSwitchCredential: false });
+        });
+    test('an unrelated 400 is left alone', () => {
+        expect(applyKiroErrorPolicy(http(400), { message: 'Improperly formed request.' })).toBe(false);
+    });
+    test('a paused-new-user 429 switches account instead of returning capacity', () => {
+        const error = http(429);
+        expect(applyKiroErrorPolicy(error, { reason: 'INSUFFICIENT_MODEL_CAPACITY', message: 'Kiro temporarily paused new Pro users at this time' })).toBe(false);
+        expect(error).toMatchObject({ kiroAccountRateLimited: true, kiroAccountScoped: true });
+    });
+    test('kiroErrorReason extracts a log-safe reason', () => {
+        expect(kiroErrorReason('{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}')).toBe('OVERAGE_REQUEST_LIMIT_EXCEEDED');
+        expect(kiroErrorReason({ __type: 'com.amazon#ServiceQuotaExceededException' })).toBe('com.amazon#ServiceQuotaExceededException');
+        expect(kiroErrorReason({ reason: 'BAD\nINJECT' })).toBe('BADINJECT');
+        expect(kiroErrorReason('<html>')).toBe('');
     });
 });

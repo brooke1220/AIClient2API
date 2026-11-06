@@ -141,6 +141,34 @@ describe('Kiro 402 handling with remaining trial credits', () => {
         expect(service._markCredentialUnhealthyWithRecovery).not.toHaveBeenCalled();
     });
 
+    test.each([['credits remain', usageWithTrial(), 'warn'], ['quota exhausted', usageWithTrial({ trialUsed: 500 }), 'info']])(
+        'logs the upstream 402 reason when %s', async (_, usage, level) => {
+            const service = createService(usage);
+            service._requestWithBuilderEndpointRouting.mockRejectedValue(Object.assign(new Error('HTTP 402'), {
+                response: { status: 402, data: Readable.from(['{"message":"limit reached","reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}']) }
+            }));
+            const error = await service.streamApiReal('', MODEL, request(), false, 0, {}).next().catch(e => e);
+            expect(logger[level].mock.calls.map(([line]) => String(line)).join('\n'))
+                .toContain('upstream reason: OVERAGE_REQUEST_LIMIT_EXCEEDED');
+            // The body is read once and still normalizes into a readable message.
+            expect(error.message).toContain('limit reached');
+        });
+
+    test.each([
+        ['the Kiro header', { 'x-amzn-kiro-ratelimit-retry-after': '90000' }, {}, '90000ms (x-amzn-kiro-ratelimit-retry-after)'],
+        ['the payload', {}, { retryAfterMilliseconds: 1500 }, '1500ms (retryAfterMilliseconds)'],
+        ['an upstream Retry-After', { 'Retry-After': '7' }, { retryAfterMilliseconds: 1500 }, 'Retry-After 7'],
+        ['no source', {}, {}, 'none']
+    ])('logs the 429 reason and the retry delay from %s', async (_, headers, extra, delay) => {
+        const service = createService(usageWithTrial());
+        service._requestWithBuilderEndpointRouting.mockRejectedValue(Object.assign(new Error('HTTP 429'), {
+            response: { status: 429, headers: { ...headers }, data: Readable.from([JSON.stringify({ reason: 'DAILY_REQUEST_COUNT', ...extra })]) }
+        }));
+        await service.streamApiReal('', MODEL, request(), false, 0, {}).next().catch(e => e);
+        expect(logger.info.mock.calls.map(([line]) => String(line)).join('\n'))
+            .toContain(`Received 429 (Too Many Requests) in stream, reason: DAILY_REQUEST_COUNT, retry delay: ${delay}.`);
+    });
+
     test('does not lock an account with exactly one cent remaining', async () => {
         const service = createService(usageWithTrial({ trialUsed: 499.99 }));
         const error = await service.streamApiReal('', MODEL, request(), false, 0, {}).next().catch(e => e);

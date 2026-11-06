@@ -345,11 +345,58 @@ describe('in-stream exceptions are classified like their HTTP equivalents', () =
         expect(decodeError(decodeKiroFrames, 'ThrottlingException')).toMatchObject({ status: 429, kiroErrorKind: 'throttled',
             isRetryableUpstreamResponseFailure: false, shouldSwitchCredential: true, skipErrorCount: true });
     });
-    test.each([['validationException', 400, 'invalid_request'], ['throttlingException', 429, 'throttled']])(
-        'lowerCamelCase %s is classified like its PascalCase form', (type, status, kind) => {
+    test.each([['validationError', 400, 'invalid_request'], ['throttlingError', 429, 'throttled']])(
+        'Kiro IDE spelling %s is classified like its Exception form', (type, status, kind) => {
             expect(decodeError(decodeKiroFrames, type)).toMatchObject({ status, kiroErrorKind: kind,
                 isRetryableUpstreamResponseFailure: false });
         });
+    test.each([['strict', decodeKiroFrames], ['resilient', decodeKiroFramesResilient]])(
+        '%s decoder: an error-typed :event-type frame is an upstream exception, not a dropped event', (_, decoder) => {
+            const bytes = frame('throttlingError', { message: 'slow down', reason: 'USER_REQUEST_RATE_EXCEEDED', retryAfterMilliseconds: 1500 });
+            let error;
+            try { decoder(bytes); } catch (caught) { error = caught; }
+            expect(error).toMatchObject({ status: 429, upstreamCode: 'throttlingError', retryAfterMs: 1500,
+                kiroAccountRateLimited: true, kiroAccountScoped: true, isRetryableUpstreamResponseFailure: false });
+            expect(error.message).toContain('slow down');
+        });
+    test('an ordinary :event-type frame still decodes as an event', () => {
+        expect(decodeKiroFrames(frame('assistantResponseEvent', { content: 'hi' })).frames).toHaveLength(1);
+    });
+    test.each(['Input is too long.', 'Prompt is too long: 250000 tokens', 'Input content length exceeds threshold'])(
+        'a ValidationException whose message says "%s" is a 413 even without the reason', message => {
+            const bytes = frame(null, { message }, { ':message-type': 'exception', ':exception-type': 'ValidationException' });
+            let error;
+            try { decodeKiroFrames(bytes); } catch (caught) { error = caught; }
+            expect(error).toMatchObject({ status: 413, kiroErrorKind: 'payload_too_large', isRetryableUpstreamResponseFailure: false });
+        });
+    test.each(['InternalServerException', 'serviceUnavailableError'])(
+        'an in-stream MODEL_TEMPORARILY_UNAVAILABLE %s is a 503 like the HTTP path', type => {
+            const bytes = frame(null, { message: 'model busy', reason: 'MODEL_TEMPORARILY_UNAVAILABLE' }, { ':message-type': 'exception', ':exception-type': type });
+            let error;
+            try { decodeKiroFrames(bytes); } catch (caught) { error = caught; }
+            expect(error).toMatchObject({ status: 503, kiroErrorKind: 'model_unavailable', responseFailureCode: 'KIRO_MODEL_UNAVAILABLE',
+                retryAfterMs: 5000, isRetryableUpstreamResponseFailure: false, shouldSwitchCredential: false });
+        });
+    test.each(['PAUSE_TURN', 'UNKNOWN'])('the declared Kiro stop reason %s completes the turn instead of failing', async stopReason => {
+        const events = await collect(service([text('answer'), frame('metadataEvent', { stopReason })]).generateContentStream(model, request()));
+        expect(events.find(e => e.type === 'message_delta')).toMatchObject({ delta: { stop_reason: 'end_turn' } });
+    });
+    test.each(['PAUSE_TURN', 'pauseTurn', 'UNKNOWN'])('the lenient stop reason %s is logged once per response', async stopReason => {
+        logger.info.mockClear();
+        const meta = frame('metadataEvent', { stopReason });
+        await collect(service([text('answer'), meta, meta]).generateContentStream(model, request()));
+        const lines = logger.info.mock.calls.map(([message]) => String(message)).filter(message => message.includes('treated as end of turn'));
+        expect(lines).toEqual([`[Kiro Stream] Upstream stop reason "${stopReason}" treated as end of turn`]);
+    });
+    test('a mapped stop reason is not logged as lenient', async () => {
+        logger.info.mockClear();
+        await collect(service([text('answer'), frame('metadataEvent', { stopReason: 'end_turn' })]).generateContentStream(model, request()));
+        expect(logger.info.mock.calls.some(([message]) => String(message).includes('treated as end of turn'))).toBe(false);
+    });
+    test('UNKNOWN counts as a missing stop reason when one is required', async () => {
+        const strict = service([text('answer'), frame('metadataEvent', { stopReason: 'UNKNOWN' })], { KIRO_REQUIRE_STOP_REASON: true });
+        await expect(collect(strict.generateContentStream(model, request()))).rejects.toMatchObject({ responseFailureLabel: 'missing upstream stop reason' });
+    });
     test.each([
         ['the payload reason', { message: 'Input is too long.', reason: 'CONTENT_LENGTH_EXCEEDS_THRESHOLD' }],
         ['the message', { message: 'CONTENT_LENGTH_EXCEEDS_THRESHOLD: Input is too long.' }]
