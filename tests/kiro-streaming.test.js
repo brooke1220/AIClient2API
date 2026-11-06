@@ -12,7 +12,7 @@ jest.mock('../src/utils/logger.js', () => ({
 }));
 
 import logger from '../src/utils/logger.js';
-import { KiroApiService } from '../src/providers/claude/claude-kiro.js';
+import { KiroApiService, KIRO_HTTPS_AGENT } from '../src/providers/claude/claude-kiro.js';
 import { KiroApiServiceAdapter } from '../src/providers/adapter.js';
 import * as serviceManager from '../src/services/service-manager.js';
 import { handleStreamRequest, handleUnifiedResponse } from '../src/utils/common.js';
@@ -507,9 +507,13 @@ describe('Kiro streaming latency and lifecycle', () => {
         service.loadCredentials = jest.fn(async () => {});
         await service.initialize();
         expect(service.axiosInstance.defaults.httpAgent).toBe(http.globalAgent);
-        expect(service.axiosInstance.defaults.httpsAgent).toBe(https.globalAgent);
         expect(http.globalAgent.keepAlive).toBe(true);
-        expect(https.globalAgent.keepAlive).toBe(true);
+        // A dedicated shared pool: Node's global agent drops idle sockets after 5s,
+        // shorter than a tool run between agent turns.
+        expect(service.axiosInstance.defaults.httpsAgent).toBe(KIRO_HTTPS_AGENT);
+        expect(KIRO_HTTPS_AGENT).toBeInstanceOf(https.Agent);
+        expect(KIRO_HTTPS_AGENT.keepAlive).toBe(true);
+        expect(KIRO_HTTPS_AGENT.options.timeout).toBeGreaterThan(https.globalAgent.options.timeout ?? 5000);
         expect(service.axiosInstance.defaults.headers.Connection).toBeUndefined();
     });
 
@@ -558,22 +562,36 @@ describe('Kiro credential switches wait only as long as the failure requires', (
     beforeEach(() => jest.clearAllMocks());
     afterEach(() => jest.restoreAllMocks());
 
+    // `other` is what the retry's selection reaches: a uuid (the failed one means a same-account retry), or null.
     test.each([
-        ['an explicit account failure', { kiroAccountScoped: true }, 250, undefined],
-        ['an unclassified failure', {}, 5000, undefined],
-        ['a non-Kiro provider carrying the Kiro flag', { kiroAccountScoped: true }, 5000, 'openai-custom']
-    ])('%s waits the expected jitter before switching', async (_label, flags, waitMs, provider) => {
+        ['an explicit account failure', { kiroAccountScoped: true }, 250, undefined, undefined],
+        ['an unclassified failure', {}, 5000, undefined, undefined],
+        ['a non-Kiro provider carrying the Kiro flag', { kiroAccountScoped: true }, 5000, 'openai-custom', undefined],
+        ['a single-account retry', {}, 250, undefined, 'test-account'],
+        ['a retry with nothing selectable', {}, 250, undefined, null],
+        ['a single-account 429', { status: 429 }, 5000, undefined, 'test-account'],
+        ['a failure with another account', {}, 5000, undefined, 'other-account']
+    ])('%s waits the expected jitter before switching', async (_label, flags, waitMs, provider, other) => {
         const service = createService();
         service._requestWithBuilderEndpointRouting.mockRejectedValue(
             Object.assign(new Error('switch me'), { shouldSwitchCredential: true, skipErrorCount: true, ...flags })
         );
         jest.spyOn(Math, 'random').mockReturnValue(0.5);
         jest.spyOn(serviceManager, 'getApiServiceWithFallback').mockResolvedValue(null);
-        const pool = { releaseSlot: jest.fn(), markProviderHealthy: jest.fn(), markProviderUnhealthy: jest.fn() };
+        const selectProviderWithFallback = other === undefined ? undefined
+            : jest.fn().mockResolvedValue(other ? { config: { uuid: other } } : null);
+        const pool = { releaseSlot: jest.fn(), markProviderHealthy: jest.fn(), markProviderUnhealthy: jest.fn(), selectProviderWithFallback };
         const response = responseMock();
         const pending = runHandler(service, response, pool, { CONFIG: {}, maxRetries: 1 }, provider);
         await waitFor(logged('info', 'Credential marked unhealthy. Waiting'));
         expect(logged('info', `Waiting ${waitMs}ms before retry`)()).toBe(true);
+        if (selectProviderWithFallback) {
+            // A 429 keeps the full wait whatever the pool holds, so the query is skipped.
+            if (flags.status === 429) expect(selectProviderWithFallback).not.toHaveBeenCalled();
+            // Same options as the real retry: the failed account is only avoided, not excluded.
+            else expect(selectProviderWithFallback).toHaveBeenCalledWith('claude-kiro-oauth', MODEL,
+                expect.objectContaining({ dryRun: true, excludeUuids: [], preferOtherUuids: ['test-account'] }));
+        }
         response.emit('close');
         await bounded(pending, 6000);
     }, 10000);

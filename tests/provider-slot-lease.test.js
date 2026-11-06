@@ -15,9 +15,23 @@ describe('atomic, cancellable account-slot leases', () => {
     });
     test('lease release is idempotent and independent of a rotated UUID', async () => {
         const node = provider(); const acquired = await acquireProviderSlot(node); node.config.uuid = 'new';
+        expect(acquired.uuid).toBe('old');
+        expect(acquired._slotLease.uuid).toBe('new');
         acquired._slotLease.release(); acquired._slotLease.release();
         expect(node.state.activeCount).toBe(0);
         expect(JSON.stringify(acquired)).not.toContain('slotLease');
+    });
+    test('lease identity follows authoritative config after a reload and later UUID rotation', async () => {
+        const node = provider();
+        const acquired = await acquireProviderSlot(node);
+        const currentConfig = { ...node.config, uuid: 'reloaded' };
+        Object.defineProperty(node.state, '_slotConfig', { value: currentConfig });
+        expect(acquired._slotLease.uuid).toBe('reloaded');
+        currentConfig.uuid = 'rotated';
+        expect(acquired._slotLease.uuid).toBe('rotated');
+        expect(acquired.uuid).toBe('old');
+        acquired._slotLease.release();
+        expect(node.state.activeCount).toBe(0);
     });
     test('aborting a queued caller removes its reservation immediately', async () => {
         const node = provider(); const first = await acquireProviderSlot(node); const controller = new AbortController();

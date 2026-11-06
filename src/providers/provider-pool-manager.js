@@ -22,6 +22,10 @@ import { quotaFamilyForModel } from './gemini/antigravity-quota-family.js';
 import { KiroSessionAffinity } from './claude/kiro-session.js';
 import { kiroAccountBudget, kiroBudgetKeyForConfig } from './claude/kiro-account-budget.js';
 import { kiroModelCapabilityScope } from './claude/kiro-model-cache.js';
+import { kiroUpstreamModelId } from './claude/kiro-model-mapping.js';
+
+// Long enough to stop repeated 402 round trips, short enough to retry a grant that changes.
+const KIRO_MODEL_REJECTION_COOLDOWN_MS = 10 * 60 * 1000;
 
 function kiroPauseSnapshot(provider, config) {
     return JSON.stringify([
@@ -382,6 +386,57 @@ export class ProviderPoolManager {
         provider.state._kiroDiscoveredModels = { ids: new Set(modelIds), expiresAt: Date.now() + ttlMs, scope };
     }
 
+    /**
+     * 402 but the account still has trial/bonus credits: the remaining grant likely does
+     * not cover this model. Skip only this (account, model) pair for a while, in memory.
+     */
+    markKiroModelRejected(providerType, uuid, model, cooldownMs = KIRO_MODEL_REJECTION_COOLDOWN_MS) {
+        if (!isKiroProviderType(providerType) || !model) return false;
+        const provider = this._findProvider(providerType, uuid);
+        if (!provider) return false;
+        return this._recordKiroModelRejection(providerType, provider, model, cooldownMs);
+    }
+
+    /** Keep late 402 results attached to the account that started the request. */
+    captureKiroModelRejection(providerType, uuid, sourceScope) {
+        const provider = isKiroProviderType(providerType) && this._findProvider(providerType, uuid);
+        if (!provider) return () => false;
+        const state = provider.state;
+        const capturedScope = sourceScope === undefined
+            ? kiroModelCapabilityScope({ ...this.globalConfig, ...provider.config }) : sourceScope;
+        return model => {
+            const current = this.providerStatus[providerType]?.find(candidate => candidate.state === state);
+            if (!current) return false;
+            return this._recordKiroModelRejection(providerType, current, model, KIRO_MODEL_REJECTION_COOLDOWN_MS, capturedScope);
+        };
+    }
+
+    _recordKiroModelRejection(providerType, provider, model, cooldownMs, sourceScope) {
+        if (!model) return false;
+        const scope = kiroModelCapabilityScope({ ...this.globalConfig, ...provider.config });
+        if (sourceScope !== undefined && sourceScope !== scope) return false;
+        const now = Date.now();
+        if (provider.state._kiroRejectedModels?.scope !== scope) {
+            provider.state._kiroRejectedModels = { scope, models: new Map() };
+        }
+        const rejected = provider.state._kiroRejectedModels.models;
+        for (const [name, until] of rejected) if (until <= now) rejected.delete(name);
+        // Aliases of one upstream model share the rejection.
+        rejected.set(kiroUpstreamModelId(model), now + cooldownMs);
+        this._log('warn', `Skipping ${this._getDisplayName(provider.config)} (${providerType}) for model ${model} until ${new Date(now + cooldownMs).toISOString()}: 402 with credits remaining`);
+        return true;
+    }
+
+    _isKiroModelRejected(provider, model, now = Date.now()) {
+        const rejected = provider.state._kiroRejectedModels;
+        if (!rejected) return false;
+        if (rejected.scope !== kiroModelCapabilityScope({ ...this.globalConfig, ...provider.config })) {
+            delete provider.state._kiroRejectedModels;
+            return false;
+        }
+        return !!model && rejected.models.get(kiroUpstreamModelId(model)) > now;
+    }
+
     /** Proactive refresh keeps a valid token usable; blocking refresh pauses it. */
     requestKiroCredentialRefresh(providerType, providerConfig, { blocking = false } = {}) {
         const provider = this._findProvider(providerType, providerConfig?.uuid);
@@ -441,6 +496,8 @@ export class ProviderPoolManager {
                 if (excluded.has(config.uuid)) continue;
                 const supported = getConfiguredSupportedModels(type, config);
                 if (model && (supported.length ? !supported.includes(model) : config.notSupportedModels?.includes(model))) continue;
+                // Selection would skip this pair after the refresh too; waiting on it only delays a 503.
+                if (this._isKiroModelRejected(provider, model)) continue;
                 const unavailable = getKiroAccountUnavailableError(type, config, { allowUnhealthy: true, allowNeedsRefresh: true });
                 if (unavailable) {
                     // A fast failure can finish before selection reaches this
@@ -1092,9 +1149,14 @@ export class ProviderPoolManager {
                     this._migrateLegacyAntigravityQuotaCooldown(providerType, providerConfig);
 
                     const slotState = existing ? existing.state : { activeCount: 0, waitingCount: 0, queue: [] };
-                    if (isKiroProviderType(providerType) && slotState._kiroDiscoveredModels &&
-                        slotState._kiroDiscoveredModels.scope !== kiroModelCapabilityScope({ ...this.globalConfig, ...providerConfig })) {
-                        delete slotState._kiroDiscoveredModels;
+                    if (isKiroProviderType(providerType)) {
+                        const scope = kiroModelCapabilityScope({ ...this.globalConfig, ...providerConfig });
+                        if (slotState._kiroDiscoveredModels && slotState._kiroDiscoveredModels.scope !== scope) {
+                            delete slotState._kiroDiscoveredModels;
+                        }
+                        if (slotState._kiroRejectedModels && slotState._kiroRejectedModels.scope !== scope) {
+                            delete slotState._kiroRejectedModels;
+                        }
                     }
                     Object.defineProperty(slotState, '_slotConfig', { value: providerConfig, writable: true, configurable: true });
                     const providerStatus = {
@@ -1128,7 +1190,20 @@ export class ProviderPoolManager {
         options.signal?.throwIfAborted();
         if (!selectedConfig) return null;
         const provider = this._findProvider(providerType, selectedConfig.uuid);
-        return provider ? await acquireProviderSlot(provider, options) : selectedConfig;
+        const acquiredConfig = provider ? await acquireProviderSlot(provider, options) : selectedConfig;
+        const lease = acquiredConfig._slotLease;
+        if (isKiroProviderType(providerType) && lease) {
+            // A queued request receives the configuration in force when granted.
+            // Keep its 402 result tied to that snapshot even if the node is rebound
+            // before the handler starts or its UUID rotates during the request.
+            const sourceScope = kiroModelCapabilityScope({ ...this.globalConfig, ...acquiredConfig });
+            const current = this._findProvider(providerType, lease.uuid || acquiredConfig.uuid);
+            Object.defineProperty(lease, 'markKiroModelRejected', {
+                value: current?.state === provider?.state
+                    ? this.captureKiroModelRejection(providerType, current.uuid, sourceScope) : () => false
+            });
+        }
+        return acquiredConfig;
     }
 
     /** Safe for standalone Kiro: missing pool entries do not block a request. */
@@ -1216,6 +1291,14 @@ export class ProviderPoolManager {
         const minSeq = Math.min(...availableProviders.map(p => p.config._lastSelectionSeq || 0));
 
         const excludedUuids = new Set(Array.isArray(options.excludeUuids) ? options.excludeUuids : []);
+        const previous = new Set(options.preferOtherUuids || []);
+        if (isKiroProviderType(providerType)) {
+            // Read live lease identities under the selection lock, after all retry
+            // delays and lock waits. Released leases still follow UUID rotations.
+            for (const lease of options.preferOtherLeases || []) {
+                if (lease?.uuid) previous.add(lease.uuid);
+            }
+        }
         const supportsRequestedModel = p => {
             if (!requestedModel) return true;
             const discovered = p.state._kiroDiscoveredModels;
@@ -1236,6 +1319,13 @@ export class ProviderPoolManager {
         if (providerType === MODEL_PROVIDER.ANTIGRAVITY && requestedModel) {
             availableAndHealthyProviders = availableAndHealthyProviders.filter(provider =>
                 !this._isAntigravityQuotaFamilyExhausted(provider.config, requestedModel, now)
+            );
+        }
+
+        // A Kiro account that returned 402 for this model with credits left stays usable for other models.
+        if (isKiroProviderType(providerType) && requestedModel) {
+            availableAndHealthyProviders = availableAndHealthyProviders.filter(provider =>
+                !this._isKiroModelRejected(provider, requestedModel, now)
             );
         }
 
@@ -1299,11 +1389,17 @@ export class ProviderPoolManager {
                     if (c.scheduledRecoveryTime && new Date(c.scheduledRecoveryTime).getTime() > now) return false;
                     if (providerType === MODEL_PROVIDER.ANTIGRAVITY && requestedModel &&
                         this._isAntigravityQuotaFamilyExhausted(c, requestedModel, now)) return false;
+                    // 被拒绝的 (账号, 模型) 重置后仍会被过滤，重置只会白占冷却窗口。
+                    if (isKiroProviderType(providerType) && this._isKiroModelRejected(p, requestedModel, now)) return false;
                     // 普通不健康状态是恢复目标；账户暂停和冷却仍由账户检查拦截。
                     if (getKiroAccountUnavailableError(providerType, c, { allowUnhealthy: true })) return false;
                     return !c.isHealthy;
                 });
 
+                if (healable.length > 0 && options.dryRun) {
+                    // Report what the real selection would reach after healing, without healing.
+                    return (healable.find(p => !previous.has(p.config.uuid)) || healable[0]).config;
+                }
                 if (healable.length > 0) {
                     this._log('warn', `[Self-Healing] All providers unhealthy for ${providerType}, resetting ${healable.length} auto-failed provider(s)`);
                     this._selfHealTimestamps[providerType] = now;
@@ -1325,9 +1421,16 @@ export class ProviderPoolManager {
             return null;
         }
 
-        if (isKiroProviderType(providerType) && options.preferOtherUuids?.length) {
-            const previous = new Set(options.preferOtherUuids);
-            const alternatives = availableAndHealthyProviders.filter(provider => !previous.has(provider.config.uuid));
+        if (isKiroProviderType(providerType) && previous.size) {
+            // An alternative must be able to start or queue; a full one with no queue room
+            // rejects the slot with 429, while the account this request left may be free.
+            const alternatives = availableAndHealthyProviders.filter(provider => {
+                if (previous.has(provider.config.uuid)) return false;
+                const limit = Number(provider.config.concurrencyLimit);
+                if (!(limit > 0 && provider.state.activeCount >= limit) && !provider.state.waitingCount) return true;
+                const queueLimit = Number(provider.config.queueLimit);
+                return queueLimit > 0 && (provider.state.waitingCount || 0) < queueLimit;
+            });
             if (alternatives.length) availableAndHealthyProviders = alternatives;
         }
 
@@ -1360,6 +1463,8 @@ export class ProviderPoolManager {
             // 如果分值相同，使用 UUID 排序确保确定性
             return a.uuid < b.uuid ? -1 : 1;
         })[0];
+        // 只查询能否选出账号：不改 LRU、计数和自愈状态。
+        if (options.dryRun) return selected.config;
 
         // 始终更新 lastUsed（确保 LRU 策略生效，避免并发请求选到同一个 provider）
         // usageCount 只在请求成功后才增加（由 skipUsageCount 控制）
@@ -1647,7 +1752,7 @@ export class ProviderPoolManager {
             }
         }
 
-        if (!options._kiroRefreshWaited && await this.waitForPendingKiroRefreshes(providerType, requestedModel, options)) {
+        if (!options.dryRun && !options._kiroRefreshWaited && await this.waitForPendingKiroRefreshes(providerType, requestedModel, options)) {
             return this.selectProviderWithFallback(providerType, requestedModel, { ...options, _kiroRefreshWaited: true });
         }
         this._log('warn', `None available provider found for ${providerType} (Model: ${requestedModel}) after checking fallback chain and model mapping.`);

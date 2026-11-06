@@ -244,7 +244,9 @@ describe('independent stream timeout budgets', () => {
     test('metadata-only activity does not disable the first meaningful-event deadline', async () => {
         const upstream = openStream(); upstream.push(frame('contextUsageEvent', { contextUsagePercentage: 1 }));
         const backend = service([], { KIRO_FIRST_EVENT_TIMEOUT_MS: 15 }); backend._requestWithBuilderEndpointRouting.mockResolvedValue({ data: upstream });
-        await expect(bounded(collect(backend.generateContentStream(model, request())))).rejects.toMatchObject({ status: 504 });
+        // The stalled account sent headers, so it is the session-bound one: its retry must look elsewhere.
+        await expect(bounded(collect(backend.generateContentStream(model, request())))).rejects.toMatchObject({ status: 504,
+            isRetryableUpstreamResponseFailure: true, preferOtherAccount: true });
         expect(upstream.destroyed).toBe(true);
     });
     test('the internal no-tool placeholder cannot disable the first-event deadline', async () => {
@@ -323,5 +325,53 @@ describe('single-flight cold initialization', () => {
         backend.loadCredentials = jest.fn().mockRejectedValueOnce(new Error('temporary')).mockResolvedValueOnce(undefined);
         await expect(backend.initialize()).rejects.toThrow('temporary');
         await backend.initialize(); expect(backend.isInitialized).toBe(true); expect(backend.loadCredentials).toHaveBeenCalledTimes(2);
+    });
+});
+
+describe('in-stream exceptions are classified like their HTTP equivalents', () => {
+    const exception = type => frame(null, { message: `${type} detail` }, { ':message-type': 'exception', ':exception-type': type });
+    const decodeError = (decoder, type) => {
+        try { decoder(exception(type)); } catch (error) { return error; }
+        throw new Error('expected an upstream exception');
+    };
+    test.each([['strict', decodeKiroFrames], ['resilient', decodeKiroFramesResilient]])('%s decoder: a ValidationException is a non-retryable 400', (_, decoder) => {
+        const error = decodeError(decoder, 'ValidationException');
+        expect(error).toMatchObject({ status: 400, code: 'KIRO_STREAM_INTEGRITY', upstreamCode: 'ValidationException',
+            responseFailureLabel: 'upstream exception',
+            kiroErrorKind: 'invalid_request', isRetryableUpstreamResponseFailure: false, shouldSwitchCredential: false, skipErrorCount: true });
+        expect(error.message).toContain('ValidationException detail');
+    });
+    test('a ThrottlingException switches credential instead of replaying the same body', () => {
+        expect(decodeError(decodeKiroFrames, 'ThrottlingException')).toMatchObject({ status: 429, kiroErrorKind: 'throttled',
+            isRetryableUpstreamResponseFailure: false, shouldSwitchCredential: true, skipErrorCount: true });
+    });
+    test.each([['validationException', 400, 'invalid_request'], ['throttlingException', 429, 'throttled']])(
+        'lowerCamelCase %s is classified like its PascalCase form', (type, status, kind) => {
+            expect(decodeError(decodeKiroFrames, type)).toMatchObject({ status, kiroErrorKind: kind,
+                isRetryableUpstreamResponseFailure: false });
+        });
+    test.each([
+        ['the payload reason', { message: 'Input is too long.', reason: 'CONTENT_LENGTH_EXCEEDS_THRESHOLD' }],
+        ['the message', { message: 'CONTENT_LENGTH_EXCEEDS_THRESHOLD: Input is too long.' }]
+    ])('an oversized-context ValidationException named in %s is a 413, as on the HTTP path', (_, payload) => {
+        const oversized = frame(null, payload, { ':message-type': 'exception', ':exception-type': 'ValidationException' });
+        let error;
+        try { decodeKiroFrames(oversized); } catch (caught) { error = caught; }
+        expect(error).toMatchObject({ status: 413, kiroErrorKind: 'payload_too_large', responseFailureCode: 'KIRO_PAYLOAD_TOO_LARGE',
+            isRetryableUpstreamResponseFailure: false, shouldSwitchCredential: false });
+    });
+    test('an unclassified exception keeps the same-body replay', () => {
+        expect(decodeError(decodeKiroFrames, 'InternalServerException')).toMatchObject({ status: 502,
+            isRetryableUpstreamResponseFailure: true });
+        expect(decodeError(decodeKiroFrames, 'InternalServerException').shouldSwitchCredential).toBeUndefined();
+    });
+    test.each(['stream', 'unary'])('%s surfaces an in-stream ValidationException as 400', async mode => {
+        const backend = service([exception('ValidationException')]);
+        const operation = mode === 'stream' ? collect(backend.generateContentStream(model, request())) : backend.generateContent(model, request());
+        await expect(operation).rejects.toMatchObject({ status: 400, isRetryableUpstreamResponseFailure: false });
+    });
+    test('an unsupported stop reason fails without a same-body replay', async () => {
+        await expect(collect(service([text('prefix'), frame('metadataEvent', { stopReason: 'NEW_REASON' })]).generateContentStream(model, request())))
+            .rejects.toMatchObject({ responseFailureLabel: 'unsupported upstream stop reason', isRetryableUpstreamResponseFailure: false });
     });
 });

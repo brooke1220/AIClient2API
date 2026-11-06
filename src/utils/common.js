@@ -384,10 +384,46 @@ function kiroRetryCount(value, fallback) {
 // short jitter is enough to spread concurrent switches.
 const KIRO_ACCOUNT_SWITCH_JITTER_MS = 500;
 
-function credentialSwitchDelayMs(error, cooldown, isCredentialRefresh, providerType) {
+// The wide window spreads concurrent switches across accounts. When the retry would land
+// on the same account anyway, only a 429 still needs it as backoff. A dry run of the
+// retry's own selection (same primary type and options) answers that without touching
+// LRU order, counters or self-heal state.
+async function hasOtherPoolAccount(providerPoolManager, providerType, model, pooluuid, selection, slotLease) {
+    if (!providerPoolManager?.selectProviderWithFallback) return true;
+    try {
+        const selected = await providerPoolManager.selectProviderWithFallback(providerType, model, {
+            ...selection, dryRun: true, skipUsageCount: true
+        });
+        return Boolean(selected?.config && selected.config.uuid !== (slotLease?.uuid || pooluuid));
+    } catch {
+        return true;
+    }
+}
+
+// Accounts this request has left. A switch-only error (5xx, 403, unclassified 429)
+// leaves the account healthy, so session affinity would pick it again; the pool
+// prefers other accounts and still falls back to these when none is selectable.
+function leftAccountUuids(retryContext, ...uuids) {
+    return [...new Set([...(retryContext?.switchedFromUuids || []), ...uuids.flat()].filter(Boolean))];
+}
+
+// Retain every account's lease after releasing its slot. The pool resolves these
+// identities when selecting, so rotations during a retry delay or a later attempt
+// cannot make session affinity send the request back to an account it already left.
+function leftAccountLeases(retryContext, leaveCurrent = true) {
+    return [...new Set([
+        ...(retryContext?.switchedFromLeases || []),
+        ...(leaveCurrent && retryContext?.slotLease ? [retryContext.slotLease] : [])
+    ])];
+}
+
+async function credentialSwitchDelayMs(error, cooldown, isCredentialRefresh, providerType, hasAlternateAccount = async () => true) {
     if (cooldown.quotaExhausted || isCredentialRefresh) return 0;
-    const accountScoped = isKiroProviderType(providerType) && error?.kiroAccountScoped === true;
-    return Math.floor(Math.random() * (accountScoped ? KIRO_ACCOUNT_SWITCH_JITTER_MS : 10000));
+    const kiro = isKiroProviderType(providerType);
+    const accountScoped = kiro && error?.kiroAccountScoped === true;
+    // Only consulted when the answer can shorten the wait.
+    const sameAccountRetry = kiro && !accountScoped && Number(getErrorStatusCode(error)) !== 429 && !(await hasAlternateAccount());
+    return Math.floor(Math.random() * (accountScoped || sameAccountRetry ? KIRO_ACCOUNT_SWITCH_JITTER_MS : 10000));
 }
 
 function formatQuotaRecovery(recoveryTime) {
@@ -404,9 +440,14 @@ async function hasAlternateAfterQuotaExhaustion(providerPoolManager, config, mod
     return Boolean(selected?.config?.uuid && !exhaustedUuids.includes(selected.config.uuid));
 }
 
-function applyCredentialCooldown(error, config, providerPoolManager, providerType, pooluuid, logPrefix, model = null) {
+function applyCredentialCooldown(error, config, providerPoolManager, providerType, pooluuid, logPrefix, model = null, recordModelRejection) {
     if (error?.isKiroSidecarError) return { recoveryTime: null, credentialMarkedUnhealthy: false, quotaExhausted: false };
     const quotaExhausted = error?.quotaExhausted === true;
+    // Same model name the pool filters on; the account stays healthy for other models.
+    if (error?.kiroModelRejected === true && isKiroProviderType(providerType) && pooluuid && model) {
+        if (recordModelRejection) recordModelRejection(model);
+        else providerPoolManager?.markKiroModelRejected?.(providerType, pooluuid, model);
+    }
     const quotaRecoveryTime = error?.quotaRecoveryTime instanceof Date && !Number.isNaN(error.quotaRecoveryTime.getTime())
         ? error.quotaRecoveryTime
         : null;
@@ -803,7 +844,8 @@ export function getClientIp(req, config = {}) {
  */
 export function getRequestBody(req, options = {}) {
     return new Promise((resolve, reject) => {
-        let body = '';
+        // Decode once at the end: a multi-byte UTF-8 character can straddle chunks.
+        const chunks = [];
         let receivedBytes = 0;
         let settled = false;
         const maxBytes = Number(options.maxBytes) > 0 ? Number(options.maxBytes) : DEFAULT_REQUEST_BODY_MAX_BYTES;
@@ -847,11 +889,12 @@ export function getRequestBody(req, options = {}) {
                 rejectTooLarge(error);
                 return;
             }
-            body += chunk.toString();
+            chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
         });
         req.on('end', () => {
             if (settled) return;
             settled = true;
+            const body = Buffer.concat(chunks).toString('utf8');
             if (!body) {
                 return resolve({});
             }
@@ -1037,9 +1080,10 @@ function throwIfUpstreamResponseFailed(response, provider, providerLabel = provi
  * @param {string} [providerLabel='Upstream'] - 用于日志的 provider 标签
  * @param {string} [failureLabel='upstream response failure'] - 归一化失败类型
  * @param {AbortSignal} [signal] - 客户端取消信号；等待期间被取消则放弃重试
+ * @param {Object} [selection] - 额外的选号参数，如 Kiro 的 kiroSession
  * @returns {Promise<{retry: boolean, aborted?: boolean, result?: object, responseFailureRetry?: number}>}
  */
-async function resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, logPrefix, providerLabel = 'Upstream', failureLabel = 'upstream response failure', signal) {
+async function resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, logPrefix, providerLabel = 'Upstream', failureLabel = 'upstream response failure', signal, selection = {}) {
     const retryMax = CONFIG?.EMPTY_RESPONSE_MAX_RETRIES ?? 2;
     const retryDelayMs = CONFIG?.EMPTY_RESPONSE_RETRY_DELAY_MS ?? 500;
 
@@ -1061,7 +1105,8 @@ async function resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, log
     try {
         // 动态导入以避免循环依赖
         const { getApiServiceWithFallback } = await import('../services/service-manager.js');
-        const result = await getApiServiceWithFallback(CONFIG, model, { acquireSlot: true, signal });
+        // Same body, same session: keep the bound account (and its prompt cache) when it can serve.
+        const result = await getApiServiceWithFallback(CONFIG, model, { ...selection, acquireSlot: true, signal });
 
         if (result && result.service) {
             logger.info(`${logPrefix} Retrying ${failureLabel} from ${providerLabel} with credential: ${result.uuid} (provider: ${result.actualProviderType})`);
@@ -1480,6 +1525,11 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         else if (providerPoolManager && pooluuid) providerPoolManager.releaseSlot(toProvider, pooluuid);
     };
 
+    if (isKiroStream) pooluuid = retryContext?.slotLease?.uuid || pooluuid;
+    const recordModelRejection = isKiroStream
+        ? retryContext?.slotLease?.markKiroModelRejected || providerPoolManager?.captureKiroModelRejection?.(toProvider, pooluuid)
+        : undefined;
+
     try {
         // The client may have disconnected while routing or waiting for an
         // account slot, before this handler installed its close listener.
@@ -1715,6 +1765,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (retryContext.kiroTiming) retryContext.kiroTiming.downstreamError = false;
 
     }  catch (error) {
+        // Another attempt can rotate the UUID while this account is still in flight.
+        if (isKiroStream) pooluuid = retryContext?.slotLease?.uuid || pooluuid;
         // 如果客户端已断开，不需要发送错误响应
         if (clientDisconnected.value) {
             logger.info('[Stream] Skipping error response due to client disconnect');
@@ -1751,7 +1803,13 @@ export async function handleStreamRequest(res, service, model, requestBody, from
             const attemptsMade = retryContext?.responseFailureRetry ?? retryContext?.emptyResponseRetry ?? 0;
             const failureLabel = error.responseFailureLabel || 'upstream response failure';
             releaseCurrentSlot();
-            const outcome = await resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, '[Stream Retry]', toProvider, failureLabel, upstreamAbortController.signal);
+            // The first replay keeps the session binding (and its prompt cache). A stall, or a
+            // failure after this request already used a replay, prefers another account.
+            const leaveAccount = error.preferOtherAccount || attemptsMade > 0;
+            const switchedFromUuids = leftAccountUuids(retryContext, leaveAccount ? [pooluuid] : []);
+            const switchedFromLeases = leftAccountLeases(retryContext, leaveAccount);
+            const outcome = await resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, '[Stream Retry]', toProvider, failureLabel, upstreamAbortController.signal,
+                { kiroSession: retryContext.kiroSession, preferOtherUuids: switchedFromUuids, preferOtherLeases: switchedFromLeases });
 
             if (outcome.aborted) {
                 responseClosed = true;
@@ -1762,6 +1820,8 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 const { result, responseFailureRetry } = outcome;
                 const newRetryContext = {
                     ...retryContext,
+                    switchedFromUuids,
+                    switchedFromLeases,
                     slotLease: result.slotLease || null,
                     CONFIG,
                     currentRetry,
@@ -1815,11 +1875,13 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         const refreshTriedUuids = isCredentialRefresh
             ? [...new Set([...(retryContext?.refreshTriedUuids || []), pooluuid, error.kiroRefreshUuid].filter(Boolean))]
             : retryContext?.refreshTriedUuids;
+        const switchedFromUuids = leftAccountUuids(retryContext, refreshTriedUuids || [], pooluuid);
+        const switchedFromLeases = leftAccountLeases(retryContext);
         
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
 
-        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Stream]', model);
+        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Stream]', model, recordModelRejection);
         if (cooldown.credentialMarkedUnhealthy) credentialMarkedUnhealthy = true;
         
         // 如果底层未标记，且不跳过错误计数，则在此处标记
@@ -1857,7 +1919,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         if (credentialMarkedUnhealthy && quotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             // 额度耗尽立即换号；其它错误保留抖动，并在等待前释放当前插槽。
             releaseCurrentSlot();
-            const randomDelay = credentialSwitchDelayMs(error, cooldown, isCredentialRefresh, toProvider);
+            const selection = { excludeUuids: exhaustedUuids, preferOtherUuids: switchedFromUuids, preferOtherLeases: switchedFromLeases, kiroSession: retryContext.kiroSession };
+            const randomDelay = await credentialSwitchDelayMs(error, cooldown, isCredentialRefresh, toProvider,
+                () => hasOtherPoolAccount(providerPoolManager, CONFIG.MODEL_PROVIDER || toProvider, model, pooluuid, selection, retryContext?.slotLease));
             logger.info(`[Stream Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
             if (randomDelay > 0) await sleep(randomDelay, undefined, { signal: upstreamAbortController.signal }).catch(() => {});
             // 客户端在等待期间断开：不再占用新凭证的并发插槽，也无需写错误响应
@@ -1872,21 +1936,21 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
                 const result = await getApiServiceWithFallback(CONFIG, model, {
+                    ...selection,
                     acquireSlot: true,
-                    signal: upstreamAbortController.signal,
-                    excludeUuids: exhaustedUuids,
-                    preferOtherUuids: refreshTriedUuids,
-                    kiroSession: retryContext.kiroSession
+                    signal: upstreamAbortController.signal
                 });
-                
+
                 if (result && result.service) {
                     logger.info(`[Stream Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
-                    
+
                     // 使用新服务重试
                     const newRetryContext = {
                         ...retryContext,
                         slotLease: result.slotLease || null,
                         refreshTriedUuids,
+                        switchedFromUuids,
+                        switchedFromLeases,
                         exhaustedUuids: cooldown.quotaExhausted ? exhaustedUuids : retryContext?.exhaustedUuids,
                         CONFIG,
                         currentRetry: currentRetry + 1,
@@ -2041,6 +2105,11 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         else if (providerPoolManager && pooluuid) providerPoolManager.releaseSlot(toProvider, pooluuid);
     };
 
+    if (isKiroRequest) pooluuid = retryContext?.slotLease?.uuid || pooluuid;
+    const recordModelRejection = isKiroRequest
+        ? retryContext?.slotLease?.markKiroModelRejected || providerPoolManager?.captureKiroModelRejection?.(toProvider, pooluuid)
+        : undefined;
+
     try{
         // The service returns the response in its native format (toProvider).
         const needsConversion = getProtocolPrefix(fromProvider) !== getProtocolPrefix(toProvider);
@@ -2112,6 +2181,8 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         }
     } catch (error) {
         if (retryContext?.upstreamAbortController?.signal.aborted || res.destroyed) return;
+        // Resolve the account through its lease after a concurrent UUID rotation.
+        if (isKiroRequest) pooluuid = retryContext?.slotLease?.uuid || pooluuid;
         logger.error('\n[Server] Error during unary processing:', error.stack);
 
         // 协议策略识别出的可重试终止失败和 provider core 抛出的空响应共享独立的小额预算，
@@ -2120,13 +2191,21 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
             const attemptsMade = retryContext?.responseFailureRetry ?? retryContext?.emptyResponseRetry ?? 0;
             const failureLabel = error.responseFailureLabel || 'upstream response failure';
             releaseCurrentSlot();
-            const outcome = await resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, '[Unary Retry]', toProvider, failureLabel, retryContext?.upstreamAbortController?.signal);
+            // The first replay keeps the session binding (and its prompt cache). A stall, or a
+            // failure after this request already used a replay, prefers another account.
+            const leaveAccount = error.preferOtherAccount || attemptsMade > 0;
+            const switchedFromUuids = leftAccountUuids(retryContext, leaveAccount ? [pooluuid] : []);
+            const switchedFromLeases = leftAccountLeases(retryContext, leaveAccount);
+            const outcome = await resolveRetryableUpstreamResponse(CONFIG, model, attemptsMade, '[Unary Retry]', toProvider, failureLabel, retryContext?.upstreamAbortController?.signal,
+                { kiroSession: retryContext?.kiroSession, preferOtherUuids: switchedFromUuids, preferOtherLeases: switchedFromLeases });
 
             if (outcome.aborted) return;
             if (outcome.retry) {
                 const { result, responseFailureRetry } = outcome;
                 const newRetryContext = {
                     ...retryContext,
+                    switchedFromUuids,
+                    switchedFromLeases,
                     slotLease: result.slotLease || null,
                     CONFIG,
                     currentRetry,
@@ -2168,11 +2247,13 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         const refreshTriedUuids = isCredentialRefresh
             ? [...new Set([...(retryContext?.refreshTriedUuids || []), pooluuid, error.kiroRefreshUuid].filter(Boolean))]
             : retryContext?.refreshTriedUuids;
+        const switchedFromUuids = leftAccountUuids(retryContext, refreshTriedUuids || [], pooluuid);
+        const switchedFromLeases = leftAccountLeases(retryContext);
         
         // 检查凭证是否已在底层被标记为不健康（避免重复标记）
         let credentialMarkedUnhealthy = error.credentialMarkedUnhealthy === true;
 
-        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Unary]', model);
+        const cooldown = applyCredentialCooldown(error, CONFIG, providerPoolManager, toProvider, pooluuid, '[Unary]', model, recordModelRejection);
         if (cooldown.credentialMarkedUnhealthy) credentialMarkedUnhealthy = true;
         
         // 如果底层未标记，且不跳过错误计数，则在此处标记
@@ -2208,7 +2289,9 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
         if (credentialMarkedUnhealthy && quotaHasAlternate && currentRetry < maxRetries && providerPoolManager && CONFIG) {
             // 额度耗尽立即换号；其它错误保留抖动，并在等待前释放当前插槽。
             releaseCurrentSlot();
-            const randomDelay = credentialSwitchDelayMs(error, cooldown, isCredentialRefresh, toProvider);
+            const selection = { excludeUuids: exhaustedUuids, preferOtherUuids: switchedFromUuids, preferOtherLeases: switchedFromLeases, kiroSession: retryContext.kiroSession };
+            const randomDelay = await credentialSwitchDelayMs(error, cooldown, isCredentialRefresh, toProvider,
+                () => hasOtherPoolAccount(providerPoolManager, CONFIG.MODEL_PROVIDER || toProvider, model, pooluuid, selection, retryContext?.slotLease));
             logger.info(`[Unary Retry] Credential marked unhealthy. Waiting ${randomDelay}ms before retry ${currentRetry + 1}/${maxRetries} with different credential...`);
             if (randomDelay > 0) await sleep(randomDelay, undefined, { signal: retryContext?.upstreamAbortController?.signal }).catch(() => {});
             if (retryContext?.upstreamAbortController?.signal.aborted) return;
@@ -2218,21 +2301,21 @@ export async function handleUnaryRequest(res, service, model, requestBody, fromP
                 const { getApiServiceWithFallback } = await import('../services/service-manager.js');
                 // 使用 acquireSlot: true 以占用新凭证的并发插槽
                 const result = await getApiServiceWithFallback(CONFIG, model, {
+                    ...selection,
                     acquireSlot: true,
-                    signal: retryContext?.upstreamAbortController?.signal,
-                    excludeUuids: exhaustedUuids,
-                    preferOtherUuids: refreshTriedUuids,
-                    kiroSession: retryContext.kiroSession
+                    signal: retryContext?.upstreamAbortController?.signal
                 });
-                
+
                 if (result && result.service) {
                     logger.info(`[Unary Retry] Switched to new credential: ${result.uuid} (provider: ${result.actualProviderType})`);
-                    
+
                     // 使用新服务重试
                     const newRetryContext = {
                         ...retryContext,
                         slotLease: result.slotLease || null,
                         refreshTriedUuids,
+                        switchedFromUuids,
+                        switchedFromLeases,
                         exhaustedUuids: cooldown.quotaExhausted ? exhaustedUuids : retryContext?.exhaustedUuids,
                         CONFIG,
                         currentRetry: currentRetry + 1,

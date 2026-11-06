@@ -23,6 +23,7 @@ function reserve(provider) {
     let released = false;
     const lease = {
         get released() { return released; },
+        get uuid() { return (state._slotConfig || provider.config).uuid; },
         assertUsable(options) { assertUsable(provider, options); },
         release() {
             if (released) return;

@@ -1,4 +1,5 @@
 import { TextDecoder } from 'node:util';
+import { applyKiroStreamExceptionPolicy } from './kiro-error-policy.js';
 /** Strict AWS Event Stream decoding. No resynchronization after corruption. */
 const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
     let crc = value;
@@ -26,6 +27,13 @@ export function kiroIntegrityError(reason) {
     }
     if (error.recoveryHint) error.message += ` ${error.recoveryHint}`;
     return error;
+}
+
+function upstreamExceptionError(headers, data, messageType) {
+    const error = kiroIntegrityError('upstream exception');
+    error.upstreamCode = headers[':exception-type'] || headers[':error-code'];
+    error.message = `Kiro upstream ${error.upstreamCode || messageType}: ${String(headers[':error-message'] || data.message || 'upstream failure').slice(0, 500)}`;
+    return applyKiroStreamExceptionPolicy(error, error.upstreamCode, typeof data.reason === 'string' ? data.reason : '');
 }
 
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
@@ -89,10 +97,7 @@ export function decodeKiroFrames(buffer, maxFrameBytes = 32 * 1024 * 1024) {
         }
         if (!data || typeof data !== 'object' || Array.isArray(data)) throw kiroIntegrityError('event payload must be a JSON object');
         if (messageType === 'error' || messageType === 'exception' || headers[':exception-type'] || headers[':error-code']) {
-            const error = kiroIntegrityError('upstream exception');
-            error.upstreamCode = headers[':exception-type'] || headers[':error-code'];
-            error.message = `Kiro upstream ${error.upstreamCode || messageType}: ${String(headers[':error-message'] || data.message || 'upstream failure').slice(0, 500)}`;
-            throw error;
+            throw upstreamExceptionError(headers, data, messageType);
         }
         if (messageType && messageType !== 'event') throw kiroIntegrityError('invalid event message type');
         frames.push({ headers, data });
@@ -145,10 +150,7 @@ function tryDecodeOneFrame(buffer, offset, limit) {
         if (!data || typeof data !== 'object' || Array.isArray(data)) return { status: 'parse_error', skip: length };
         // Upstream exceptions are still fatal — not recoverable corruption
         if (messageType === 'error' || messageType === 'exception' || headers[':exception-type'] || headers[':error-code']) {
-            const error = kiroIntegrityError('upstream exception');
-            error.upstreamCode = headers[':exception-type'] || headers[':error-code'];
-            error.message = `Kiro upstream ${error.upstreamCode || messageType}: ${String(headers[':error-message'] || data.message || 'upstream failure').slice(0, 500)}`;
-            return { status: 'fatal', error };
+            return { status: 'fatal', error: upstreamExceptionError(headers, data, messageType) };
         }
         if (messageType && messageType !== 'event') return { status: 'parse_error', skip: length };
         return { status: 'ok', frame: { headers, data }, advance: length };

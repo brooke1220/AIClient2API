@@ -16,6 +16,7 @@ import { kiroCacheMode, prepareKiroCacheAttempt } from './kiro-cache-meter.js';
 import { copyKiroUsageDetails, resolveKiroCacheUsage } from './kiro-cache-usage.js';
 import { KiroBracketToolParser } from './kiro-bracket-tools.js';
 import { getKiroRemainingCredits, KIRO_CREDIT_EPSILON } from './kiro-usage-credits.js';
+import { KIRO_MODEL_MAPPING, kiroUpstreamModelId } from './kiro-model-mapping.js';
 import { markKiroSidecarError, requestViaKiroSidecar, selectKiroSidecarTransport } from './kiro-sidecar-transport.js';
 import { atomicWriteFile } from '../../utils/file-lock.js';
 import axios from 'axios';
@@ -80,6 +81,11 @@ const KIRO_CONSTANTS = {
     ORIGIN_AI_EDITOR: 'AI_EDITOR',
     TOTAL_CONTEXT_TOKENS: 200000, // Claude Sonnet 4.5 actual context is 200K
 };
+
+// Node's global agent drops idle sockets after 5s, shorter than a typical tool
+// run between agent turns, so each turn paid a new TCP+TLS handshake. The
+// timeout only reclaims idle sockets; it never cuts an active stream.
+export const KIRO_HTTPS_AGENT = new https.Agent({ keepAlive: true, timeout: 30000, scheduling: 'lifo' });
 
 const KIRO_MAX_TOOL_NAME_LENGTH = 64;
 let kiroThrottleQueue = Promise.resolve();
@@ -294,35 +300,15 @@ function getContextTokensForModel(model, config = {}, fallbackModel = null) {
 // 从 provider-models.js 获取支持的模型列表
 const KIRO_MODELS = getProviderModels(MODEL_PROVIDER.KIRO_API);
 
-// 完整的模型映射表
-const FULL_MODEL_MAPPING = {
-    "gpt-5.6-sol":"gpt-5.6-sol",
-    "gpt-5.6-terra":"gpt-5.6-terra",
-    "gpt-5.6-luna":"gpt-5.6-luna",
-    "claude-haiku-4-5":"claude-haiku-4.5",
-    "claude-haiku-4-5-20251001":"claude-haiku-4.5",
-    "claude-opus-5-5":"claude-opus-5.5",
-    "claude-sonnet-5-5":"claude-sonnet-5.5",
-    "claude-sonnet-5":"claude-sonnet-5",
-    "claude-opus-5":"claude-opus-5",
-    "claude-opus-4-8":"claude-opus-4.8",
-    "claude-opus-4-7":"claude-opus-4.7",
-    "claude-opus-4-6":"claude-opus-4.6",
-    "claude-sonnet-4-6":"claude-sonnet-4.6",
-    "claude-opus-4-5":"claude-opus-4.5",
-    "claude-opus-4-5-20251101":"claude-opus-4.5",
-    "claude-sonnet-4-5": "claude-sonnet-4.5",
-    "claude-sonnet-4-5-20250929": "claude-sonnet-4.5"
-};
-
-// 只保留 KIRO_MODELS 中存在的模型映射
+// 只保留 KIRO_MODELS 中存在的模型映射，用于对外列出别名（完整映射表见 kiro-model-mapping.js）
 const MODEL_MAPPING = Object.fromEntries(
-    Object.entries(FULL_MODEL_MAPPING).filter(([key]) => KIRO_MODELS.includes(key))
+    Object.entries(KIRO_MODEL_MAPPING).filter(([key]) => KIRO_MODELS.includes(key))
 );
 
 function resolveKiroModel(model, config = {}) {
-    if (Object.hasOwn(MODEL_MAPPING, model)) {
-        return MODEL_MAPPING[model];
+    // 与号池的 (账号, 模型) 拒绝记录共用同一个解析，保证记录的就是实际发往上游的模型。
+    if (Object.hasOwn(KIRO_MODEL_MAPPING, model)) {
+        return kiroUpstreamModelId(model);
     }
 
     if (findCustomModelConfigForModel(model, config)) {
@@ -778,10 +764,10 @@ export class KiroApiService {
 
         const axiosConfig = {
             timeout: KIRO_CONSTANTS.AXIOS_TIMEOUT,
-            // Node >= 20 global agents reuse connections; proxy/sidecar routing
-            // can still override them per request without creating account pools.
+            // One shared pool for every account; proxy/sidecar routing can still
+            // override it per request without creating account pools.
             httpAgent: http.globalAgent,
-            httpsAgent: https.globalAgent,
+            httpsAgent: KIRO_HTTPS_AGENT,
             headers: {
                 'Content-Type': KIRO_CONSTANTS.CONTENT_TYPE_JSON,
                 'Accept': KIRO_CONSTANTS.ACCEPT_JSON,
@@ -2381,6 +2367,8 @@ async saveCredentialsToFile(filePath, newData) {
                 // 不锁到下月，避免把剩余额度闲置并让整个号池返回 503。
                 logger.warn(`[Kiro] 402 in ${context} but ${remaining.toFixed(2)} credits remain (trial/bonus). Switching credential for this request without marking unhealthy.`);
                 error.quotaExhausted = true;
+                // 同一模型大概率继续被拒；上层据此对（账号, 模型）短暂冷却，账号对其他模型仍可用。
+                error.kiroModelRejected = true;
             } else {
                 logger.info(`[Kiro] Quota confirmed exhausted: ${remaining === null ? 'no usage breakdown' : `${remaining.toFixed(2)} credits remain`}`);
                 // Calculate recovery time: 1st day of next month at 00:00:00 UTC
@@ -2603,6 +2591,9 @@ async saveCredentialsToFile(filePath, newData) {
         const expire = kind => {
             timeoutError = kiroIntegrityError(`${kind} timeout`);
             timeoutError.status = 504;
+            // The session binding forms at response headers, so a stalled account is the bound
+            // one; the same-body retry must not be routed straight back to it.
+            timeoutError.preferOtherAccount = true;
             transport.abort(timeoutError);
             if (stream && !stream.destroyed) stream.destroy(timeoutError);
         };
@@ -3366,7 +3357,11 @@ async saveCredentialsToFile(filePath, newData) {
                     if (reason !== undefined && reason !== null && (typeof reason !== 'string' || !normalizeKiroStopReason(reason))) {
                         // Record the raw value so the mapping can be extended from evidence, not guesses.
                         logger.warn(`[Kiro Stream] Unsupported upstream stop reason: ${String(JSON.stringify(reason)).slice(0, 80)}`);
-                        throw kiroIntegrityError('unsupported upstream stop reason');
+                        // The same body yields the same reason: replaying it only regenerates the
+                        // whole answer (buffered/unary) before failing again.
+                        const error = kiroIntegrityError('unsupported upstream stop reason');
+                        error.isRetryableUpstreamResponseFailure = false;
+                        throw error;
                     }
                     upstreamStopReason = normalizeKiroStopReason(reason) || upstreamStopReason;
                     if (upstreamStopReason === 'refusal') refusalText = kiroRefusalText(event.data);

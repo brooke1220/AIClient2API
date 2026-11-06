@@ -1,3 +1,43 @@
+const KIRO_ACCOUNT_THROTTLE_REASON = /^(?:SERVICE_REQUEST_RATE_EXCEEDED|USER_REQUEST_RATE_EXCEEDED|CREDIT_CONSUMPTION_RATE_EXCEEDED|ACCOUNT_RATE_LIMIT_EXCEEDED)$/;
+const KIRO_CAPACITY_THROTTLE_REASON = /^(?:CAPACITY_EXCEEDED|INSUFFICIENT_MODEL_CAPACITY|MODEL_TEMPORARILY_UNAVAILABLE)$/;
+
+function markAccountThrottle(error, reason) {
+    error.status = 429;
+    error.kiroAccountRateLimited = true;
+    // A service-level throttle may cover every account; it keeps the full switch wait.
+    error.kiroAccountScoped = reason !== 'SERVICE_REQUEST_RATE_EXCEEDED';
+    error.kiroErrorKind = 'account_throttled';
+}
+
+/**
+ * In-stream exception frames carry no HTTP status. Map the explicit types to
+ * their HTTP equivalents so a deterministic rejection is not replayed with the
+ * same body; unknown types (e.g. InternalServerException) keep the replay.
+ * A throttle `reason` in the payload is classified exactly as on the HTTP path.
+ * Event-stream union members may arrive lowerCamelCase (`throttlingException`).
+ */
+export function applyKiroStreamExceptionPolicy(error, exceptionType, reason = '') {
+    const type = typeof exceptionType === 'string' ? exceptionType.toLowerCase() : '';
+    if (type === 'validationexception' && /CONTENT_LENGTH_EXCEEDS_THRESHOLD/.test(`${reason} ${error.message}`)) {
+        // Same status as the HTTP path, so clients that compact context on 413 still recover.
+        Object.assign(error, { status: 413, kiroErrorKind: 'payload_too_large', responseFailureCode: 'KIRO_PAYLOAD_TOO_LARGE',
+            isRetryableUpstreamResponseFailure: false, shouldSwitchCredential: false });
+    } else if (type === 'validationexception') {
+        Object.assign(error, { status: 400, kiroErrorKind: 'invalid_request', responseFailureCode: 'KIRO_REQUEST_INVALID',
+            isRetryableUpstreamResponseFailure: false, shouldSwitchCredential: false });
+    } else if (type === 'throttlingexception' && KIRO_CAPACITY_THROTTLE_REASON.test(reason)) {
+        // Capacity throttles are not evidence that an account is unhealthy.
+        Object.assign(error, { status: 429, kiroErrorKind: 'capacity_throttled', responseFailureCode: 'KIRO_CAPACITY_THROTTLED',
+            isRetryableUpstreamResponseFailure: false, shouldSwitchCredential: false });
+    } else if (type === 'throttlingexception') {
+        // Otherwise an unclassified 429: switch credential with the usual jitter.
+        Object.assign(error, { status: 429, kiroErrorKind: 'throttled', responseFailureCode: 'KIRO_STREAM_THROTTLED',
+            isRetryableUpstreamResponseFailure: false, shouldSwitchCredential: true });
+        if (KIRO_ACCOUNT_THROTTLE_REASON.test(reason)) markAccountThrottle(error, reason);
+    }
+    return error;
+}
+
 /** Only classify explicit provider errors; unrelated 5xx retain existing failover. */
 export function applyKiroErrorPolicy(error, body) {
     const status = Number(error.response?.status ?? error.status);
@@ -17,13 +57,9 @@ export function applyKiroErrorPolicy(error, body) {
         result = { status: 400, code: 'KIRO_REQUEST_INVALID', kind: 'invalid_request' };
     } else if (status === 400 && /CONTENT_LENGTH_EXCEEDS_THRESHOLD/.test(`${reason} ${message}`)) {
         result = { status: 413, code: 'KIRO_PAYLOAD_TOO_LARGE', kind: 'payload_too_large' };
-    } else if (status === 429 && /^(?:SERVICE_REQUEST_RATE_EXCEEDED|USER_REQUEST_RATE_EXCEEDED|CREDIT_CONSUMPTION_RATE_EXCEEDED|ACCOUNT_RATE_LIMIT_EXCEEDED)$/.test(reason)) {
-        error.status = 429;
-        error.kiroAccountRateLimited = true;
-        // A service-level throttle may cover every account; it keeps the full switch wait.
-        error.kiroAccountScoped = reason !== 'SERVICE_REQUEST_RATE_EXCEEDED';
-        error.kiroErrorKind = 'account_throttled';
-    } else if (status === 429 && /^(?:CAPACITY_EXCEEDED|INSUFFICIENT_MODEL_CAPACITY|MODEL_TEMPORARILY_UNAVAILABLE)$/.test(reason)) {
+    } else if (status === 429 && KIRO_ACCOUNT_THROTTLE_REASON.test(reason)) {
+        markAccountThrottle(error, reason);
+    } else if (status === 429 && KIRO_CAPACITY_THROTTLE_REASON.test(reason)) {
         // Capacity throttles are not evidence that an account is unhealthy.
         result = { status: 429, code: 'KIRO_CAPACITY_THROTTLED', kind: 'capacity_throttled' };
     }

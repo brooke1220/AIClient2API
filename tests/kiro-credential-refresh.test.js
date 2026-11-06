@@ -188,6 +188,90 @@ describe('required refresh and account routing', () => {
         expect(result.config.uuid).toBe('alternate');
     });
 
+    test('a full alternate with no queue room does not displace the free account the retry left', async () => {
+        const manager = pool([{ uuid: 'account', concurrencyLimit: 1 }, { uuid: 'alternate', concurrencyLimit: 1 }]);
+        manager.providerStatus[TYPE][1].state.activeCount = 1;
+        const result = await manager.acquireSlotWithFallback(TYPE, model, { preferOtherUuids: ['account'] });
+        expect(result.config.uuid).toBe('account');
+        result.config._slotLease.release();
+    });
+
+    test('a full alternate with queue room is still preferred over the account the retry left', async () => {
+        const manager = pool([{ uuid: 'account', concurrencyLimit: 1 }, { uuid: 'alternate', concurrencyLimit: 1, queueLimit: 1 }]);
+        manager.providerStatus[TYPE][1].state.activeCount = 1;
+        const result = await manager.selectProviderWithFallback(TYPE, model, { preferOtherUuids: ['account'] });
+        expect(result.config.uuid).toBe('alternate');
+    });
+
+    test('a dry run reports a selectable account without touching LRU order or usage', async () => {
+        const manager = pool([{ uuid: 'account' }, { uuid: 'alternate', lastUsed: null, usageCount: 0 }]);
+        const alternate = manager.providerStatus[TYPE][1].config;
+        const result = await manager.selectProviderWithFallback(TYPE, model, { dryRun: true, excludeUuids: ['account'] });
+        expect(result.config.uuid).toBe('alternate');
+        expect(alternate.lastUsed).toBeNull();
+        expect(alternate.usageCount).toBe(0);
+        expect(alternate._lastSelectionSeq).toBeUndefined();
+    });
+
+    test('a dry run with the retry options lands where the retry will: the free account it left', async () => {
+        const manager = pool([{ uuid: 'account', concurrencyLimit: 1 }, { uuid: 'alternate', concurrencyLimit: 1 }]);
+        manager.providerStatus[TYPE][1].state.activeCount = 1;
+        const options = { preferOtherUuids: ['account'], excludeUuids: [] };
+        const dry = await manager.selectProviderWithFallback(TYPE, model, { ...options, dryRun: true });
+        const real = await manager.acquireSlotWithFallback(TYPE, model, options);
+        expect(dry.config.uuid).toBe('account');
+        expect(real.config.uuid).toBe('account');
+        real.config._slotLease.release();
+    });
+
+    test('a dry run reports the account self-heal would reach without healing it', async () => {
+        const manager = pool([{ uuid: 'account', isHealthy: false }, { uuid: 'sick', isHealthy: false }]);
+        const result = await manager.selectProviderWithFallback(TYPE, model, { dryRun: true, preferOtherUuids: ['account'] });
+        expect(result.config.uuid).toBe('sick');
+        expect(manager.providerStatus[TYPE].map(provider => provider.config.isHealthy)).toEqual([false, false]);
+        expect(manager._selfHealTimestamps[TYPE]).toBeUndefined();
+    });
+
+    test('self-heal dry runs and actual acquisition both avoid the rotated account a retry left', async () => {
+        const manager = pool([{ uuid: 'account' }, { uuid: 'sick' }]);
+        const acquired = await manager.acquireSlot(TYPE, model);
+        expect(acquired.uuid).toBe('account');
+        acquired._slotLease.release();
+        const options = { preferOtherUuids: [acquired.uuid], preferOtherLeases: [acquired._slotLease] };
+        const currentUuid = manager.refreshProviderUuid(TYPE, { uuid: acquired.uuid });
+        for (const provider of manager.providerStatus[TYPE]) provider.config.isHealthy = false;
+
+        const dry = await manager.selectProviderWithFallback(TYPE, model, { ...options, dryRun: true });
+        expect(dry.config.uuid).toBe('sick');
+        expect(acquired._slotLease.uuid).toBe(currentUuid);
+        expect(manager.providerStatus[TYPE].map(provider => provider.config.isHealthy)).toEqual([false, false]);
+        expect(manager._selfHealTimestamps[TYPE]).toBeUndefined();
+
+        const real = await manager.acquireSlotWithFallback(TYPE, model, options);
+        expect(real.config.uuid).toBe('sick');
+        real.config._slotLease.release();
+        expect(manager.providerStatus[TYPE].every(provider => provider.state.activeCount === 0)).toBe(true);
+    });
+
+    test('a dry run does not wait for a refreshing alternate', async () => {
+        const manager = pool([{ uuid: 'account' }, { uuid: 'refreshing' }]);
+        const pending = deferred();
+        refreshAdapter(pending);
+        manager.markProviderNeedRefresh(TYPE, { uuid: 'refreshing' });
+        const result = await manager.selectProviderWithFallback(TYPE, model, { dryRun: true, excludeUuids: ['account'] });
+        expect(result).toBeNull();
+        pending.resolve(true);
+        await tick();
+    });
+
+    test('self-heal skips an account rejected for the requested model', async () => {
+        const manager = pool([{ uuid: 'rejected', isHealthy: false }, { uuid: 'sick', isHealthy: false }]);
+        manager.markKiroModelRejected(TYPE, 'rejected', model);
+        const selected = await manager.selectProvider(TYPE, model);
+        expect(selected.uuid).toBe('sick');
+        expect(manager.providerStatus[TYPE][0].config.isHealthy).toBe(false);
+    });
+
     test('failed required refresh returns a refresh error and cools down the invalid credential', async () => {
         const manager = pool();
         const pending = deferred();

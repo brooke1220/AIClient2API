@@ -7,7 +7,10 @@ jest.mock('../src/utils/logger.js', () => ({
     default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }
 }));
 
-import { handleStreamRequest, handleUnaryRequest, handleContentGenerationRequest, ENDPOINT_TYPE } from '../src/utils/common.js';
+import { handleStreamRequest, handleUnaryRequest, handleContentGenerationRequest, ENDPOINT_TYPE,
+    getRequestBody, createEmptyUpstreamResponseError } from '../src/utils/common.js';
+import { kiroIntegrityError } from '../src/providers/claude/kiro-event-stream.js';
+import { applyKiroStreamExceptionPolicy } from '../src/providers/claude/kiro-error-policy.js';
 import '../src/converters/register-converters.js';
 import { acquireProviderSlot } from '../src/providers/provider-slot-lease.js';
 import { ProviderPoolManager } from '../src/providers/provider-pool-manager.js';
@@ -439,5 +442,280 @@ describe('Kiro acquired account identity survives UUID rotation', () => {
         expect(node.config.kiroAccountSuspended).toBe(true);
         expect(node.config.isHealthy).toBe(false);
         expect(node.state.activeCount).toBe(0);
+    });
+});
+
+describe('Kiro model rejection follows the in-flight account identity', () => {
+    afterEach(() => jest.restoreAllMocks());
+
+    class MemoryPool extends ProviderPoolManager {
+        _debouncedSave() {}
+        _log() {}
+        _logHealthStatusChange() {}
+    }
+
+    const createPool = () => new MemoryPool({ [KIRO]: [{
+        uuid: 'account', isHealthy: true, concurrencyLimit: 1,
+        KIRO_OAUTH_CREDS_FILE_PATH: '/mock/original-account.json'
+    }] }, { globalConfig: {} });
+
+    const startRejectedRequest = (mode, manager, selected) => {
+        let enter, finish;
+        const entered = new Promise(resolve => { enter = resolve; });
+        const complete = new Promise(resolve => { finish = resolve; });
+        const fail = async () => {
+            enter();
+            await complete;
+            throw Object.assign(new Error('402 with trial credits remaining'), {
+                response: { status: 402 }, quotaExhausted: true, kiroModelRejected: true,
+                shouldSwitchCredential: true, skipErrorCount: true
+            });
+        };
+        const backend = {
+            generateContentStream: async function* () { await fail(); },
+            generateContent: fail
+        };
+        const res = response();
+        const handler = mode === 'stream' ? handleStreamRequest : handleUnaryRequest;
+        const pending = handler(res, backend, MODEL, body(), 'claude', KIRO, 'none', null,
+            manager, selected.uuid, null, {
+                slotLease: selected._slotLease,
+                CONFIG: { CREDENTIAL_SWITCH_MAX_RETRIES: 0, SSE_HEARTBEAT_INTERVAL_MS: 0 }
+            });
+        return { entered, finish, pending, res };
+    };
+
+    test.each(['stream', 'unary'])('%s cools the rejected model after another request rotates the account UUID', async mode => {
+        const manager = createPool();
+        const node = manager.providerStatus[KIRO][0];
+        const selected = await acquireProviderSlot(node);
+        const attempt = startRejectedRequest(mode, manager, selected);
+        await attempt.entered;
+
+        const currentUuid = manager.refreshProviderUuid(KIRO, { uuid: selected.uuid });
+        expect(currentUuid).not.toBe(selected.uuid);
+        attempt.finish();
+        await settles(attempt.pending, attempt.res);
+
+        await expect(manager.selectProvider(KIRO, MODEL)).resolves.toBeNull();
+        await expect(manager.selectProvider(KIRO, 'claude-haiku-4-5')).resolves.toMatchObject({ uuid: currentUuid });
+        expect(node.config.isHealthy).toBe(true);
+        expect(selected._slotLease.released).toBe(true);
+        expect(node.state.activeCount).toBe(0);
+        expect(node.state.waitingCount).toBe(0);
+    });
+
+    test.each(['stream', 'unary'])('%s does not apply an old request rejection to replacement credentials with the same UUID', async mode => {
+        const manager = createPool();
+        const node = manager.providerStatus[KIRO][0];
+        const selected = await acquireProviderSlot(node);
+        const attempt = startRejectedRequest(mode, manager, selected);
+        await attempt.entered;
+
+        manager.providerPools[KIRO][0] = {
+            ...node.config, KIRO_OAUTH_CREDS_FILE_PATH: '/mock/replacement-account.json'
+        };
+        manager.initializeProviderStatus(true);
+        const replacement = manager.providerStatus[KIRO][0];
+        expect(replacement.state).toBe(node.state);
+        expect(replacement.state.activeCount).toBe(1);
+        attempt.finish();
+        await settles(attempt.pending, attempt.res);
+
+        await expect(manager.selectProvider(KIRO, MODEL)).resolves.toMatchObject({ uuid: selected.uuid });
+        await expect(manager.selectProvider(KIRO, 'claude-haiku-4-5')).resolves.toMatchObject({ uuid: selected.uuid });
+        expect(replacement.config.isHealthy).toBe(true);
+        expect(selected._slotLease.released).toBe(true);
+        expect(replacement.state.activeCount).toBe(0);
+        expect(replacement.state.waitingCount).toBe(0);
+    });
+
+    test.each(['stream', 'unary'])('%s preserves the credential scope captured by the acquired slot before the handler starts', async mode => {
+        const manager = createPool();
+        const selected = await manager.acquireSlot(KIRO, MODEL);
+        const node = manager.providerStatus[KIRO][0];
+
+        manager.providerPools[KIRO][0] = {
+            ...node.config, KIRO_OAUTH_CREDS_FILE_PATH: '/mock/replacement-before-handler.json'
+        };
+        manager.initializeProviderStatus(true);
+        const replacement = manager.providerStatus[KIRO][0];
+        expect(replacement.state).toBe(node.state);
+        expect(replacement.state.activeCount).toBe(1);
+
+        const attempt = startRejectedRequest(mode, manager, selected);
+        await attempt.entered;
+        attempt.finish();
+        await settles(attempt.pending, attempt.res);
+
+        await expect(manager.selectProvider(KIRO, MODEL)).resolves.toMatchObject({ uuid: selected.uuid });
+        expect(replacement.config.isHealthy).toBe(true);
+        expect(selected._slotLease.released).toBe(true);
+        expect(replacement.state.activeCount).toBe(0);
+        expect(replacement.state.waitingCount).toBe(0);
+    });
+
+    test.each(['stream', 'unary'])('%s switches away from the current UUID after an in-flight account rotation and 503', async mode => {
+        jest.spyOn(Math, 'random').mockReturnValue(0);
+        const select = jest.spyOn(services, 'getApiServiceWithFallback').mockResolvedValue(null);
+        const manager = createPool();
+        const selected = await manager.acquireSlot(KIRO, MODEL);
+        const node = manager.providerStatus[KIRO][0];
+        let enter, finish;
+        const entered = new Promise(resolve => { enter = resolve; });
+        const complete = new Promise(resolve => { finish = resolve; });
+        const fail = async () => {
+            enter();
+            await complete;
+            throw Object.assign(new Error('upstream unavailable'), {
+                response: { status: 503 }, shouldSwitchCredential: true, skipErrorCount: true
+            });
+        };
+        const backend = {
+            generateContentStream: async function* () { await fail(); },
+            generateContent: fail
+        };
+        const res = response();
+        const handler = mode === 'stream' ? handleStreamRequest : handleUnaryRequest;
+        const pending = handler(res, backend, MODEL, body(), 'claude', KIRO, 'none', null,
+            manager, selected.uuid, null, {
+                slotLease: selected._slotLease,
+                CONFIG: { CREDENTIAL_SWITCH_MAX_RETRIES: 1, SSE_HEARTBEAT_INTERVAL_MS: 0 }
+            });
+        await entered;
+        const currentUuid = manager.refreshProviderUuid(KIRO, { uuid: selected.uuid });
+        finish();
+        await settles(pending, res);
+
+        expect(select).toHaveBeenCalledTimes(1);
+        expect(select.mock.calls[0][2].preferOtherUuids).toEqual([currentUuid]);
+        expect(select.mock.calls[0][2].preferOtherUuids).not.toContain(selected.uuid);
+        expect(selected._slotLease.released).toBe(true);
+        expect(node.state.activeCount).toBe(0);
+        expect(node.state.waitingCount).toBe(0);
+    });
+});
+
+describe('request bodies decode UTF-8 once, across chunk boundaries', () => {
+    test('multi-byte characters split between chunks survive intact', async () => {
+        const req = new EventEmitter(); req.headers = {};
+        const payload = { messages: [{ role: 'user', content: '中文测试 🟢 émoji' }] };
+        const pending = getRequestBody(req);
+        // One byte per chunk splits every multi-byte character.
+        for (const byte of Buffer.from(JSON.stringify(payload))) req.emit('data', Buffer.from([byte]));
+        req.emit('end');
+        await expect(pending).resolves.toEqual(payload);
+    });
+});
+
+describe('Kiro retry account selection matches the failure type', () => {
+    afterEach(() => jest.restoreAllMocks());
+    const session = { key: 'session-key' };
+    const failing = error => ({
+        generateContentStream: async function* () { throw error; },
+        generateContent: async () => { throw error; }
+    });
+    const succeeding = () => ({
+        generateContentStream: async function* () { yield startChunk(); yield textChunk(); yield { type: 'message_stop' }; },
+        generateContent: async () => ({ id: 'msg', type: 'message', role: 'assistant', model: MODEL,
+            content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } })
+    });
+    const streamException = (type, reason) => applyKiroStreamExceptionPolicy(kiroIntegrityError('upstream exception'), type, reason);
+    const run = async (mode, service, manager, retryContext) => {
+        const res = response();
+        await (mode === 'stream' ? handleStreamRequest : handleUnaryRequest)(
+            res, service, MODEL, body(), 'claude', KIRO, 'none', null, manager, 'failed-node', null,
+            { CONFIG: { SSE_HEARTBEAT_INTERVAL_MS: 0, EMPTY_RESPONSE_RETRY_DELAY_MS: 0 }, kiroSession: session, ...retryContext });
+        return res;
+    };
+    const selectNext = uuid => jest.spyOn(services, 'getApiServiceWithFallback').mockResolvedValue({ service: succeeding(), actualProviderType: KIRO, uuid });
+
+    test.each(['stream', 'unary'])('%s credential switch prefers accounts the request already left', async mode => {
+        jest.spyOn(Math, 'random').mockReturnValue(0);
+        const error = Object.assign(new Error('upstream unavailable'), { response: { status: 503 }, skipErrorCount: true, shouldSwitchCredential: true });
+        const select = selectNext('next-node');
+        await run(mode, failing(error), pool(), { switchedFromUuids: ['earlier-node'] });
+        expect(select).toHaveBeenCalledTimes(1);
+        expect(select.mock.calls[0][2]).toMatchObject({ kiroSession: session });
+        expect(select.mock.calls[0][2].preferOtherUuids).toEqual(['earlier-node', 'failed-node']);
+    });
+
+    test.each(['stream', 'unary'])('%s same-body retry after an empty response keeps the session binding', async mode => {
+        const select = selectNext('failed-node');
+        await run(mode, failing(createEmptyUpstreamResponseError('Kiro')), pool(), { switchedFromUuids: ['earlier-node'] });
+        expect(select).toHaveBeenCalledTimes(1);
+        expect(select.mock.calls[0][2]).toMatchObject({ kiroSession: session, acquireSlot: true });
+        // Only accounts the request already left are avoided; the current one stays eligible.
+        expect(select.mock.calls[0][2].preferOtherUuids).toEqual(['earlier-node']);
+    });
+
+    test.each(['stream', 'unary'])('%s same-body retry after a stall prefers another account', async mode => {
+        const stall = Object.assign(kiroIntegrityError('first meaningful event timeout'), { status: 504, preferOtherAccount: true });
+        const select = selectNext('next-node');
+        await run(mode, failing(stall), pool());
+        expect(select).toHaveBeenCalledTimes(1);
+        expect(select.mock.calls[0][2]).toMatchObject({ kiroSession: session, preferOtherUuids: ['failed-node'] });
+    });
+
+    test.each(['stream', 'unary'])('%s repeat empty response on the bound account prefers another account', async mode => {
+        const select = selectNext('next-node');
+        await run(mode, failing(createEmptyUpstreamResponseError('Kiro')), pool(), { responseFailureRetry: 1 });
+        expect(select).toHaveBeenCalledTimes(1);
+        expect(select.mock.calls[0][2]).toMatchObject({ kiroSession: session, preferOtherUuids: ['failed-node'] });
+    });
+
+    test.each(['stream', 'unary'])('%s in-stream ValidationException is returned without any retry', async mode => {
+        const select = jest.spyOn(services, 'getApiServiceWithFallback');
+        const manager = pool();
+        const res = await run(mode, failing(streamException('ValidationException')), manager);
+        expect(select).not.toHaveBeenCalled();
+        assertNoProviderPenalty(manager);
+        if (mode === 'unary') expect(res.writeHead.mock.calls[0][0]).toBe(400);
+        else expect(res.write.mock.calls.map(([chunk]) => String(chunk)).join('')).toContain('"invalid_request_error"');
+    });
+
+    test.each(['stream', 'unary'])('%s in-stream ThrottlingException switches credential instead of a same-body retry', async mode => {
+        jest.spyOn(Math, 'random').mockReturnValue(0);
+        const select = selectNext('next-node');
+        await run(mode, failing(streamException('ThrottlingException')), pool());
+        expect(select).toHaveBeenCalledTimes(1);
+        expect(select.mock.calls[0][2].preferOtherUuids).toEqual(['failed-node']);
+    });
+
+    test.each(['stream', 'unary'])('%s in-stream capacity throttle is returned without penalty or switch, as on the HTTP path', async mode => {
+        const select = jest.spyOn(services, 'getApiServiceWithFallback');
+        const manager = pool();
+        const res = await run(mode, failing(streamException('ThrottlingException', 'INSUFFICIENT_MODEL_CAPACITY')), manager,
+            { CONFIG: { SSE_HEARTBEAT_INTERVAL_MS: 0, RATE_LIMIT_COOLDOWN_ENABLED: true } });
+        expect(select).not.toHaveBeenCalled();
+        assertNoProviderPenalty(manager);
+        if (mode === 'unary') expect(res.writeHead.mock.calls[0][0]).toBe(429);
+        else expect(res.write.mock.calls.map(([chunk]) => String(chunk)).join('')).toContain('"rate_limit_error"');
+    });
+
+    test.each(['stream', 'unary'])('%s in-stream account throttle cools the account down and switches', async mode => {
+        jest.spyOn(Math, 'random').mockReturnValue(0);
+        const select = selectNext('next-node');
+        const manager = pool();
+        await run(mode, failing(streamException('ThrottlingException', 'USER_REQUEST_RATE_EXCEEDED')), manager);
+        expect(manager.markProviderUnhealthyWithRecoveryTime).toHaveBeenCalledWith(KIRO, { uuid: 'failed-node' }, expect.any(String), expect.any(Date));
+        expect(select).toHaveBeenCalledTimes(1);
+        expect(select.mock.calls[0][2].preferOtherUuids).toEqual(['failed-node']);
+    });
+});
+
+describe('in-stream throttle reasons share the HTTP classification', () => {
+    const classify = reason => applyKiroStreamExceptionPolicy(kiroIntegrityError('upstream exception'), 'ThrottlingException', reason);
+    test('an account rate limit is account-scoped with the short switch jitter', () => {
+        expect(classify('USER_REQUEST_RATE_EXCEEDED')).toMatchObject({ status: 429, shouldSwitchCredential: true,
+            kiroAccountRateLimited: true, kiroAccountScoped: true, kiroErrorKind: 'account_throttled', isRetryableUpstreamResponseFailure: false });
+    });
+    test('a service-wide rate limit keeps the full switch wait', () => {
+        expect(classify('SERVICE_REQUEST_RATE_EXCEEDED')).toMatchObject({ kiroAccountRateLimited: true, kiroAccountScoped: false });
+    });
+    test('a reasonless throttle stays an unclassified 429', () => {
+        const error = classify('');
+        expect(error).toMatchObject({ status: 429, shouldSwitchCredential: true, kiroErrorKind: 'throttled' });
+        expect(error.kiroAccountRateLimited).toBeUndefined();
     });
 });
