@@ -24,3 +24,4 @@ src/plugins-user/
 
 /.codegraph/
 /.omc/
+.private/

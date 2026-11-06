@@ -47,6 +47,8 @@ api-potluck-data.json
 input_system_prompt.txt
 fetch_system_prompt.txt
 configs/pwd
+.private
+**/.private
 *.md
 LICENSE
 jest.config.js
