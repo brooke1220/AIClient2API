@@ -8,6 +8,7 @@ import crypto from 'crypto';
 import { BaseConverter } from '../BaseConverter.js';
 import { MODEL_PROTOCOL_PREFIX } from '../../utils/common.js';
 import { toClaudeInputUsage } from '../utils.js';
+import { resolveCodexReasoningEffort } from '../../providers/openai/codex-request-utils.js';
 import {
     generateResponseCreated,
     generateResponseInProgress,
@@ -237,10 +238,11 @@ export class CodexConverter extends BaseConverter {
         delete codexRequest.temperature;
         delete codexRequest.top_p;
         delete codexRequest.user;
+        delete codexRequest.reasoning_effort;
         
-        // 添加 reasoning 配置
+        // 保留显式 null；模型默认值由 provider 统一设置。
         codexRequest.reasoning = {
-          "effort": responsesRequest.reasoning_effort || responsesRequest.reasoning?.effort || "medium",
+          "effort": resolveCodexReasoningEffort(responsesRequest),
           "summary": responsesRequest.reasoning?.summary || "auto"
         };
         
@@ -300,7 +302,7 @@ export class CodexConverter extends BaseConverter {
             store: false,
             metadata: data.metadata || {},
             reasoning: {
-                effort: data.reasoning_effort || data.reasoning?.effort || 'medium',
+                effort: resolveCodexReasoningEffort(data),
                 summary: data.reasoning?.summary || 'auto'
             },
             parallel_tool_calls: true,
@@ -1172,10 +1174,12 @@ export class CodexConverter extends BaseConverter {
         }
 
         if (type === 'response.output_item.done' && chunk.item?.type === 'image_generation_call') {
+            const imageMarkdown = this.codexImageGenerationToMarkdown(chunk.item);
+            if (!imageMarkdown) return null;
             const template = buildTemplate();
             template.choices[0].delta = {
                 role: 'assistant',
-                content: this.codexImageGenerationToMarkdown(chunk.item),
+                content: imageMarkdown,
                 reasoning_content: null,
                 tool_calls: null
             };
