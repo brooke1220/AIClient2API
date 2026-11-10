@@ -932,6 +932,8 @@ const translations = {
         // Usage
         'usage.title': '用量查询',
         'usage.refresh': '刷新用量',
+        'usage.refreshing': '正在刷新...',
+        'usage.requestTimeout': '用量查询超时，请稍后重试；也可双击提供商标签或单独刷新实例。',
         'usage.serverTime': '服务端时间',
         'usage.lastUpdate': '上次更新: {time}',
         'usage.lastUpdateCache': '缓存时间: {time}',
@@ -948,6 +950,7 @@ const translations = {
         'usage.card.totalUsage': '总用量',
         'usage.card.resetAt': '将在 {time} 重置',
         'usage.card.refresh': '刷新此实例用量',
+        'usage.card.lastRefreshed': '最后刷新: {time}',
         'usage.card.downloadConfig': '下载授权文件',
         'usage.card.downloadSuccess': '授权文件下载成功',
         'usage.card.downloadFailed': '授权文件下载失败',
@@ -2304,6 +2307,8 @@ const translations = {
         // Usage
         'usage.title': 'Usage Query',
         'usage.refresh': 'Refresh Usage',
+        'usage.refreshing': 'Refreshing...',
+        'usage.requestTimeout': 'Usage request timed out. Please retry, double-click a provider tag, or refresh an individual instance.',
         'usage.serverTime': 'Server Time',
         'usage.lastUpdate': 'Last Update: {time}',
         'usage.lastUpdateCache': 'Cache Time: {time}',
@@ -2320,6 +2325,7 @@ const translations = {
         'usage.card.totalUsage': 'Total Usage',
         'usage.card.resetAt': 'Resets at {time}',
         'usage.card.refresh': 'Refresh this instance',
+        'usage.card.lastRefreshed': 'Last refreshed: {time}',
         'usage.card.downloadConfig': 'Download Config',
         'usage.card.downloadSuccess': 'Config file downloaded successfully',
         'usage.card.downloadFailed': 'Failed to download config file',

@@ -7,6 +7,67 @@ import { t, getCurrentLanguage } from './i18n.js';
 // 提供商配置缓存
 let currentProviderConfigs = null;
 let usagePageDataPromise = null;
+let usageRefreshPromise = null;
+let usageLoadVersion = 0;
+const USAGE_REQUEST_TIMEOUT_MS = 120000;
+
+async function requestUsage(url, options = {}) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), USAGE_REQUEST_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(url, {
+            method: 'GET',
+            headers: getAuthHeaders(),
+            cache: 'no-store',
+            ...options,
+            signal: controller.signal
+        });
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.error?.message || `HTTP ${response.status}`);
+        }
+        // Keep the timeout active while reading the response body as well.
+        return await response.json();
+    } catch (error) {
+        if (controller.signal.aborted) {
+            throw new Error(t('usage.requestTimeout'));
+        }
+        throw error;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+function setUsageLoading(loading) {
+    const loadingEl = document.getElementById('usageLoading');
+    if (loadingEl) loadingEl.style.display = loading ? 'block' : 'none';
+    if (loading) {
+        const errorEl = document.getElementById('usageError');
+        if (errorEl) errorEl.style.display = 'none';
+    }
+}
+
+function showUsageError(error) {
+    const errorEl = document.getElementById('usageError');
+    const messageEl = document.getElementById('usageErrorMessage');
+    if (errorEl) errorEl.style.display = 'block';
+    if (messageEl) messageEl.textContent = error.message;
+}
+
+function setRefreshButtonLoading(loading) {
+    const button = document.getElementById('refreshUsageBtn');
+    if (!button) return;
+    button.disabled = loading;
+    button.setAttribute('aria-busy', String(loading));
+    button.querySelector('i')?.classList.toggle('fa-spin', loading);
+    const label = button.querySelector('[data-i18n]');
+    if (label) {
+        const key = loading ? 'usage.refreshing' : 'usage.refresh';
+        label.setAttribute('data-i18n', key);
+        label.textContent = t(key);
+    }
+}
 
 /**
  * 更新提供商配置
@@ -28,6 +89,8 @@ export function initUsageManager() {
  * 加载页面数据
  */
 export function loadUsagePageData() {
+    // A section may have arrived after the initial application setup.
+    initUsageManager();
     if (usagePageDataPromise) {
         return usagePageDataPromise;
     }
@@ -50,13 +113,7 @@ async function loadSupportedProviders() {
     if (!listEl) return;
 
     try {
-        const response = await fetch('/api/usage/supported-providers', {
-            method: 'GET',
-            headers: getAuthHeaders()
-        });
-
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const providers = await response.json();
+        const providers = await requestUsage('/api/usage/supported-providers');
         
         listEl.innerHTML = '';
         const displayOrder = currentProviderConfigs ? currentProviderConfigs.map(c => c.id) : providers;
@@ -85,62 +142,53 @@ async function loadSupportedProviders() {
  * 加载用量数据
  */
 export async function loadUsage() {
-    const loadingEl = document.getElementById('usageLoading');
-    const errorEl = document.getElementById('usageError');
-    const contentEl = document.getElementById('usageContent');
-
-    if (loadingEl) loadingEl.style.display = 'block';
-    if (errorEl) errorEl.style.display = 'none';
+    if (usageRefreshPromise) return usageRefreshPromise;
+    const version = ++usageLoadVersion;
+    setUsageLoading(true);
 
     try {
-        const response = await fetch('/api/usage', { method: 'GET', headers: getAuthHeaders() });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const data = await response.json();
+        const data = await requestUsage('/api/usage');
+        if (version !== usageLoadVersion) return;
         
-        if (loadingEl) loadingEl.style.display = 'none';
-        renderUsageData(data, contentEl);
+        renderUsageData(data, document.getElementById('usageContent'));
         updateTimeInfo(data);
     } catch (error) {
+        if (version !== usageLoadVersion) return;
         console.error('获取用量数据失败:', error);
-        if (loadingEl) loadingEl.style.display = 'none';
-        if (errorEl) {
-            errorEl.style.display = 'block';
-            document.getElementById('usageErrorMessage').textContent = error.message;
-        }
+        showUsageError(error);
+    } finally {
+        if (version === usageLoadVersion) setUsageLoading(false);
     }
 }
 
 /**
  * 刷新全部用量
  */
-export async function refreshUsage() {
-    const refreshBtn = document.getElementById('refreshUsageBtn');
-    if (refreshBtn) refreshBtn.disabled = true;
+export function refreshUsage() {
+    if (usageRefreshPromise) return usageRefreshPromise;
+    // Older cache loads must not replace this refresh, even if they finish later.
+    ++usageLoadVersion;
+    setRefreshButtonLoading(true);
+    setUsageLoading(true);
 
-    try {
-        // 使用更明显的反馈：显示加载中的 Toast
-        showToast(t('usage.loading'), 'info');
-        
-        const response = await fetch('/api/usage?refresh=true', { method: 'GET', headers: getAuthHeaders() });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.error?.message || `HTTP ${response.status}`);
+    usageRefreshPromise = (async () => {
+        try {
+            showToast(t('usage.loading'), 'info');
+            const data = await requestUsage('/api/usage?refresh=true');
+            renderUsageData(data, document.getElementById('usageContent'));
+            updateTimeInfo(data);
+            showToast(t('common.refresh.success'), 'success');
+        } catch (error) {
+            console.error('刷新用量失败:', error);
+            showUsageError(error);
+            showToast(t('common.error'), error.message || t('common.requestFailed'), 'error');
         }
-        
-        const data = await response.json();
-        
-        // 渲染数据
-        renderUsageData(data, document.getElementById('usageContent'));
-        updateTimeInfo(data);
-        
-        // 成功提示
-        showToast(t('common.refresh.success'), 'success');
-    } catch (error) {
-        console.error('刷新用量失败:', error);
-        showToast(t('common.error'), error.message || t('common.requestFailed'), 'error');
-    } finally {
-        if (refreshBtn) refreshBtn.disabled = false;
-    }
+    })().finally(() => {
+        setRefreshButtonLoading(false);
+        setUsageLoading(false);
+        usageRefreshPromise = null;
+    });
+    return usageRefreshPromise;
 }
 
 /**
@@ -149,17 +197,7 @@ export async function refreshUsage() {
 export async function refreshSingleInstanceUsage(providerType, uuid, displayName) {
     try {
         showToast(t('usage.refreshingInstance', { name: displayName }), 'info');
-        const response = await fetch(`/api/usage/${providerType}/${uuid}?refresh=true`, { 
-            method: 'GET', 
-            headers: getAuthHeaders() 
-        });
-        
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.error?.message || `HTTP ${response.status}`);
-        }
-        
-        const data = await response.json();
+        const data = await requestUsage(`/api/usage/${providerType}/${uuid}?refresh=true`);
         
         // 局部更新该实例的卡片
         if (data && data.uuid) {
@@ -188,17 +226,7 @@ async function resetSingleInstanceUsage(providerType, uuid, displayName, buttonE
     try {
         showToast(t('common.info'), t('usage.codex.resetting', { name: displayName }), 'info');
 
-        const response = await fetch(`/api/usage/${providerType}/${uuid}/reset`, {
-            method: 'POST',
-            headers: getAuthHeaders()
-        });
-
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.error?.message || `HTTP ${response.status}`);
-        }
-
-        const data = await response.json();
+        const data = await requestUsage(`/api/usage/${providerType}/${uuid}/reset`, { method: 'POST' });
         if (data?.instance?.uuid) {
             updateSingleInstanceCard(providerType, data.instance);
         } else {
@@ -255,16 +283,16 @@ function updateSingleInstanceCard(providerType, instanceData) {
 export async function refreshProviderUsage(providerType) {
     try {
         showToast(t('usage.refreshingProvider', { name: getProviderDisplayName(providerType) }), 'info');
-        const response = await fetch(`/api/usage/${providerType}?refresh=true`, { method: 'GET', headers: getAuthHeaders() });
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({}));
-            throw new Error(errorData.error?.message || `HTTP ${response.status}`);
-        }
-        const data = await response.json();
+        const data = await requestUsage(`/api/usage/${providerType}?refresh=true`);
         
         // 如果返回了全量数据或该提供商的数据，尝试局部更新
-        if (data.providers && data.providers[providerType]) {
-            updateSingleProviderGroup(providerType, data.providers[providerType]);
+        const providerData = data.providers?.[providerType]
+            || (data.providerType === providerType && Array.isArray(data.instances) ? data : null);
+        if (providerData) {
+            // A pending page cache load must not overwrite this fresh provider.
+            ++usageLoadVersion;
+            if (!usageRefreshPromise) setUsageLoading(false);
+            updateSingleProviderGroup(providerType, providerData);
             updateTimeInfo(data);
         } else {
             await loadUsage();
@@ -451,6 +479,7 @@ function createInstanceUsageCard(instance, providerType) {
                 <div class="instance-name"><span class="instance-name-text" title="${displayName}">${displayName}</span></div>
                 <div class="instance-user-info">
                     ${user.label ? `<span class="user-email"><i class="fas fa-envelope"></i> ${user.label}</span>` : ''}
+                    <span class="instance-last-refresh"><i class="fas fa-clock"></i> ${t('usage.card.lastRefreshed', { time: formatDate(instance.lastRefreshedAt) })}</span>
                 </div>
             </div>
             <div class="usage-instance-content"></div>

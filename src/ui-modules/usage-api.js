@@ -171,6 +171,8 @@ async function getProviderTypeUsage(providerType, currentConfig, providerPoolMan
             }
         }
 
+        // 记录该账号的最后刷新时间（成功或失败都记录）
+        instanceResult.lastRefreshedAt = new Date().toISOString();
         result.instances.push(instanceResult);
     }
 
@@ -431,6 +433,7 @@ export async function handleGetSingleInstanceUsage(req, res, currentConfig, prov
             }
         }
 
+        instanceResult.lastRefreshedAt = new Date().toISOString();
         await updateSingleInstanceInCache(providerType, uuid, instanceResult);
         
         const finalResults = {
@@ -478,7 +481,8 @@ export async function handleResetSingleInstanceUsage(req, res, currentConfig, pr
             ...baseInstanceResult,
             success: true,
             usage,
-            error: null
+            error: null,
+            lastRefreshedAt: new Date().toISOString()
         };
 
         await updateProviderUsageCache(providerType, await getProviderTypeUsage(providerType, currentConfig, providerPoolManager));

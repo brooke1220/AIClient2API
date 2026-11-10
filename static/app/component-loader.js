@@ -5,6 +5,15 @@
 
 // 组件缓存
 const componentCache = new Map();
+let componentLoadState = 'idle';
+
+/**
+ * 获取整页组件的加载状态，避免把已插入的部分组件当作整页加载完成。
+ * @returns {'idle'|'loading'|'ready'|'error'}
+ */
+function getComponentLoadState() {
+    return componentLoadState;
+}
 
 /**
  * 加载单个组件
@@ -75,6 +84,7 @@ async function loadComponents(components) {
  * @returns {Promise<void>}
  */
 async function initializeComponents() {
+    componentLoadState = 'loading';
     const basePath = 'components/';
     
     // 定义组件配置
@@ -116,10 +126,12 @@ async function initializeComponents() {
         await loadComponents(sectionComponents);
         
         console.log('All components loaded successfully');
+        componentLoadState = 'ready';
         // 触发组件加载完成事件
         window.dispatchEvent(new CustomEvent('componentsLoaded'));
         
     } catch (error) {
+        componentLoadState = 'error';
         console.error('Failed to initialize components:', error);
         throw error;
     }
@@ -137,6 +149,7 @@ export {
     loadComponent,
     insertComponent,
     loadComponents,
+    getComponentLoadState,
     initializeComponents,
     clearComponentCache
 };

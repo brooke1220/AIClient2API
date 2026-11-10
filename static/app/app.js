@@ -12,6 +12,7 @@ import {
 } from './utils.js';
 
 import { t } from './i18n.js';
+import { getComponentLoadState } from './component-loader.js';
 
 import {
     initFileUpload,
@@ -274,28 +275,33 @@ function initMobileMenu() {
     });
 }
 
-// 等待组件加载完成后初始化应用
-// 组件加载器会在所有组件加载完成后触发 'componentsLoaded' 事件
-window.addEventListener('componentsLoaded', initApp);
+function initAppWhenReady() {
+    const componentState = getComponentLoadState();
+    if (componentState === 'ready') {
+        return initApp();
+    }
 
-// 如果组件已经加载完成（例如页面刷新后），也需要初始化
-// 检查是否有组件已经存在
-document.addEventListener('DOMContentLoaded', () => {
-    // 如果 sidebar 和 content 已经有内容，说明组件已加载
+    // 动态加载期间，侧栏或某个 section 先出现不代表其他按钮已存在。
+    if (componentState !== 'idle') {
+        return;
+    }
+
+    // 未使用动态组件加载器时，保留完整静态页面的初始化入口。
     const sidebarContainer = document.getElementById('sidebar-container');
     const contentContainer = document.getElementById('content-container');
-    
-    // 如果容器不存在或为空，说明使用的是组件加载方式，等待 componentsLoaded 事件
-    // 如果容器已有内容，说明是静态 HTML，直接初始化
-    if (sidebarContainer && contentContainer) {
-        const hasContent = sidebarContainer.children.length > 0 || contentContainer.children.length > 0;
-        if (hasContent) {
-            // 静态 HTML 方式，直接初始化
-            initApp();
-        }
-        // 否则等待 componentsLoaded 事件
+    if (sidebarContainer?.children.length > 0 && contentContainer?.children.length > 0) {
+        return initApp();
     }
-});
+}
+
+window.addEventListener('componentsLoaded', initAppWhenReady);
+
+// app.js 可能在组件完成或 DOMContentLoaded 之后才加载，读取状态以补上错过的事件。
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initAppWhenReady, { once: true });
+} else {
+    initAppWhenReady();
+}
 
 // 导出调试函数
 window.getProviderStats = () => getProviderStats(providerStats);
