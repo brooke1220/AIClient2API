@@ -21,6 +21,7 @@ import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { pathToFileURL } from 'node:url';
+import { lookup as dnsLookup } from 'node:dns/promises';
 import { mergeConfig } from '../utils/config-merge.js';
 import { resolveProxyUrlForProvider } from '../utils/proxy-utils.js';
 
@@ -48,7 +49,7 @@ Options:
   --rounds <n>             Measurements per variant (default: 3)
   --gap-ms <ms>            Pause between requests (default: 1000)
   --endpoint <url>         Override the upstream URL
-  --proxy <url|none>       HTTP(S) proxy (default: the account's sidecar proxy setting)
+  --proxy <url|none>       HTTP(S) or SOCKS5 proxy (default: the account's sidecar proxy setting)
   --gzip <auto|force|off>  auto: time gzip bodies only if Kiro accepts them (default)
   --json <file>            Also write the result as JSON
   --dry-run                Show settings and body sizes without sending anything
@@ -229,17 +230,35 @@ export function resolveProxy(opts, account) {
     } catch {
         fail('the proxy URL is invalid; pass --proxy <url> or --proxy none');
     }
-    if (!['http:', 'https:'].includes(url.protocol)) {
-        fail(`${url.protocol.replace(':', '')} proxies are not supported by this probe; pass an HTTP proxy with --proxy, or --proxy none`);
+    if (!['http:', 'https:', 'socks5:', 'socks5h:'].includes(url.protocol)) {
+        fail(`${url.protocol.replace(':', '')} proxies are not supported by this probe; use http, https, socks5 or socks5h, or --proxy none`);
     }
     return url;
 }
 
+const isSocks = url => url.protocol === 'socks5:' || url.protocol === 'socks5h:';
+const proxyPort = url => Number(url.port) || (isSocks(url) ? 1080 : url.protocol === 'https:' ? 443 : 80);
 const describeProxy = url => url
-    ? `${url.protocol}//${url.hostname}:${url.port || (url.protocol === 'https:' ? 443 : 80)}${url.username ? ' (with auth)' : ''}`
+    ? `${url.protocol}//${url.hostname}:${proxyPort(url)}${url.username ? ' (with auth)' : ''}`
     : 'none (direct)';
 
-// ---- transport: one keep-alive connection, optionally through an HTTP CONNECT proxy ----
+const SOCKS_REPLIES = { 1: 'general failure', 2: 'not allowed by ruleset', 3: 'network unreachable', 4: 'host unreachable',
+    5: 'connection refused', 6: 'TTL expired', 7: 'command not supported', 8: 'address type not supported' };
+
+// socks5:// resolves the target locally and socks5h:// lets the proxy resolve it, as reqwest does in the sidecar.
+async function socksTargetAddress(proxy, host, lookup) {
+    if (net.isIPv4(host)) return Buffer.from([1, ...host.split('.').map(Number)]);
+    if (net.isIP(host)) throw new Error('IPv6 targets are not supported through the SOCKS proxy');
+    if (proxy.protocol === 'socks5:') {
+        const { address } = await lookup(host, { family: 4 });
+        return Buffer.from([1, ...address.split('.').map(Number)]);
+    }
+    const name = Buffer.from(host);
+    if (name.length > 255) throw new Error('target host name is too long for SOCKS5');
+    return Buffer.concat([Buffer.from([3, name.length]), name]);
+}
+
+// ---- transport: one keep-alive connection, optionally through an HTTP CONNECT or SOCKS5 proxy ----
 
 const ignoreClosedSocketError = () => {};
 
@@ -275,16 +294,39 @@ export function tunnel(proxy, options, callback, transport = {}) {
         }
         callback(error, socket);
     };
+    const socks = isSocks(proxy);
     const target = `${options.host}:${options.port || 443}`;
     const lines = [`CONNECT ${target} HTTP/1.1`, `Host: ${target}`];
-    if (proxy.username) {
+    if (proxy.username && !socks) {
         const credentials = `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`;
         lines.push(`Proxy-Authorization: Basic ${Buffer.from(credentials).toString('base64')}`);
     }
-    const onConnect = () => raw.write(`${lines.join('\r\n')}\r\n\r\n`);
+    const socksUser = socks && proxy.username ? Buffer.from(decodeURIComponent(proxy.username)) : null;
+    const socksPass = Buffer.from(socks && proxy.password ? decodeURIComponent(proxy.password) : '');
+    let socksAddress;
+    let socksStage = 'method';
+    const sendSocksConnect = () => {
+        const port = Number(options.port) || 443;
+        raw.write(Buffer.concat([Buffer.from([5, 1, 0]), socksAddress, Buffer.from([port >> 8, port & 255])]));
+        socksStage = 'connect';
+    };
+    const onConnect = () => raw.write(socks
+        ? Buffer.from(socksUser ? [5, 2, 0, 2] : [5, 1, 0])
+        : `${lines.join('\r\n')}\r\n\r\n`);
     const onSecureConnect = () => finish(null, secure);
+    const startTls = remainder => {
+        // Preserve bytes read beyond the proxy handshake for the TLS socket.
+        if (remainder.length) raw.unshift(remainder);
+        try {
+            secure = (transport.connectTls || tls.connect)({ socket: raw, servername: options.servername || options.host });
+            secure.once('secureConnect', onSecureConnect);
+            secure.once('error', finish);
+            secure.once('end', onClosed);
+            secure.once('close', onClosed);
+        } catch (error) { finish(error); }
+    };
     let head = Buffer.alloc(0);
-    const onData = chunk => {
+    const onHttpData = chunk => {
         head = Buffer.concat([head, chunk]);
         const end = head.indexOf('\r\n\r\n');
         if (end < 0) {
@@ -300,31 +342,78 @@ export function tunnel(proxy, options, callback, transport = {}) {
             finish(new Error(`proxy CONNECT returned ${status || 'an invalid reply'}`));
             return;
         }
-        // Preserve bytes read beyond the CONNECT headers for the TLS socket.
-        const remainder = head.subarray(end + 4);
-        if (remainder.length) raw.unshift(remainder);
+        startTls(head.subarray(end + 4));
+    };
+    // RFC 1928 greeting, optional RFC 1929 username/password, then CONNECT. Replies may arrive split or merged.
+    const onSocksData = chunk => {
+        head = Buffer.concat([head, chunk]);
         try {
-            secure = (transport.connectTls || tls.connect)({ socket: raw, servername: options.servername || options.host });
-            secure.once('secureConnect', onSecureConnect);
-            secure.once('error', finish);
-            secure.once('end', onClosed);
-            secure.once('close', onClosed);
+            while (!done) {
+                if (socksStage === 'method') {
+                    if (head.length < 2) return;
+                    const [version, method] = head;
+                    head = head.subarray(2);
+                    if (version !== 5) throw new Error('the proxy did not answer as SOCKS5');
+                    if (method === 0) {
+                        sendSocksConnect();
+                    } else if (method === 2 && socksUser) {
+                        if (socksUser.length > 255 || socksPass.length > 255) throw new Error('SOCKS username or password is too long');
+                        raw.write(Buffer.concat([Buffer.from([1, socksUser.length]), socksUser, Buffer.from([socksPass.length]), socksPass]));
+                        socksStage = 'auth';
+                    } else {
+                        throw new Error(method === 0xff ? 'SOCKS proxy accepted none of the offered auth methods'
+                            : `SOCKS proxy chose unsupported auth method ${method}`);
+                    }
+                } else if (socksStage === 'auth') {
+                    if (head.length < 2) return;
+                    const status = head[1];
+                    head = head.subarray(2);
+                    if (status !== 0) throw new Error('SOCKS proxy rejected the username/password');
+                    sendSocksConnect();
+                } else {
+                    if (head.length < 5) return;
+                    if (head[0] !== 5 || head[1] !== 0) {
+                        throw new Error(`SOCKS proxy could not connect to Kiro (${SOCKS_REPLIES[head[1]] || `code ${head[1]}`})`);
+                    }
+                    const addressLength = head[3] === 1 ? 4 : head[3] === 4 ? 16 : head[3] === 3 ? 1 + head[4] : null;
+                    if (addressLength === null) throw new Error('SOCKS proxy sent an invalid reply');
+                    const total = 4 + addressLength + 2;
+                    if (head.length < total) return;
+                    raw.off('data', onData);
+                    raw.pause();
+                    startTls(head.subarray(total));
+                    return;
+                }
+            }
+        } catch (error) { finish(error); }
+    };
+    const onData = socks ? onSocksData : onHttpData;
+    const open = () => {
+        try {
+            raw = proxy.protocol === 'https:'
+                ? (transport.connectTls || tls.connect)({ host: proxy.hostname, port: proxyPort(proxy), servername: proxy.hostname })
+                : (transport.connect || net.connect)({ host: proxy.hostname, port: proxyPort(proxy) });
+            raw.once('error', finish);
+            raw.once('end', onClosed);
+            raw.once('close', onClosed);
+            raw.once(proxy.protocol === 'https:' ? 'secureConnect' : 'connect', onConnect);
+            raw.on('data', onData);
         } catch (error) { finish(error); }
     };
     if (signal?.aborted) { onAbort(); return; }
-    const port = Number(proxy.port) || (proxy.protocol === 'https:' ? 443 : 80);
-    try {
-        raw = proxy.protocol === 'https:'
-            ? (transport.connectTls || tls.connect)({ host: proxy.hostname, port, servername: proxy.hostname })
-            : (transport.connect || net.connect)({ host: proxy.hostname, port });
-        raw.once('error', finish);
-        raw.once('end', onClosed);
-        raw.once('close', onClosed);
-        raw.once(proxy.protocol === 'https:' ? 'secureConnect' : 'connect', onConnect);
-        raw.on('data', onData);
+    if (socks) {
+        // The SOCKS request needs the target address first; a local DNS wait is cancellable too.
         signal?.addEventListener('abort', onAbort, { once: true });
-        if (signal?.aborted) onAbort();
-    } catch (error) { finish(error); }
+        socksTargetAddress(proxy, options.host, transport.lookup || dnsLookup).then(address => {
+            if (done) return;
+            socksAddress = address;
+            open();
+        }, error => finish(new Error(`cannot resolve ${options.host} for the SOCKS proxy: ${error.message}`)));
+        return;
+    }
+    open();
+    if (!done) signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
 }
 
 export function createAgent(proxy, transport = {}) {

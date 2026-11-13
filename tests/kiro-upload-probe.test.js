@@ -197,3 +197,112 @@ test('the CLI entry point still prints help without reading credentials or sendi
     expect(output).toContain('Usage: node src/scripts/kiro-upload-probe.mjs');
     expect(output).toContain('--proxy <url|none>');
 });
+
+// ---- SOCKS5 (the kiro-sidecar sends socks5:// and socks5h:// proxies through reqwest) ----
+
+const flush = () => new Promise(resolve => setImmediate(resolve));
+const socksTransport = lookup => {
+    const raw = fakeSocket(), secure = fakeSocket();
+    const transport = {
+        connect: jest.fn(() => raw),
+        connectTls: jest.fn(options => options.socket ? secure : raw),
+        lookup: lookup || jest.fn(async () => ({ address: '203.0.113.7', family: 4 }))
+    };
+    return { raw, secure, transport };
+};
+const kiroTarget = { host: 'q.us-east-1.amazonaws.com', port: 443 };
+const socksOk = Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+
+test.each(['socks5://127.0.0.1:1080', 'socks5h://127.0.0.1:1080'])('accepts %s from the production proxy route', value => {
+    expect(resolveProxy({ proxy: null }, { config: { PROXY_URL: value }, node: {} }).protocol).toBe(value.split('//')[0]);
+});
+
+test('socks5h sends the host name to the proxy, handles split replies and keeps extra bytes for TLS', async () => {
+    const { raw, secure, transport } = socksTransport();
+    const callback = jest.fn();
+    tunnel(new URL('socks5h://127.0.0.1:1080'), { ...kiroTarget }, callback, transport);
+    await flush();
+    expect(transport.lookup).not.toHaveBeenCalled();
+    expect(transport.connect).toHaveBeenCalledWith({ host: '127.0.0.1', port: 1080 });
+    raw.emit('connect');
+    expect(raw.write).toHaveBeenLastCalledWith(Buffer.from([5, 1, 0]));
+    raw.emit('data', Buffer.from([5]));
+    raw.emit('data', Buffer.from([0]));
+    const name = Buffer.from(kiroTarget.host);
+    expect(raw.write).toHaveBeenLastCalledWith(Buffer.concat([Buffer.from([5, 1, 0, 3, name.length]), name, Buffer.from([1, 187])]));
+    const extra = Buffer.from([0x16, 3, 1]);
+    raw.emit('data', socksOk.subarray(0, 3));
+    raw.emit('data', Buffer.concat([socksOk.subarray(3), extra]));
+    expect(raw.pause).toHaveBeenCalled();
+    expect(raw.unshift).toHaveBeenCalledWith(extra);
+    expect(transport.connectTls).toHaveBeenCalledWith({ socket: raw, servername: kiroTarget.host });
+    secure.emit('secureConnect');
+    expect(callback).toHaveBeenCalledWith(null, secure);
+    expect(raw.listenerCount('data')).toBe(0);
+});
+
+test('socks5 resolves the host locally and sends decoded username/password credentials', async () => {
+    const { raw, transport } = socksTransport();
+    tunnel(new URL('socks5://u%40x:p%3Aw@127.0.0.1:7891'), { ...kiroTarget }, jest.fn(), transport);
+    await flush();
+    expect(transport.lookup).toHaveBeenCalledWith(kiroTarget.host, { family: 4 });
+    expect(transport.connect).toHaveBeenCalledWith({ host: '127.0.0.1', port: 7891 });
+    raw.emit('connect');
+    expect(raw.write).toHaveBeenLastCalledWith(Buffer.from([5, 2, 0, 2]));
+    raw.emit('data', Buffer.from([5, 2]));
+    expect(raw.write).toHaveBeenLastCalledWith(Buffer.from([1, 3, ...Buffer.from('u@x'), 3, ...Buffer.from('p:w')]));
+    raw.emit('data', Buffer.from([1, 0]));
+    expect(raw.write).toHaveBeenLastCalledWith(Buffer.from([5, 1, 0, 1, 203, 0, 113, 7, 1, 187]));
+});
+
+test.each([
+    ['a refused CONNECT', [Buffer.from([5, 0]), Buffer.from([5, 5, 0, 1, 0, 0, 0, 0, 0, 0])], /connection refused/],
+    ['no acceptable auth method', [Buffer.from([5, 0xff])], /none of the offered auth methods/],
+    ['a non-SOCKS5 reply', [Buffer.from('HTTP/1.1 400 Bad Request\r\n\r\n')], /did not answer as SOCKS5/]
+])('%s fails the tunnel and closes the proxy socket', async (name, replies, message) => {
+    const { raw, transport } = socksTransport();
+    const callback = jest.fn();
+    tunnel(new URL('socks5h://127.0.0.1:1080'), { ...kiroTarget }, callback, transport);
+    await flush();
+    raw.emit('connect');
+    for (const reply of replies) raw.emit('data', reply);
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(callback.mock.calls[0][0].message).toMatch(message);
+    expect(raw.destroy).toHaveBeenCalledTimes(1);
+    expect(transport.connectTls).not.toHaveBeenCalled();
+});
+
+test('rejected SOCKS credentials fail without starting TLS', async () => {
+    const { raw, transport } = socksTransport();
+    const callback = jest.fn();
+    tunnel(new URL('socks5h://user:wrong@127.0.0.1:1080'), { ...kiroTarget }, callback, transport);
+    await flush();
+    raw.emit('connect');
+    raw.emit('data', Buffer.from([5, 2, 1, 1]));
+    expect(callback.mock.calls[0][0].message).toMatch(/rejected the username\/password/);
+    expect(transport.connectTls).not.toHaveBeenCalled();
+});
+
+test('cancellation during the local DNS wait never opens the proxy connection', async () => {
+    let resolveLookup;
+    const lookup = jest.fn(() => new Promise(resolve => { resolveLookup = resolve; }));
+    const { transport } = socksTransport(lookup);
+    const controller = new AbortController(), callback = jest.fn();
+    tunnel(new URL('socks5://127.0.0.1:1080'), { ...kiroTarget, kiroProbeSignal: controller.signal }, callback, transport);
+    controller.abort(new Error('deadline'));
+    resolveLookup({ address: '203.0.113.7', family: 4 });
+    await flush();
+    expect(callback).toHaveBeenCalledTimes(1);
+    expect(callback.mock.calls[0][0].message).toBe('deadline');
+    expect(transport.connect).not.toHaveBeenCalled();
+    expect(getEventListeners(controller.signal, 'abort')).toHaveLength(0);
+});
+
+test('a failed local DNS lookup is reported without opening the proxy connection', async () => {
+    const { transport } = socksTransport(jest.fn(async () => { throw new Error('ENOTFOUND'); }));
+    const callback = jest.fn();
+    tunnel(new URL('socks5://127.0.0.1:1080'), { ...kiroTarget }, callback, transport);
+    await flush();
+    expect(callback.mock.calls[0][0].message).toMatch(/cannot resolve q\.us-east-1\.amazonaws\.com.*ENOTFOUND/);
+    expect(transport.connect).not.toHaveBeenCalled();
+});
