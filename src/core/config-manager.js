@@ -129,6 +129,9 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
         CRON_REFRESH_TOKEN: false,
         KIRO_DYNAMIC_MODELS: false,
         KIRO_CC_BUFFERED: false,
+        KIRO_TOOL_STREAM_MODE: 'validated', // validated | incremental; trusted supported live protocols only
+        KIRO_MAX_TOOL_STREAM_QUEUE_BYTES: 4 * 1024 * 1024,
+        KIRO_MAX_TOOL_STREAM_QUEUE_EVENTS: 4096,
         KIRO_MAX_BUFFERED_RESPONSE_BYTES: 32 * 1024 * 1024,
         KIRO_SESSION_AFFINITY: true,
         KIRO_ACCOUNT_MIN_INTERVAL_MS: 0,
@@ -282,6 +285,7 @@ export async function initializeConfig(args = process.argv.slice(2), configFileP
 
     normalizeRequestBodyMaxBytes(currentConfig);
     normalizeConfiguredProviders(currentConfig);
+    if (!['validated', 'incremental'].includes(currentConfig.KIRO_TOOL_STREAM_MODE)) currentConfig.KIRO_TOOL_STREAM_MODE = 'validated';
 
     if (!currentConfig.SYSTEM_PROMPT_FILE_PATH) {
         currentConfig.SYSTEM_PROMPT_FILE_PATH = INPUT_SYSTEM_PROMPT_FILE;

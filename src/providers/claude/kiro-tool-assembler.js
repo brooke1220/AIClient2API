@@ -24,6 +24,7 @@ export class KiroToolAssembler {
     }
 
     feed(event, { legacy = false } = {}) {
+        this.lastUpdatedCall = null;
         let id = event.toolUseId;
         if (!id && event.name) id = `tool_${uuidv4()}`;
         if (!id) {
@@ -40,7 +41,10 @@ export class KiroToolAssembler {
             this.calls.set(id, previous);
             call = previous;
         }
-        if (call?.done && event.stop && !event.input && (!event.name || event.name === call.name)) return [];
+        if (call?.done && event.stop && !event.input && (!event.name || event.name === call.name)) {
+            this.lastUpdatedCall = call;
+            return [];
+        }
         if (!call && event.name) {
             // A legacy opening fragment may receive its real ID later.
             const previous = legacy ? null : this.calls.get(this.lastId);
@@ -52,7 +56,7 @@ export class KiroToolAssembler {
             } else {
                 if (this.order.length >= this.maxCalls) throw kiroIntegrityError('tool call count limit exceeded');
                 call = { id, name: event.name, arguments: '', argumentBytes: 0, trailingHighSurrogate: false,
-                    done: false, synthetic: !event.toolUseId, legacy };
+                    done: false, synthetic: !event.toolUseId, legacy, callKey: this.order.length + 1 };
                 this.order.push(call);
                 // The ordinal survives a later ID migration because it lives on the call.
                 if (this.clock) call.trace = { callKey: this.order.length, native: !legacy };
@@ -60,6 +64,7 @@ export class KiroToolAssembler {
             this.calls.set(id, call);
         }
         if (!call || call.done) throw kiroIntegrityError('orphan or completed tool fragment');
+        this.lastUpdatedCall = call;
         if (event.name && event.name !== call.name) throw kiroIntegrityError('tool name changed within a call');
         if (!legacy) this.lastId = id;
         if (call.trace && !call.synthetic) call.trace.identityMs ??= this.clock();
@@ -71,6 +76,11 @@ export class KiroToolAssembler {
                     if (this.stats && call.trace?.stringFragments) {
                         this.stats.objectAfterString++;
                         if (serialized.startsWith(call.arguments)) this.stats.prefixMatch++;
+                    }
+                    if (call.outputCharacters > 0 && !serialized.startsWith(call.arguments.slice(0, call.outputCharacters))) {
+                        const error = kiroIntegrityError('tool argument snapshot conflicts with emitted prefix');
+                        error.recoveryHint = 'The failed tool call may be incomplete. Do not execute or repair its arguments, or replay earlier completed calls; use actual tool results to determine execution status.';
+                        throw error;
                     }
                     if (hasKiroToolArguments(serialized)) this.markArgs(call);
                     call.arguments = serialized;
@@ -101,8 +111,30 @@ export class KiroToolAssembler {
         return this.drain();
     }
 
+    /** The same state machine, exposing a stable call reference for live scheduling. */
+    feedUpdates(event, options) {
+        try {
+            const completed = this.feed(event, options);
+            return { call: this.lastUpdatedCall, completed };
+        } catch (error) {
+            if (this.lastUpdatedCall) error.kiroToolCallId = this.lastUpdatedCall.id;
+            throw error;
+        }
+    }
+
+    finishUpdates() {
+        try {
+            const completed = this.finish();
+            return { calls: this.order, completed };
+        } catch (error) {
+            if (this.lastUpdatedCall) error.kiroToolCallId = this.lastUpdatedCall.id;
+            throw error;
+        }
+    }
+
     /** First non-empty arguments: record whether identity was ready and an earlier call was still open. */
     markArgs(call) {
+        call.hasMeaningfulArguments = true;
         const trace = call.trace;
         if (!trace || trace.firstArgsMs !== undefined) return;
         trace.firstArgsMs = this.clock();
@@ -144,6 +176,7 @@ export class KiroToolAssembler {
     finish() {
         for (const call of this.order) {
             if (!call.done) {
+                this.lastUpdatedCall = call;
                 if (!call.arguments) throw kiroIntegrityError('unfinished empty tool call');
                 this.complete(call);
             }

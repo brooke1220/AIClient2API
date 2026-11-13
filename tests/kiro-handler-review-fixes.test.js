@@ -277,9 +277,13 @@ describe('Kiro request timing covers account selection', () => {
         expect(options.kiroTiming.startedAt).toBeGreaterThanOrEqual(before);
         expect(options.kiroTiming.startedAt).toBeLessThanOrEqual(waitStarted);
         expect(sentBody).not.toHaveProperty('kiroTiming');
+        expect(sentBody).not.toHaveProperty('bodyTiming');
         const logs = logger.info.mock.calls.map(([message]) => message).filter(message => message.startsWith('[Kiro Timing]'));
         const preparation = logs.find(message => message.includes('Request preparation:'));
         expect(Number(preparation.match(/account selection: (\d+)ms/)[1])).toBeGreaterThanOrEqual(Math.floor(waitedMs));
+        const bodyLog = logs.find(message => message.includes('Request body:'));
+        expect(bodyLog).toMatch(/bytes: \d+; chunks: 1; first data: \d+ms; end: \d+ms; concat\/decode: \d+ms; JSON parse: \d+ms/);
+        expect(bodyLog).not.toContain('hello');
         expect(logs.filter(message => message.includes('First downstream event accepted:'))).toHaveLength(1);
         const textLogs = logs.filter(message => message.includes('First downstream text accepted:'));
         expect(textLogs).toHaveLength(1);

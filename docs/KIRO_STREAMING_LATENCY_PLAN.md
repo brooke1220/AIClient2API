@@ -2,7 +2,7 @@
 
 日期：2026-11-05
 
-状态：第一批（分段计时）已于 2026-11-05 实施，日志字段见 [Kiro 生产保护与兼容性开关](KIRO_PRODUCTION_SAFETY.md) 的 `KIRO_REQUEST_TRACE`；输出方式不变。测试实例上的大参数工具探测与线上基线尚未采集。第二批起（`KIRO_TOOL_STREAM_MODE`、增量输出等）仍为拟议设计，不能视为当前版本已经支持。
+状态：第一批（分段计时）已于 2026-11-05 实施。第二批的可选 `KIRO_TOOL_STREAM_MODE=incremental` 已于 2026-11-13 实施并使用本地开放模拟上游验证首段真实参数在 stop/EOF 前输出；默认仍为 validated。原生工具、快照冲突、交错调度、预算、取消及入口隔离的回归见 `tests/kiro-tool-incremental.test.js`。本地测试不代表线上灰度验收；尚未通过真实 CLIProxyAPI 链路做参数增量对照，也未采集完整上游首参配对基线。配置、失败语义与客户端执行前提见 [Kiro 生产保护与兼容性开关](KIRO_PRODUCTION_SAFETY.md)。下文“拟议”部分保留设计背景，实施与线上验收状态以本段为准。
 
 ## 目标与范围
 

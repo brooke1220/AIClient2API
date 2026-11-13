@@ -838,7 +838,7 @@ export function getClientIp(req, config = {}) {
 /**
  * Reads the entire request body from an HTTP request.
  * @param {http.IncomingMessage} req - The HTTP request object.
- * @param {{ maxBytes?: number }} options - Optional body limits.
+ * @param {{ maxBytes?: number, signal?: AbortSignal, timing?: Object }} options - Optional limits, cancellation and numeric timing sink.
  * @returns {Promise<Object>} A promise that resolves with the parsed JSON request body.
  * @throws {Error} If the request body is not valid JSON.
  */
@@ -849,6 +849,13 @@ export function getRequestBody(req, options = {}) {
         let receivedBytes = 0;
         let settled = false;
         const maxBytes = Number(options.maxBytes) > 0 ? Number(options.maxBytes) : DEFAULT_REQUEST_BODY_MAX_BYTES;
+        const { signal, timing } = options;
+        const readStartedAt = timing ? performance.now() : 0;
+        if (timing) Object.assign(timing, { bytes: 0, chunks: 0, firstDataMs: null, endMs: null, concatDecodeMs: 0, jsonParseMs: 0 });
+        const cleanup = () => {
+            signal?.removeEventListener('abort', onAbort);
+            req.off?.('aborted', onAborted);
+        };
 
         // 1. Quick check Content-Length header
         const headers = req.headers || {};
@@ -864,6 +871,8 @@ export function getRequestBody(req, options = {}) {
         const fail = (error) => {
             if (settled) return;
             settled = true;
+            cleanup();
+            chunks.length = 0;
             if (typeof req.destroy === 'function') {
                 req.destroy();
             }
@@ -873,15 +882,25 @@ export function getRequestBody(req, options = {}) {
         const rejectTooLarge = (error) => {
             if (settled) return;
             settled = true;
+            cleanup();
+            chunks.length = 0;
             if (typeof req.resume === 'function') {
                 req.resume();
             }
             reject(error);
         };
 
+        const onAbort = () => fail(signal.reason || new Error('Request body aborted'));
+        const onAborted = () => fail(Object.assign(new Error('Request body aborted'), { code: 'ECONNABORTED' }));
         req.on('data', chunk => {
             if (settled) return;
-            receivedBytes += chunk.length;
+            const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : chunk;
+            receivedBytes += bytes.length;
+            if (timing) {
+                timing.firstDataMs ??= performance.now() - readStartedAt;
+                timing.bytes = receivedBytes;
+                timing.chunks++;
+            }
             if (maxBytes && receivedBytes > maxBytes) {
                 const error = new Error(`Request body too large. Maximum size is ${maxBytes} bytes.`);
                 error.statusCode = 413;
@@ -889,24 +908,36 @@ export function getRequestBody(req, options = {}) {
                 rejectTooLarge(error);
                 return;
             }
-            chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+            chunks.push(bytes);
         });
         req.on('end', () => {
             if (settled) return;
             settled = true;
+            cleanup();
+            const endedAt = timing ? performance.now() : 0;
+            if (timing) timing.endMs = endedAt - readStartedAt;
             const body = Buffer.concat(chunks).toString('utf8');
+            chunks.length = 0;
+            if (timing) timing.concatDecodeMs = performance.now() - endedAt;
             if (!body) {
                 return resolve({});
             }
+            const parseStartedAt = timing ? performance.now() : 0;
             try {
                 resolve(JSON.parse(body));
             } catch (error) {
                 reject(new Error("Invalid JSON in request body."));
+            } finally {
+                if (timing) timing.jsonParseMs = performance.now() - parseStartedAt;
             }
         });
         req.on('error', err => {
             fail(err);
         });
+        req.on('aborted', onAborted);
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+        else if (req.aborted) onAborted();
     });
 }
 
@@ -1150,6 +1181,9 @@ export async function handleStreamRequest(res, service, model, requestBody, from
     let fullOldResponseJson = '';
     let responseClosed = false;
     let anyDataSent = retryContext?.anyDataSent || false; // 跟踪是否已向客户端发送过任何数据
+    const kiroWrittenToolIds = new Set();
+    const kiroOpenToolIds = new Set();
+    const kiroNativeToolIds = new Map();
     const upstreamAbortController = retryContext?.upstreamAbortController || new AbortController();
     // All credential/empty-response retries share the client's cancellation.
     retryContext = { ...retryContext, upstreamAbortController };
@@ -1255,9 +1289,17 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         return operation;
     };
 
-    const onModelEventWritten = (chunk, record, toolTrace) => {
+    const onModelEventWritten = (chunk, record, toolTrace, nativeToolId) => {
         anyDataSent = true;
         if (!kiroTiming) return;
+        // Update only after res.write accepted the client record, including converted protocols.
+        if (chunk.type === 'content_block_start' && ['tool_use', 'server_tool_use'].includes(chunk.content_block?.type)
+            || chunk.type === 'content_block_delta' && chunk.delta?.type === 'input_json_delta'
+            || chunk.choices?.some(choice => choice.delta?.tool_calls?.length)
+            || chunk.type === 'response.output_item.added' && chunk.item?.type === 'function_call'
+            || chunk.type === 'response.function_call_arguments.delta') {
+            if (nativeToolId) { kiroWrittenToolIds.add(nativeToolId); kiroOpenToolIds.add(nativeToolId); }
+        }
         // res.write accepted the record; this does not measure client receipt.
         if (!kiroTiming.firstEventWritten) {
             kiroTiming.firstEventWritten = true;
@@ -1590,6 +1632,19 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                 logger.info('[Stream] Stopping iteration due to client disconnect');
                 break;
             }
+
+            let nativeToolId;
+            if (isKiroStream) {
+                if (nativeChunk?.type === 'content_block_start' && ['tool_use', 'server_tool_use'].includes(nativeChunk.content_block?.type)) {
+                    nativeToolId = nativeChunk.content_block.id;
+                    kiroNativeToolIds.set(nativeChunk.index, nativeToolId);
+                } else if (nativeChunk?.type === 'content_block_delta' && nativeChunk.delta?.type === 'input_json_delta') {
+                    nativeToolId = kiroNativeToolIds.get(nativeChunk.index);
+                } else if (nativeChunk?.type === 'content_block_stop') {
+                    kiroOpenToolIds.delete(kiroNativeToolIds.get(nativeChunk.index));
+                    kiroNativeToolIds.delete(nativeChunk.index);
+                }
+            }
             
             // 由协议策略识别原生终止失败；必须在转换和写入客户端之前抛出，
             // 才能安全重试且不会把失败伪装成成功的结束帧。
@@ -1723,7 +1778,7 @@ export async function handleStreamRequest(res, service, model, requestBody, from
                     try {
                         const eventHeader = isKiroStream && addEvent ? `event: ${chunk.type}\n` : '';
                         const record = `${eventHeader}data: ${JSON.stringify(chunk)}\n\n`;
-                        await writeStreamRecord(record, () => onModelEventWritten(chunk, record, toolTrace));
+                        await writeStreamRecord(record, () => onModelEventWritten(chunk, record, toolTrace, nativeToolId));
                         if (clientProtocol === MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES) {
                             const sequence = chunk?.sequence_number;
                             nextResponseSequenceNumber = Number.isInteger(sequence) && sequence >= 0
@@ -1775,6 +1830,24 @@ export async function handleStreamRequest(res, service, model, requestBody, from
         }
         // Cover every terminal error branch; a successful retry resets this.
         if (retryContext.kiroTiming) retryContext.kiroTiming.downstreamError = true;
+
+        // A block still open on the wire is incomplete regardless of which call the
+        // error names: a later call can fail while an earlier one is mid-arguments.
+        const partialToolDataSent = kiroOpenToolIds.size > 0
+            || typeof error.kiroToolCallId === 'string' && kiroWrittenToolIds.has(error.kiroToolCallId);
+        if (isKiroStream && error.kiroIncrementalToolFailure && partialToolDataSent) {
+            const unsentClaim = 'No malformed tool call was emitted.';
+            const partialNotice = 'Partial tool data was already sent. Do not execute incomplete arguments or automatically replay earlier tool calls.';
+            // Preserve specific recovery advice (for example a conflicting snapshot),
+            // and correct the validated-mode assertion using this writer's actual state.
+            const hint = typeof error.recoveryHint === 'string' ? error.recoveryHint : '';
+            error.recoveryHint = hint.includes(unsentClaim) ? hint.replace(unsentClaim, partialNotice)
+                : hint.includes(partialNotice) ? hint : `${hint}${hint ? ' ' : ''}${partialNotice}`;
+            if (typeof error.message === 'string') {
+                error.message = error.message.includes(unsentClaim) ? error.message.replace(unsentClaim, partialNotice)
+                    : error.message.includes(partialNotice) ? error.message : `${error.message} ${partialNotice}`;
+            }
+        }
 
         if (error.isKiroAccountUnavailable) logger.info(`[Stream] Kiro account unavailable (${error.kiroUnavailableReason}); evaluating recovery`);
         else logger.error('\n[Server] Error during stream processing:', error.stack);
@@ -2519,7 +2592,10 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
     let ownedSlotLease = null;
     try {
         cancellation.controller.signal.throwIfAborted();
-        const originalRequestBody = await getRequestBody(req, { maxBytes: CONFIG.REQUEST_BODY_MAX_BYTES });
+        const bodyTiming = {};
+        const originalRequestBody = await getRequestBody(req, {
+            maxBytes: CONFIG.REQUEST_BODY_MAX_BYTES, signal: cancellation.controller.signal, timing: bodyTiming
+        });
         const bodyReadFinishedAt = performance.now();
 
         if (!originalRequestBody) {
@@ -2675,6 +2751,7 @@ export async function handleContentGenerationRequest(req, res, service, endpoint
         const retryContext = { CONFIG, currentRetry: 0, maxRetries: credentialSwitchMaxRetries, slotLease: ownedSlotLease, upstreamAbortController: cancellation.controller, kiroSession, kiroTiming: { startedAt: requestStartedAt } };
         if (isStream && isKiroProviderType(toProvider)) {
             logger.info(`[Kiro Timing] Request preparation: body: ${Math.round(bodyReadFinishedAt - requestStartedAt)}ms; account selection: ${Math.round(selectionMs)}ms; preprocessing: ${Math.round(performance.now() - preprocessingStartedAt)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
+            logger.info(`[Kiro Timing] Request body: bytes: ${bodyTiming.bytes}; chunks: ${bodyTiming.chunks}; first data: ${bodyTiming.firstDataMs === null ? 'none' : `${Math.round(bodyTiming.firstDataMs)}ms`}; end: ${Math.round(bodyTiming.endMs)}ms; concat/decode: ${Math.round(bodyTiming.concatDecodeMs)}ms; JSON parse: ${Math.round(bodyTiming.jsonParseMs)}ms`);
         }
     
         if (isStream) {

@@ -4,6 +4,7 @@ import { AntigravityApiService } from './gemini/antigravity-core.js';
 import { OpenAIApiService } from './openai/openai-core.js';
 import { ClaudeApiService } from './claude/claude-core.js';
 import { KiroApiService } from './claude/claude-kiro.js';
+import { resolveKiroToolStreamMode } from './claude/kiro-tool-stream.js';
 import { QwenApiService } from './openai/qwen-core.js';
 import { IFlowApiService } from './openai/iflow-core.js';
 import { CodexApiService } from './openai/codex-core.js';
@@ -383,7 +384,8 @@ export class KiroApiServiceAdapter extends ApiServiceAdapter {
             yield* this.kiroApiService.generateContentStreamBuffered(model, requestBody, options);
         } else {
             // Initialization and cancellation are handled together by the service.
-            yield* this.kiroApiService.generateContentStream(model, requestBody, options);
+            const kiroToolStreamMode = resolveKiroToolStreamMode(this.kiroApiService.config, options);
+            yield* this.kiroApiService.generateContentStream(model, requestBody, { ...options, kiroToolStreamMode });
         }
     }
 

@@ -102,6 +102,6 @@ export function logKiroToolTrace(timing, assembler) {
             firstWriteMs: trace.firstWriteMs, backpressure: trace.backpressure, waitMs, gateSample };
     });
     logger.info(`[Kiro Tool Trace] ${JSON.stringify({ requestId: timing.traceId, attempt: timing.attempt, mode: timing.mode,
-        toolGate: timing.toolGate === true, snapshots: stats, callCount: order.length,
+        toolGate: timing.toolGate === true, toolStreamMode: timing.toolStreamMode || 'validated', snapshots: stats, callCount: order.length,
         truncated: Math.max(0, order.length - MAX_TRACED_TOOL_CALLS), calls })}`);
 }

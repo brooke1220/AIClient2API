@@ -4,7 +4,9 @@
 
 ## 默认生效的保护
 
-- `/cc/v1/messages` 与普通消息端点默认实时输出。`message_start.usage` 先提供估算值（开启缓存 `estimate` 模式时输入与缓存改为零占位），最终用量在 `message_delta.usage` 更新；要求起始事件携带最终输入用量的旧客户端可以显式开启缓冲。本地输入估算只在收到上游响应头后、等待首个事件期间计算，不再推迟上游请求的发出；`[Kiro Stream] Upstream headers` 日志的 `input estimate` 记录其耗时。
+- `/cc/v1/messages` 与普通消息端点默认实时输出。`message_start.usage` 先提供估算值（开启缓存 `estimate` 模式时输入与缓存改为零占位），最终用量在 `message_delta.usage` 更新；要求起始事件携带最终输入用量的旧客户端可以显式开启缓冲。普通模式的本地输入估算在上游调用发起后交给独立线程，与上游等待重叠，起始用量继续等待该结果；`estimate` 模式仅在缺少必要上游用量时启动这项估算。缺失输出用量时，同样在线程中计算完整正文和各次完整工具参数，不累加任意 Token 片段的分词结果。完整原生用量优先。
+- 后台计数器复用一个线程和分词器，活动及排队任务合计最多 32 个、文本合计最多 32 Mi UTF-16 字符，活动任务期限 15 秒。线程不可用、任务超限或超时，使用原有长度估算并记录限频警告，不回到主线程同步分词；该退化结果仍属于本地估算。取消排队任务会释放文本，取消活动任务会停止对应线程，队列中的其它请求交给替代线程。退出服务时清理任务和线程。缓存前缀剖面的计数仍使用原有独立的有界哈希记忆。
+- `[Kiro Timing] Background input estimate` 记录后台输入计数的墙钟耗时，包含等待线程的时间；`[Kiro Stream] Upstream headers` 中的 `header hook` 仅表示兼容观察钩子的耗时，不再代表输入计数。`[Kiro Timing] Request body` 记录接收字节数、chunk 数、首片与结束的相对时间，以及拼接/解码、JSON 解析耗时；首片与结束均相对开始读取计算，原 `Request preparation.body` 总指标保留。这些值可区分接收等待与本地解析，但不能直接等同网络上传耗时。
 - thinking 兼容标签只保留可能构成未完成标签的尾部及相邻引号，不再固定积压末尾 10–11 个字符；短正文和短思考片段无需等待下一段或 EOF。跨片段的标签、引用标签和 CRLF 分隔符仍保留语义；片段末尾的反斜杠留到下一段，跨片段的 `\n` 转义仍解码为换行。
 - 原生 `metadataEvent.tokenUsage` 的非缓存输入、输出、缓存读取和缓存写入分别映射到 Claude 用量字段。同一调用的重复快照取最新有效值，不累加；缺失或非法字段保留已知值或原有估算。OpenAI/Responses 输入总数包含缓存读取和写入，缓存读取仍单独列出。
 - `CONTENT_FILTERED` 输出明确的拒答与 `stop_reason=refusal`，不会作为损坏流重试。原生思考签名和隐藏思考内容在 Claude 流式与非流式响应中保留；OpenAI Chat 使用 `finish_reason=content_filter`，Responses 使用 `incomplete_details.reason=content_filter`。
@@ -17,12 +19,16 @@
 - 换号重试优先选择本次请求尚未离开过的账号。5xx、403 等错误不会把账号标记为不健康，若不这样处理，会话绑定会把请求送回刚失败的账号。已离开的账号通过插槽租约持续追踪，在实际选号时读取当前 UUID；重试抖动、等待选号和后续重试期间的 UUID 轮换不会丢失历史，同请求体重试也保留这份历史。其它账号都不健康、被排除或不存在时回到原账号。其它账号并发已满时，配置了 `queueLimit` 且队列未满的账号会让请求排队等待；都没有队列空位（默认 `queueLimit=0`）时回到原账号，不会因为抢不到槽位而失败。
 - 空响应等同请求体重试的第一次保留会话绑定，绑定账号可用时继续使用它及其提示词缓存，但不回到本次请求已经离开过的账号。本次请求已经用过一次同请求体重试后再失败时（重试次数按整个请求计，换号后不重新计算），下一次重试优先选择其它账号。上游尝试超时（首事件、流空闲、总时长）例外：会话绑定在收到响应头时建立，卡住的正是绑定账号，因此这类重试优先选择其它账号。
 - 图片按实际字节识别 PNG/JPEG/GIF/WebP，并验证可解码性；声明 MIME 不一致时纠正格式。默认将大图限制在长边 1568 像素、base64 400000 字节内；转换为 JPEG 时保持比例、透明区域铺白底。需要重编码的动画只保留首帧。源字节与解码像素都有预算，损坏图片在请求上游前返回 400，源体积超限或无法满足输出预算返回 413。
+- 已成功验证和规范化的图片在进程内缓存 5 分钟，最多 128 项、32 MiB 规范化 base64 内容及键/格式字节；缓存键包括源图片内容与全部四项图片处理限制。最多合并 32 项相同图片的在途处理，单请求仍按顺序处理图片。每次仍验证源字节、base64 和格式，限制变化不能复用旧结果。一个等待者取消不影响其他请求，所有等待者取消后不写入缓存；失败结果不缓存，过期和超预算条目被释放。重启后清空，多进程各自维护缓存。
 - 工具缺少描述时使用工具名，保留参数 schema 的必填、枚举、组合与长度等约束。
 
-- 校验 prelude CRC 与 message CRC、帧头边界及 JSON；异常帧和 EOF 残帧不会被正常收尾。
+- 校验 prelude CRC 与 message CRC、帧头边界及 JSON；异常帧和 EOF 残帧不会被正常收尾。完整连续帧无需复制到累积缓冲区，跨 chunk 的单帧使用几何扩容，避免小片段反复复制已有前缀；分配量受已校验的单帧长度约束。详细边界与复制量实验见 [帧缓冲说明](KIRO_FRAME_BUFFER.md)。
 - 流内异常帧没有 HTTP 状态码，按异常类型对应到 HTTP 处理。与 Kiro IDE 一致，类型可以出现在 `:exception-type`，也可以是普通事件帧的 `:event-type`；两种写法都识别（`ValidationException`/`validationError`、`ThrottlingException`/`throttlingError`、`InternalServerException`/`error`、`ServiceUnavailableException`/`serviceUnavailableError`，不区分大小写），这类事件帧不会被当作未知事件丢弃。`ValidationException` 返回 400，不重放、不换号、不处罚账号；`reason` 为 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`，或消息包含 “input is too long”、“prompt is too long”、“input content length exceeds threshold” 时，与 HTTP 路径一样返回 413，客户端可据此压缩上下文（HTTP 400 同样按这些消息识别）。`ThrottlingException` 不用同一请求体原样重放，载荷中的 `reason` 按 HTTP 429 的同一规则分类：容量不足直接返回 429，不处罚账号也不换号；明确账号限流、用量上限和新用户暂停按账号限流冷却并换号；没有可识别的 `reason` 时按未分类的 429 换号，等待 0–10 秒抖动，开启 `RATE_LIMIT_COOLDOWN_ENABLED` 时账号进入通用冷却。载荷中的 `retryAfterMilliseconds` 用于冷却，并作为 `Retry-After`（非流式）或错误事件的 `retry_after`（SSE）返回。`InternalServerException` 或 `ServiceUnavailableException` 的 `reason` 为 `MODEL_TEMPORARILY_UNAVAILABLE` 时与 HTTP 路径一样返回 503，不重放、不换号，未给重试时间时默认 5 秒。流内异常没有 HTTP 响应，因此不会先等 `REQUEST_BASE_DELAY`。其它异常（如没有上述 `reason` 的 `InternalServerException`）保留原有的同请求体重试。已向客户端输出内容后，任何异常都不重试。
 - 相同文本增量仍逐段保留，不以字符串相等判定重发。
-- 按工具调用 ID 缓冲并验证参数，按到达顺序输出合法、无重叠的 Claude 内容块。文本保持实时；工具参数在完整校验后输出，避免下游执行截断参数。
+- 默认按工具调用 ID 缓冲并验证参数，按到达顺序输出合法、无重叠的 Claude 内容块。`KIRO_TOOL_STREAM_MODE=validated` 保持工具参数完整校验后输出；`incremental` 只为可信入口确认的 Claude、Chat Completions、Responses 普通实时流开启原生工具参数增量输出。非流式、显式整段缓冲、Gemini 和缺少可信协议资格的内部调用始终保持 validated。
+- incremental 等待真实工具 ID、名称和首段非空参数后才打开工具块，随后只发送新增参数，结束时仍须通过完整 JSON 对象校验。工具块打开期间，后来的工具、正文和思考按到达顺序暂存，继续读取完成当前工具所需的上游帧；工具参数由原有预算控制，待发内容和身份元数据另受字节数与事件数预算限制。只有校验完成的调用进入用量、结束原因和成功计量。
+- incremental 已发出的参数不能撤回：非空完整对象快照必须保留已发前缀，否则明确失败；未发出的调用仍支持任意对象替换。空对象占位不覆盖已有参数。文本形式工具继续完整校验，保留跨表示去重；文本工具先输出时，本响应后续原生工具使用 validated 路径。不同原生 ID 的相同调用仍独立保留。
+- incremental 部分参数后失败不会补发正常工具结束或消息成功事件，也不切换账号重放已输出内容；错误恢复提示以统一出口实际接受写入的状态为准。客户端必须等工具完成事件和合法完整参数后才执行，收到错误时丢弃失败工具的截断参数，不能自行修补或重放此前已完成的工具。开启前需验证目标客户端和中间代理能逐段接收并正确终止。
 - 工具参数按新增片段累计字节数，避免反复扫描完整参数；跨片段的 UTF-16 代理对按拼接后的实际 UTF-8 字节计数。工具边界先输出此前缓存的文本/思考。
 - 流式与非流式共用文本形式 `[Called ... with args: {...}]` 的增量解码，只识别请求中声明的工具；引用、代码块、思考内的标记仍是文本。进入内联思考前先输出暂存的标记文本及其空白，已识别但尚未完成的工具调用在该边界报完整性错误，不跨思考块拼接。参数必须是完整合法的 JSON 对象，不修复损坏参数；复用工具参数/调用数预算并过滤 no-op 占位调用。
 - 原生与文本形式的同一调用不会重复输出，独立原生调用 ID 不因参数相同而合并。Claude Message 保留必需的可空 `stop_reason` / `stop_sequence` 字段。
@@ -82,6 +88,9 @@
 | `KIRO_DOWNSTREAM_WRITE_TIMEOUT_MS` | 30000 | 仅 Kiro 调用链启用的单次下游写入期限，覆盖正文、心跳、错误和结束记录。有效值为 1–2147483647 的整数毫秒；无效值（含 0）回退默认值。节点配置优先。客户端持续不读取时取消生成、关闭响应并释放并发名额，不处罚账号。 |
 | `KIRO_MAX_FRAME_BYTES` | 33554432 | 解码器的单帧资源预算，不是对上游服务允许大小的承诺。 |
 | `KIRO_MAX_TOOL_ARGUMENT_BYTES` | 4194304 | 单次响应累计工具参数的存储预算。 |
+| `KIRO_TOOL_STREAM_MODE` | validated | `validated` 完整校验后输出；`incremental` 为受支持的可信普通实时流逐段输出原生工具参数。缺失或非法值回退 validated；账号配置不能绕过协议资格、非流式和显式缓冲限制。在请求开始时冻结选择；切回 validated 只影响后续请求。 |
+| `KIRO_MAX_TOOL_STREAM_QUEUE_BYTES` | 4194304 | incremental 调度暂存的正文、思考与工具身份元数据预算；工具参数本体另计入 `KIRO_MAX_TOOL_ARGUMENT_BYTES`，队列不复制参数。超限明确失败并释放队列。 |
+| `KIRO_MAX_TOOL_STREAM_QUEUE_EVENTS` | 4096 | incremental 待发内容事件与工具引用数量上限，防止小片段和空内容绕过字节预算。 |
 | `KIRO_MAX_TOOL_CALLS` | 1024 | 单次响应最大工具调用数量。 |
 | `KIRO_REQUIRE_STOP_REASON` | false | 严格检查终止 metadata。旧端点可能没有该字段，先观察真实流再开启；明确异常/残帧在关闭时也会失败。 |
 | `KIRO_MAX_PAYLOAD_BYTES` | 10485760 | 最终上游 JSON 的应用层字节预算；需按实际端点验证后调整。超限返回 413，不标记凭证不健康。 |

@@ -10,7 +10,9 @@ import { KiroTruncationRecovery } from './kiro-truncation-recovery.js';
 import { convertKiroUserContent, getKiroHistoryImageMessageWindow, getKiroImagePayloadStats } from './kiro-message-content.js';
 import { buildKiroInferenceConfig, guardKiroPayload, inlineOrphanToolResults, validateKiroGenerationRequest } from './kiro-request-guards.js';
 import { decodeKiroFrames, kiroIntegrityError, normalizeKiroStopReason } from './kiro-event-stream.js';
+import { KiroFrameBuffer } from './kiro-frame-buffer.js';
 import { KiroToolAssembler } from './kiro-tool-assembler.js';
+import { KiroToolStream, resolveKiroToolStreamMode } from './kiro-tool-stream.js';
 import { captureKiroCacheSources } from './kiro-cache-profile.js';
 import { kiroCacheMode, prepareKiroCacheAttempt } from './kiro-cache-meter.js';
 import { copyKiroUsageDetails, resolveKiroCacheUsage } from './kiro-cache-usage.js';
@@ -30,6 +32,7 @@ import * as http from 'http';
 import * as https from 'https';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { estimateInputTokensAsync as estimateInputTokensAsyncUtil, countTextsTokensAsync as countTextsTokensAsyncUtil } from '../../utils/token-counter.js';
 import { getProviderModels } from '../provider-models.js';
 import { 
     countTextTokens as countTextTokensUtil, 
@@ -2461,7 +2464,7 @@ async saveCredentialsToFile(filePath, newData) {
     async generateContent(model, requestBody, options = {}) {
         let message;
         const blocks = new Map();
-        for await (const event of this.generateContentStream(model, requestBody, { ...options, kiroOutputMode: 'unary' })) {
+        for await (const event of this.generateContentStream(model, requestBody, { ...options, kiroOutputMode: 'unary', kiroToolStreamMode: 'validated' })) {
             if (event.type === 'message_start') message = { ...event.message,
                 stop_reason: event.message.stop_reason ?? null, stop_sequence: event.message.stop_sequence ?? null, content: [] };
             else if (event.type === 'content_block_start') blocks.set(event.index, { ...event.content_block });
@@ -2498,6 +2501,10 @@ async saveCredentialsToFile(filePath, newData) {
      */
     parseAwsEventStreamBuffer(buffer) {
         const { frames, remaining } = decodeKiroFrames(buffer, this.config?.KIRO_MAX_FRAME_BYTES);
+        return { events: this.parseAwsEventStreamFrames(frames), remaining };
+    }
+
+    parseAwsEventStreamFrames(frames) {
         const events = [];
         for (const { headers, data } of frames) {
             const type = headers[':event-type'];
@@ -2527,7 +2534,7 @@ async saveCredentialsToFile(filePath, newData) {
                 events.push({ type: 'content', data: data.content });
             }
         }
-        return { events, remaining };
+        return events;
     }
 
 
@@ -2647,7 +2654,11 @@ async saveCredentialsToFile(filePath, newData) {
             options.allowKiroSidecar = true;
             const bindSession = getProviderPoolManager()?.captureKiroSessionBinding?.(
                 this.config.MODEL_PROVIDER || MODEL_PROVIDER.KIRO_API, this.uuid, options.kiroSession?.key);
-            const response = await this._requestWithBuilderEndpointRouting(axiosConfig, requestData, options);
+            const responseOperation = this._requestWithBuilderEndpointRouting(axiosConfig, requestData, options);
+            // Start background accounting only after dispatch, so it overlaps
+            // upstream work without blocking response processing on this thread.
+            try { options.onUpstreamDispatch?.(); } catch { /* surfaced by the accounting caller */ }
+            const response = await responseOperation;
             bindSession?.();
 
             stream = response.data;
@@ -2655,37 +2666,32 @@ async saveCredentialsToFile(filePath, newData) {
             signal?.throwIfAborted();
             const headersAt = performance.now();
             trace?.headers();
-            // Local CPU work that only needs to finish before the first event
-            // overlaps the model's time to first token instead of delaying dispatch.
-            // A failing hook is not a transport failure; the caller recomputes and surfaces it.
+            // Keep the legacy observer hook separate from background accounting.
+            // The count now starts at dispatch and no longer runs in this hook.
             try { options.onUpstreamHeaders?.(); } catch { /* retried lazily by the caller */ }
             const hookMs = performance.now() - headersAt;
-            logger.info(`[Kiro Stream] Upstream headers: ${Math.round(headersAt - upstreamStartedAt)}ms; queue: ${Math.round(upstreamStartedAt - queuedAt)}ms; build: ${Math.round(buildMs)}ms; input estimate: ${Math.round(hookMs)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
+            logger.info(`[Kiro Stream] Upstream headers: ${Math.round(headersAt - upstreamStartedAt)}ms; queue: ${Math.round(upstreamStartedAt - queuedAt)}ms; build: ${Math.round(buildMs)}ms; header hook: ${Math.round(hookMs)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
             let firstEventLogged = false;
-            let buffer = Buffer.alloc(0);
+            const frameBuffer = new KiroFrameBuffer(this.config?.KIRO_MAX_FRAME_BYTES);
 
 
             for await (const chunk of stream) {
                 if (meaningfulEventSeen) armIdle();
-                const chunkBuf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-                buffer = buffer.length === 0 ? chunkBuf : Buffer.concat([buffer, chunkBuf]);
-                
-                // 按 AWS 标准帧格式解析缓冲区中的事件
-                const { events, remaining } = this.parseAwsEventStreamBuffer(buffer);
-                buffer = remaining;
+                const events = this.parseAwsEventStreamFrames(frameBuffer.push(chunk));
                 
                 // Preserve every valid delta; matching text is not proof of a replay.
                 for (const event of events) {
                     trace?.accept(event);
                     signal?.throwIfAborted();
-                    if (((event.type === 'content' || event.type === 'reasoning') && event.data) ||
-                        event.type === 'reasoning' && event.redactedContent || (event.type === 'toolUse' && event.data.name !== KIRO_PLACEHOLDER_TOOL_NAME)) {
+                    if (event.type === 'content' && event.data ||
+                        event.type === 'reasoning' && (event.data || event.signature || event.redactedContent) ||
+                        event.type === 'toolUse' && event.data.name !== KIRO_PLACEHOLDER_TOOL_NAME) {
                         meaningfulEventSeen = true;
                         clearTimeout(firstTimer);
                     }
                     if (!firstEventLogged && (
                         (event.type === 'content' && event.data) ||
-                        (event.type === 'reasoning' && event.data) ||
+                        (event.type === 'reasoning' && (event.data || event.signature || event.redactedContent)) ||
                         event.type === 'toolUse'
                     )) {
                         firstEventLogged = true;
@@ -2730,7 +2736,7 @@ async saveCredentialsToFile(filePath, newData) {
                     }
                 }
             }
-            if (buffer.length) throw kiroIntegrityError('truncated trailing event frame');
+            frameBuffer.finish();
             upstreamComplete = true;
         } catch (error) {
             clearTimers();
@@ -2899,6 +2905,8 @@ async saveCredentialsToFile(filePath, newData) {
         options = { ...options, kiroTiming: options.kiroTiming || { startedAt: streamStartedAt } };
         const requestStartedAt = options.kiroTiming.startedAt;
         options.kiroTiming.mode = options.kiroOutputMode || 'stream';
+        const incrementalTools = options.kiroToolStreamMode === 'incremental';
+        options.kiroTiming.toolStreamMode = incrementalTools ? 'incremental' : 'validated';
         const { signal } = options;
         signal?.throwIfAborted();
         validateKiroGenerationRequest(model, requestBody);
@@ -2973,6 +2981,12 @@ async saveCredentialsToFile(filePath, newData) {
         const unmatchedLegacyTools = new Set();
         const toolSignature = (name, input) => crypto.createHash('sha256')
             .update(name).update('\0').update(JSON.stringify(input)).digest('hex');
+        const toolStream = incrementalTools ? new KiroToolStream(toolAssembler, {
+            maxQueueBytes: this.config.KIRO_MAX_TOOL_STREAM_QUEUE_BYTES,
+            maxQueueEvents: this.config.KIRO_MAX_TOOL_STREAM_QUEUE_EVENTS,
+            placeholderName: KIRO_PLACEHOLDER_TOOL_NAME,
+            shouldStream: () => legacyToolSignatures.size === 0
+        }) : null;
 
         const ensureBlockStart = (blockType) => {
             if (blockType === 'thinking') {
@@ -3095,6 +3109,30 @@ async saveCredentialsToFile(filePath, newData) {
             return events;
         };
 
+        const streamToolEvents = event => {
+            if (event.type === 'toolStreamBoundary') return flushPendingContent();
+            const call = event.call;
+            if (event.type === 'toolStreamStart') {
+                const events = [...stopBlock(streamState.textBlockIndex), ...stopBlock(streamState.thinkingBlockIndex)];
+                call.streamBlockIndex = streamState.nextBlockIndex++;
+                if (call.trace) {
+                    call.trace.emittedMs ??= toolClock();
+                    call.trace.priorLegacyEmitted = legacyToolSignatures.size > 0;
+                    options.kiroTiming.toolTraces?.set(call.id, call.trace);
+                }
+                events.push({ type: 'content_block_start', index: call.streamBlockIndex,
+                    content_block: { type: 'tool_use', id: call.id, name: call.name, input: {} } });
+                return events;
+            }
+            if (event.type === 'toolStreamDelta') return [{ type: 'content_block_delta', index: call.streamBlockIndex,
+                delta: { type: 'input_json_delta', partial_json: event.fragment } }];
+            const completed = { toolUseId: call.id, name: call.name, input: call.input, arguments: call.arguments };
+            if (!event.incremental) return emitCompletedTools([completed]);
+            nativeToolSignatures.add(toolSignature(call.name, call.input));
+            toolCalls.push(completed);
+            return stopBlock(call.streamBlockIndex);
+        };
+
         const emitLegacyParts = parts => {
             const events = [];
             for (const part of parts) {
@@ -3104,7 +3142,18 @@ async saveCredentialsToFile(filePath, newData) {
                     if (name === KIRO_PLACEHOLDER_TOOL_NAME) continue;
                     const signature = toolSignature(name, part.input);
                     if (nativeToolSignatures.has(signature) || legacyToolSignatures.has(signature)) continue;
-                    events.push(...emitCompletedTools(toolAssembler.feed({ name, input: part.arguments, stop: true }, { legacy: true })));
+                    const tool = { name, input: part.arguments, stop: true };
+                    if (toolStream) {
+                        // The scheduler owns native output, including calls
+                        // already assembled behind queued text. Emit this
+                        // validated legacy call directly instead of relying on
+                        // the assembler's shared arrival-order drain.
+                        const { call } = toolAssembler.feedUpdates(tool, { legacy: true });
+                        events.push(...emitCompletedTools([{ toolUseId: call.id, name: call.name,
+                            input: call.input, arguments: call.arguments, legacy: true }]));
+                    } else {
+                        events.push(...emitCompletedTools(toolAssembler.feed(tool, { legacy: true })));
+                    }
                 }
             }
             return events;
@@ -3148,6 +3197,10 @@ async saveCredentialsToFile(filePath, newData) {
             return events;
         };
 
+        const tokenController = new AbortController();
+        const cancelTokenCount = () => tokenController.abort(signal?.reason);
+        signal?.addEventListener('abort', cancelTokenCount, { once: true });
+        if (signal?.aborted) cancelTokenCount();
         try {
             let outputTokens = 0;
             let upstreamStopReason = null;
@@ -3163,14 +3216,21 @@ async saveCredentialsToFile(filePath, newData) {
 
             logger.info(`[Kiro Timing] Provider preparation: initialize: ${Math.round(authStartedAt - streamStartedAt)}ms; auth: ${Math.round(authFinishedAt - authStartedAt)}ms; models: ${Math.round(modelsFinishedAt - authFinishedAt)}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
 
-            // The local estimate is only a fallback for missing upstream usage.
-            // Tokenizing a large prompt is synchronous, so compute it once the
-            // upstream request is in flight rather than before dispatch.
-            let estimatedInputTokens;
-            const getEstimatedInputTokens = () => estimatedInputTokens ??= this.estimateInputTokens(requestBody);
+            // Preserve initial usage for ordinary streams. Estimate mode already
+            // starts at zero and only needs local counts when provider usage is missing.
+            let inputCountOperation;
+            const getEstimatedInputTokens = () => inputCountOperation ||= (async () => {
+                const countStartedAt = performance.now();
+                const count = await this.estimateInputTokensAsync(requestBody, { signal: tokenController.signal });
+                options.kiroTiming.inputCountMs = Math.round(performance.now() - countStartedAt);
+                logger.info(`[Kiro Timing] Background input estimate: ${options.kiroTiming.inputCountMs}ms; elapsed: ${Math.round(performance.now() - requestStartedAt)}ms`);
+                return count;
+            })();
+            const startInputCount = kiroCacheMode(this.config) === 'estimate' ? undefined
+                : () => { void getEstimatedInputTokens().catch(() => {}); };
             let messageStartSent = false;
-            // 1. 先发送 message_start 事件（在首个上游事件之前）
-            const messageStart = () => {
+            // 1. Send message_start before the first content/tool event.
+            const messageStart = async () => {
                 if (messageStartSent) return [];
                 messageStartSent = true;
                 return [{
@@ -3183,7 +3243,7 @@ async saveCredentialsToFile(filePath, newData) {
                         stop_reason: null,
                         stop_sequence: null,
                         usage: {
-                            input_tokens: kiroCacheMode(this.config) === 'estimate' ? 0 : getEstimatedInputTokens(),
+                            input_tokens: kiroCacheMode(this.config) === 'estimate' ? 0 : await getEstimatedInputTokens(),
                             output_tokens: 0,
                             cache_creation_input_tokens: 0,
                             cache_read_input_tokens: 0
@@ -3194,10 +3254,19 @@ async saveCredentialsToFile(filePath, newData) {
             };
 
             // 2. 流式接收并发送每个 content_block_delta
-            for await (const event of this.streamApiReal('', finalModel, requestBody, false, 0,
-                { ...options, onUpstreamHeaders: getEstimatedInputTokens })) {
-                yield* pushEvents(messageStart());
-                if (event.type === 'contextUsage' && event.contextUsagePercentage) {
+            const upstreamEvents = this.streamApiReal('', finalModel, requestBody, false, 0,
+                { ...options, onUpstreamDispatch: startInputCount });
+            for await (const event of toolStream ? toolStream.transform(upstreamEvents) : upstreamEvents) {
+                // Metadata does not satisfy the first meaningful-event deadline.
+                // Keep reading it while accounting runs, so queued token work
+                // cannot hide content already waiting in the upstream buffer.
+                if (!['contextUsage', 'metadata', 'usage', 'metering'].includes(event.type)) {
+                    yield* pushEvents(await messageStart());
+                }
+                if (event.type.startsWith('toolStream')) {
+                    bracketParser.checkBudget();
+                    yield* pushEvents(streamToolEvents(event));
+                } else if (event.type === 'contextUsage' && event.contextUsagePercentage) {
                     // 捕获上下文使用百分比（包含输入和输出的总使用量）
                     contextUsagePercentage = event.contextUsagePercentage;
                 } else if (event.type === 'reasoning') {
@@ -3396,7 +3465,7 @@ async saveCredentialsToFile(filePath, newData) {
                     metering = event.data;
                 }
             }
-            yield* pushEvents(messageStart());
+            yield* pushEvents(await messageStart());
             if (this.config.KIRO_REQUIRE_STOP_REASON === true && !upstreamStopReason) {
                 throw kiroIntegrityError('missing upstream stop reason');
             }
@@ -3438,10 +3507,8 @@ async saveCredentialsToFile(filePath, newData) {
             } else {
                 // Preserve the fallback arithmetic for partial/invalid usage,
                 // including subtracting LOCAL output from the context total.
-                outputTokens = this.countTextTokens(textForTokenCount.join(''));
-                for (const tc of toolCalls) {
-                    outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
-                }
+                outputTokens = await this.countTextsTokensAsync([textForTokenCount.join(''),
+                    ...toolCalls.map(tc => JSON.stringify(tc.input || {}))], { signal: tokenController.signal });
                 if (contextUsagePercentage !== null && contextUsagePercentage > 0) {
                     const configuredContext = normalizeContextLength(findCustomModelConfigForModel(model, this.config)?.contextLength);
                     const contextTokens = configuredContext || normalizeContextLength(modelInfo?.tokenLimits?.maxInputTokens) || getContextTokensForModel(model, this.config, finalModel);
@@ -3450,7 +3517,7 @@ async saveCredentialsToFile(filePath, newData) {
                     logger.info(`[Kiro] Token calculation from contextUsagePercentage: total=${totalTokens}, output=${outputTokens}, input=${inputTokens}`);
                 } else {
                     logger.warn('[Kiro Stream] contextUsagePercentage not received, using estimation');
-                    inputTokens = getEstimatedInputTokens();
+                    inputTokens = await getEstimatedInputTokens();
                 }
                 if (Number.isFinite(actualInput) && actualInput >= 0) inputTokens = actualInput;
                 if (Number.isFinite(actualOutput) && actualOutput >= 0) outputTokens = actualOutput;
@@ -3471,7 +3538,7 @@ async saveCredentialsToFile(filePath, newData) {
                         || normalizeContextLength(modelInfo?.tokenLimits?.maxInputTokens)
                         || getContextTokensForModel(model, this.config, finalModel)) * contextUsagePercentage / 100) : null;
                 cacheInputTotal = hasProviderTotal ? providerTotalInput
-                    : contextTotal !== null ? Math.max(0, contextTotal - outputTokens) : getEstimatedInputTokens();
+                    : contextTotal !== null ? Math.max(0, contextTotal - outputTokens) : await getEstimatedInputTokens();
             }
             const { usage: finalUsage, details: usageDetails } = resolveKiroCacheUsage({
                 inputTokens: cacheInputTotal, outputTokens, nativeUsage, metering,
@@ -3499,11 +3566,22 @@ async saveCredentialsToFile(filePath, newData) {
             yield { type: "message_stop" };
 
         } catch (error) {
+            if (incrementalTools) {
+                error.kiroIncrementalToolFailure = true;
+                // A generator may be consumed internally or through a writer.
+                // Only the writer knows what was accepted downstream.
+                const unsentClaim = 'No malformed tool call was emitted.';
+                const neutralNotice = 'The failed tool call is incomplete; do not execute or repair its arguments.';
+                if (typeof error.recoveryHint === 'string') error.recoveryHint = error.recoveryHint.replace(unsentClaim, neutralNotice);
+                if (typeof error.message === 'string') error.message = error.message.replace(unsentClaim, neutralNotice);
+            }
             if (!signal?.aborted && !error.isEmptyUpstreamResponse && !error.isKiroAccountUnavailable) {
                 logger.error('[Kiro] Error in streaming generation:', error?.stack || error?.message || String(error));
             }
             throw error;
         } finally {
+            signal?.removeEventListener('abort', cancelTokenCount);
+            tokenController.abort();
             // Live streams finish here only after every yielded event was written,
             // so downstream write times are already recorded for paired calls.
             if (toolClock) logKiroToolTrace(options.kiroTiming, toolAssembler);
@@ -3522,7 +3600,8 @@ async saveCredentialsToFile(filePath, newData) {
     //   可以安全地整体重试（不会出现同一个 SSE 响应里出现两个 message_start）。
     async * generateContentStream(model, requestBody, options = {}) {
         const cacheAccounting = {};
-        const rawGenerator = this._generateContentStreamRaw(model, requestBody, { ...options, kiroCacheAccounting: cacheAccounting });
+        const kiroToolStreamMode = resolveKiroToolStreamMode(this.config, options);
+        const rawGenerator = this._generateContentStreamRaw(model, requestBody, { ...options, kiroCacheAccounting: cacheAccounting, kiroToolStreamMode });
 
         try {
             const first = await rawGenerator.next();
@@ -3565,7 +3644,7 @@ async saveCredentialsToFile(filePath, newData) {
      */
     async * generateContentStreamBuffered(model, requestBody, options = {}) {
         const cacheAccounting = {};
-        const rawGenerator = this._generateContentStreamRaw(model, requestBody, { ...options, kiroCacheAccounting: cacheAccounting, kiroOutputMode: 'buffered' });
+        const rawGenerator = this._generateContentStreamRaw(model, requestBody, { ...options, kiroCacheAccounting: cacheAccounting, kiroOutputMode: 'buffered', kiroToolStreamMode: 'validated' });
         const events = [];
         const configuredLimit = Number(this.config.KIRO_MAX_BUFFERED_RESPONSE_BYTES);
         const maxBytes = Number.isSafeInteger(configuredLimit) && configuredLimit > 0
@@ -3633,6 +3712,23 @@ async saveCredentialsToFile(filePath, newData) {
      */
     estimateInputTokens(requestBody) {
         return KiroApiService.estimateInputTokens(requestBody);
+    }
+
+    async estimateInputTokensAsync(requestBody, options = {}) {
+        options.signal?.throwIfAborted();
+        // Preserve an explicitly supplied counter used by service extensions.
+        if (this.estimateInputTokens !== KiroApiService.prototype.estimateInputTokens) {
+            return this.estimateInputTokens(requestBody);
+        }
+        return estimateInputTokensAsyncUtil(requestBody, options);
+    }
+
+    async countTextsTokensAsync(texts, options = {}) {
+        options.signal?.throwIfAborted();
+        if (this.countTextTokens !== KiroApiService.prototype.countTextTokens) {
+            return texts.reduce((sum, text) => sum + this.countTextTokens(text), 0);
+        }
+        return countTextsTokensAsyncUtil(texts, options);
     }
 
     /**

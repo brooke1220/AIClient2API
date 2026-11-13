@@ -138,7 +138,7 @@ export function countTextTokens(text) {
 /**
  * Calculate input tokens from request body using Claude's official tokenizer
  */
-export function estimateInputTokens(requestBody) {
+export function prepareInputTokenCount(requestBody) {
     let allText = "";
     let extraTokens = 0;
     
@@ -184,7 +184,12 @@ else if (t === 'adaptive') {
         allText += JSON.stringify(requestBody.tools);
     }
     
-    return countTextTokens(allText) + extraTokens;
+    return { text: allText, extraTokens };
+}
+
+export function estimateInputTokens(requestBody) {
+    const { text, extraTokens } = prepareInputTokenCount(requestBody);
+    return countTextTokens(text) + extraTokens;
 }
 
 /**
