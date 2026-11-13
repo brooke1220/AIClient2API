@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * Zero-credit upload probe for the AIClient2API -> Kiro hop.
+ * Upload and request-gzip probe for the AIClient2API -> Kiro hop.
  *
- * Every request sets an invalid output_config.effort, so Kiro answers HTTP 400
- * after it has received and parsed the whole body, before any model runs.
+ * Every request sets an invalid output_config.effort, expecting HTTP 400
+ * after body parsing and before generation. Unexpected 2xx stops the probe.
  * Timing that 400 for bodies of several sizes separates upload time (the
  * slope) from fixed overhead (the intercept). A gzip-encoded body that is
  * rejected the same way shows that Kiro decodes Content-Encoding: gzip.
@@ -24,6 +24,7 @@ import { pathToFileURL } from 'node:url';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { mergeConfig } from '../utils/config-merge.js';
 import { resolveProxyUrlForProvider } from '../utils/proxy-utils.js';
+import { sendCurl } from './kiro-upload-curl.mjs';
 
 const INVALID_EFFORT = 'probe-invalid-effort';
 const DEFAULT_ENDPOINT = 'https://q.{{region}}.amazonaws.com/generateAssistantResponse';
@@ -37,7 +38,9 @@ const REQUEST_TIMEOUT_MS = 120000;
 const HELP = `Usage: node src/scripts/kiro-upload-probe.mjs [options]
 
 Run from the AIClient2API working directory (/app inside the container).
-Every request is rejected by Kiro before generation, so no credits are used.
+Requests deliberately contain invalid effort, expecting rejection before generation.
+Any unexpected 2xx reply stops the probe immediately.
+Upload timing uses Node only; --check-only skips it for compatibility diagnosis.
 
 Options:
   --uuid <prefix>          Pool account to use (default: first enabled, healthy one)
@@ -51,6 +54,8 @@ Options:
   --endpoint <url>         Override the upstream URL
   --proxy <url|none>       HTTP(S) or SOCKS5 proxy (default: the account's sidecar proxy setting)
   --gzip <auto|force|off>  auto: time gzip bodies only if Kiro accepts them (default)
+  --client <node|curl|both>  Clients used for gzip checks (default: node)
+  --check-only             Check every size's plain/gzip pair; skip upload timing
   --json <file>            Also write the result as JSON
   --dry-run                Show settings and body sizes without sending anything
   -h, --help               Show this help`;
@@ -74,7 +79,7 @@ function parseArgs(argv) {
     const opts = {
         pools: 'configs/provider_pools.json', config: 'configs/config.json', uuid: null, creds: null,
         model: 'claude-opus-5.5', sizes: '1k,450k,900k', rounds: 3, gapMs: 1000, endpoint: null,
-        proxy: null, gzip: 'auto', json: null, dryRun: false
+        proxy: null, gzip: 'auto', client: 'node', checkOnly: false, json: null, dryRun: false
     };
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
@@ -95,6 +100,8 @@ function parseArgs(argv) {
             case '--endpoint': opts.endpoint = value(); break;
             case '--proxy': opts.proxy = value(); break;
             case '--gzip': opts.gzip = value(); break;
+            case '--client': opts.client = value(); break;
+            case '--check-only': opts.checkOnly = true; break;
             case '--json': opts.json = value(); break;
             case '--dry-run': opts.dryRun = true; break;
             case '-h': case '--help': console.log(HELP); process.exit(0);
@@ -104,6 +111,7 @@ function parseArgs(argv) {
     if (!Number.isSafeInteger(opts.rounds) || opts.rounds < 1 || opts.rounds > 10) fail('--rounds must be 1-10');
     if (!Number.isFinite(opts.gapMs) || opts.gapMs < 0) fail('--gap-ms must be >= 0');
     if (!['auto', 'force', 'off'].includes(opts.gzip)) fail('--gzip must be auto, force or off');
+    if (!['node', 'curl', 'both'].includes(opts.client)) fail('--client must be node, curl or both');
     const seen = new Set();
     opts.sizes = opts.sizes.split(',').filter(Boolean).map(parseSize)
         .filter(size => !seen.has(size.bytes) && seen.add(size.bytes))
@@ -521,7 +529,7 @@ function fillerText(rng, length) {
     return parts.join(' ').slice(0, length);
 }
 
-function makeBody(size, index, model, profileArn) {
+export function makeBody(size, index, model, profileArn) {
     const rng = makeRng(0x9e3779b9 + index * 7919);
     const userMessage = content => ({ userInputMessage: { content, modelId: model, origin: 'AI_EDITOR' } });
     const build = history => {
@@ -548,18 +556,27 @@ function makeBody(size, index, model, profileArn) {
         bytes += Buffer.byteLength(JSON.stringify(user)) + Buffer.byteLength(JSON.stringify(assistant)) + (history.length ? 2 : 14);
         history.push(user, assistant);
     }
-    const object = build(history);
+    return prepareBody(build(history), size.label);
+}
+
+export function prepareBody(object, label) {
     const json = Buffer.from(JSON.stringify(object));
-    return { label: size.label, object, jsonBytes: json.length, gzipBytes: zlib.gzipSync(json, { level: 6 }).length };
+    const compressed = zlib.gzipSync(json, { level: 6 });
+    if (!zlib.gunzipSync(compressed).equals(json)) throw new Error('gzip round-trip verification failed; nothing was sent');
+    return {
+        label, object, json, compressed, jsonBytes: json.length, gzipBytes: compressed.length,
+        jsonSha256: crypto.createHash('sha256').update(json).digest('hex'),
+        gzipSha256: crypto.createHash('sha256').update(compressed).digest('hex')
+    };
 }
 
-function encode(body, gzip) {
-    body.object.conversationState.conversationId = crypto.randomUUID();
-    const json = Buffer.from(JSON.stringify(body.object));
-    return { json, payload: gzip ? zlib.gzipSync(json, { level: 6 }) : json };
+export function encode(body, gzip) {
+    // The same size uses the exact same JSON, including conversationId, across
+    // encodings, clients and rounds. Only Content-Encoding and wire length vary.
+    return { json: body.json, payload: gzip ? body.compressed : body.json };
 }
 
-function headersFor(token, payload, gzip) {
+export function headersFor(token, payload, gzip) {
     const headers = {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
@@ -582,21 +599,69 @@ const sanitize = text => String(text)
     .replace(/Bearer\s+\S+/gi, 'Bearer ...')
     .replace(/[A-Za-z0-9+/=_-]{60,}/g, '...');
 
-function describeReply(result) {
+export function describeReply(result) {
     if (result.error) return { key: `error:${result.error.code || result.error.message}`, text: sanitize(result.error.code || result.error.message) };
-    const type = String(result.headers?.['x-amzn-errortype'] || '').split(':')[0];
+    let type = String(result.headers?.['x-amzn-errortype'] || '').split(':')[0];
     let reason = '';
     let message = result.text || '';
     try {
         const parsed = JSON.parse(result.text);
         reason = parsed.reason || '';
         message = parsed.message || parsed.Message || parsed.__type || result.text;
+        if (!type && parsed.__type) type = String(parsed.__type).split('#').at(-1);
     } catch { /* not JSON */ }
     message = sanitize(message).replace(/\s+/g, ' ').trim().slice(0, 240);
     const normalized = message.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, 'ID');
     return {
         key: `${result.status}|${type}|${reason}|${normalized}`,
-        text: [result.status, type, reason].filter(Boolean).join(' ') + (message ? `: ${message}` : '')
+        text: [result.status, type, reason].filter(Boolean).join(' ') + (message ? `: ${message}` : ''),
+        type, message
+    };
+}
+
+export function isEffortRejection(sample) {
+    if (sample?.status !== 400 || sample.transportError) return false;
+    if (!/ValidationException/i.test(sample.replyType || sample.reply || '')) return false;
+    const message = sample.replyMessage || sample.reply || '';
+    return (/effort/i.test(message) && /invalid|enumeration|allowed|value|must/i.test(message))
+        || (/Invalid additionalModelRequestFields/i.test(message) && /enumeration/i.test(message)
+            && /["']low["']/.test(message) && /["']medium["']/.test(message) && /["']high["']/.test(message));
+}
+
+export function classifyGzipPair(plain, gzip) {
+    if (!isEffortRejection(plain)) return { verdict: 'inconclusive', reason: 'plain request did not reach the expected invalid-effort validation' };
+    if (!gzip || gzip.transportError || gzip.status == null) return { verdict: 'inconclusive', reason: 'gzip request had no complete upstream reply' };
+    if (!plain.jsonSha256 || plain.jsonSha256 !== gzip.jsonSha256) return { verdict: 'inconclusive', reason: 'plain and gzip did not use identical JSON' };
+    if (isEffortRejection(gzip)) return { verdict: 'supported', reason: 'gzip reached the expected invalid-effort validation' };
+    if ((gzip.status === 400 && /SerializationException|UnsupportedContentEncoding|UnsupportedEncoding/i.test(gzip.replyType || ''))
+        || gzip.status === 415) {
+        return { verdict: 'rejected', reason: 'gzip was rejected during parsing or content-encoding handling' };
+    }
+    return { verdict: 'inconclusive', reason: 'gzip returned a different error; this does not establish compression support' };
+}
+
+export function summarizeGzipChecks(checks) {
+    const verdicts = new Set(checks.map(check => check.verdict));
+    const gzipVerdict = !checks.length ? 'not-tested'
+        : verdicts.has('supported') && verdicts.has('rejected') ? 'mixed'
+            : verdicts.size === 1 ? checks[0].verdict : 'inconclusive';
+    const bySize = new Map();
+    const byClient = new Map();
+    for (const check of checks) {
+        if (!bySize.has(check.size)) bySize.set(check.size, new Set());
+        if (!byClient.has(check.client)) byClient.set(check.client, new Set());
+        bySize.get(check.size).add(check.verdict);
+        byClient.get(check.client).add(check.verdict);
+    }
+    const conflicts = values => values.has('supported') && values.has('rejected');
+    const clientDependent = [...bySize.values()].some(conflicts);
+    const sizeDependent = [...byClient.values()].some(conflicts);
+    const independentAgreement = byClient.size > 1 && ['supported', 'rejected'].includes(gzipVerdict)
+        && [...bySize].every(([size, values]) => values.size === 1
+            && new Set(checks.filter(check => check.size === size).map(check => check.client)).size === byClient.size);
+    return {
+        gzipAccepted: gzipVerdict === 'supported' ? true : gzipVerdict === 'rejected' ? false : null,
+        gzipVerdict, clientDependent, sizeDependent, independentAgreement
     };
 }
 
@@ -638,16 +703,19 @@ async function main() {
     const url = resolveEndpoint(opts, account);
     const proxy = resolveProxy(opts, account);
     const bodies = opts.sizes.map((size, index) => makeBody(size, index, opts.model, account.profileArn));
+    const clients = opts.client === 'both' ? ['node', 'curl'] : [opts.client];
     const largest = bodies.at(-1);
     const minutesLeft = Number.isFinite(account.expiresAt) ? `${Math.round((account.expiresAt - Date.now()) / 60000)} min` : 'unknown';
 
-    console.log('Kiro upload probe: every request carries an invalid effort value and is rejected before generation.');
+    console.log('Kiro upload probe: invalid effort is intended to reject requests before generation; unexpected 2xx stops all checks.');
     console.log(`  account   ${account.label}  auth=${account.authMethod}  region=${account.region}  token valid for ${minutesLeft}`);
     console.log(`  endpoint  ${url.origin}${url.pathname}`);
     console.log(`  proxy     ${describeProxy(proxy)}`);
     console.log(`  model     ${opts.model}`);
+    console.log(`  clients   ${clients.join(', ')} (HTTP/1.1; same proxy and identical JSON per size)`);
     console.log(`  bodies    ${bodies.map(body => `${body.label}=${kb(body.jsonBytes)}`).join(', ')}; `
         + `gzip of the largest: ${kb(largest.gzipBytes)} (${(100 * largest.gzipBytes / largest.jsonBytes).toFixed(0)}%)`);
+    for (const body of bodies) console.log(`  verified  ${body.label.padEnd(6)} gzip round-trip OK; JSON sha256 ${body.jsonSha256.slice(0, 16)}`);
     if (opts.dryRun) {
         console.log('Dry run: nothing was sent.');
         return;
@@ -655,9 +723,13 @@ async function main() {
 
     const agent = createAgent(proxy);
     const samples = [];
-    const run = async (body, gzip, phase) => {
+    const run = async (body, gzip, phase, client = 'node') => {
+        if (samples.length) await sleep(opts.gapMs);
         const { json, payload } = encode(body, gzip);
-        const result = await send(agent, url, headersFor(account.token, payload, gzip), payload);
+        const headers = headersFor(account.token, payload, gzip);
+        const result = client === 'curl'
+            ? await sendCurl(url, headers, payload, { proxy })
+            : await send(agent, url, headers, payload);
         if (result.unsafe) {
             console.error(`\nKiro returned HTTP ${result.status} for ${gzip ? 'gzip' : 'plain'} ${body.label}: the invalid effort was not rejected.`);
             console.error('The connection was dropped at once to stop generation. Check this account\'s usage before running again.');
@@ -665,40 +737,88 @@ async function main() {
         }
         const reply = describeReply(result);
         const sample = {
-            phase, size: body.label, gzip, jsonBytes: json.length, wireBytes: payload.length, status: result.status,
-            ttfbMs: result.ttfbMs, writeMs: result.writeMs, reusedSocket: result.reusedSocket === true, replyKey: reply.key, reply: reply.text
+            phase, client, size: body.label, gzip, jsonBytes: json.length, wireBytes: payload.length, status: result.status,
+            jsonSha256: body.jsonSha256, wireSha256: gzip ? body.gzipSha256 : body.jsonSha256,
+            ttfbMs: result.ttfbMs, writeMs: result.writeMs, reusedSocket: result.reusedSocket === true,
+            replyKey: reply.key, reply: reply.text, replyType: reply.type, replyMessage: reply.message,
+            transportError: Boolean(result.error)
         };
         samples.push(sample);
         return sample;
     };
-    const line = sample => `${sample.gzip ? 'gzip ' : 'plain'} ${sample.size.padEnd(6)} wire ${kb(sample.wireBytes).padStart(9)}  `
-        + `ttfb ${ms(sample.ttfbMs).padStart(8)}  ${sample.reply.slice(0, 110)}${sample.reusedSocket ? '' : '  [new connection]'}`;
+    const line = sample => `${sample.client.padEnd(4)} ${sample.gzip ? 'gzip ' : 'plain'} ${sample.size.padEnd(6)} wire ${kb(sample.wireBytes).padStart(9)}  `
+        + `ttfb ${ms(sample.ttfbMs).padStart(8)}  ${sample.reply.slice(0, 160)}${sample.client === 'node' && !sample.reusedSocket ? '  [new connection]' : ''}`;
 
     const smallest = bodies[0];
-    const baseline = await run(smallest, false, 'baseline');
+    const baseline = await run(smallest, false, 'baseline', clients[0]);
     console.log(`\nBaseline  ${line(baseline)}`);
     if (baseline.status !== 400) {
         fail(`expected HTTP 400 from the invalid effort, got: ${baseline.reply}. Nothing else was sent.`, 3);
     }
-    if (!/effort|probe-invalid-effort/i.test(baseline.reply)) {
-        console.log('  Note: the 400 does not mention effort. Timings are only comparable where every body gets this same reply.');
+    if (!isEffortRejection(baseline)) {
+        console.log('  Note: this is not a confirmed invalid-effort rejection; matching errors alone cannot establish gzip support.');
     }
 
-    let gzipAccepted = null;
+    const checks = [];
+    const plainBySize = new Map();
+    if (clients[0] === 'node') plainBySize.set(smallest.label, baseline);
     if (opts.gzip !== 'off') {
-        await sleep(opts.gapMs);
-        const check = await run(smallest, true, 'gzip-check');
-        gzipAccepted = check.replyKey === baseline.replyKey;
-        console.log(`Gzip      ${line(check)}`);
-        console.log(gzipAccepted
-            ? '  => Kiro decoded the gzip body (same rejection as the plain body).'
-            : '  => Kiro did not treat the gzip body like the plain one (reply above).');
+        console.log('\nGzip checks: plain then gzip for every size and client. A failed small body does not skip larger bodies.');
+        for (const client of clients) {
+            for (const body of bodies) {
+                const plain = client === clients[0] && body === smallest ? baseline
+                    : await run(body, false, 'gzip-baseline', client);
+                if (plain !== baseline) console.log(`Plain     ${line(plain)}`);
+                if (client === 'node') plainBySize.set(body.label, plain);
+                const compressed = isEffortRejection(plain) ? await run(body, true, 'gzip-check', client) : null;
+                if (compressed) console.log(`Gzip      ${line(compressed)}`);
+                const assessment = classifyGzipPair(plain, compressed);
+                checks.push({
+                    client, size: body.label, jsonSha256: body.jsonSha256, ...assessment,
+                    plain: plain.reply, gzip: compressed?.reply ?? null
+                });
+                console.log(`  => ${client} ${body.label}: ${assessment.verdict.toUpperCase()} (${assessment.reason})`);
+            }
+        }
     }
 
-    const timeGzip = opts.gzip === 'force' || (opts.gzip === 'auto' && gzipAccepted);
-    const variants = bodies.flatMap(body => [{ body, gzip: false }, ...(timeGzip ? [{ body, gzip: true }] : [])]);
+    const assessment = summarizeGzipChecks(checks);
+    console.log(`\nGzip verdict: ${assessment.gzipVerdict.toUpperCase()} (this endpoint and request format only)`);
+    if (assessment.clientDependent) console.log('  Node and curl disagree for the same size; the failure cannot be attributed to Kiro alone.');
+    if (assessment.sizeDependent) console.log('  Support differs by body size; do not apply the small-body result to all sizes.');
+    if (assessment.independentAgreement) console.log('  Node and curl independently agree for every tested size.');
+    if (assessment.gzipVerdict === 'inconclusive') console.log('  Inconclusive replies do not establish whether request gzip is supported.');
+
+    const finish = (fit, summary) => {
+        const result = {
+            probe: 'kiro-upload', at: new Date().toISOString(), account: account.label, authMethod: account.authMethod, region: account.region,
+            endpoint: `${url.origin}${url.pathname}`, proxy: describeProxy(proxy), model: opts.model, clients,
+            ...assessment, checks, baseline: baseline.reply, fit, summary,
+            samples: samples.map(({ replyKey, ...sample }) => ({
+                ...sample, ttfbMs: sample.ttfbMs == null ? null : Math.round(sample.ttfbMs),
+                writeMs: sample.writeMs == null ? null : Math.round(sample.writeMs)
+            }))
+        };
+        if (opts.json) {
+            fs.writeFileSync(opts.json, `${JSON.stringify(result, null, 2)}\n`);
+            console.log(`Wrote ${opts.json}`);
+        }
+        console.log(`\nRESULT ${JSON.stringify({ ...assessment, checks, fit, summary, proxy: result.proxy, endpoint: result.endpoint, baseline: result.baseline })}`);
+        agent.destroy();
+    };
+    if (opts.checkOnly) {
+        finish(null, []);
+        return;
+    }
+
+    // curl is an independent compatibility check, not a sample for Node's
+    // connection-reuse or bandwidth fit. Never mix the clients' timings.
+    const variants = bodies.flatMap(body => [{ body, gzip: false }, ...(
+        opts.gzip === 'force' || (opts.gzip === 'auto' && checks.some(check =>
+            check.client === 'node' && check.size === body.label && check.verdict === 'supported'))
+            ? [{ body, gzip: true }] : [])]);
     const uploadBytes = variants.reduce((sum, variant) => sum + (variant.gzip ? variant.body.gzipBytes : variant.body.jsonBytes), 0) * opts.rounds;
-    console.log(`\nTiming ${variants.length} variants x ${opts.rounds} rounds (${variants.length * opts.rounds} requests, about ${kb(uploadBytes)} upload)`);
+    console.log(`\nNode timing ${variants.length} variants x ${opts.rounds} rounds (${variants.length * opts.rounds} requests, about ${kb(uploadBytes)} upload)`);
     let consecutiveMismatches = 0;
     for (let round = 1; round <= opts.rounds; round++) {
         const order = [...variants];
@@ -707,10 +827,11 @@ async function main() {
             [order[i], order[j]] = [order[j], order[i]];
         }
         for (const variant of order) {
-            await sleep(opts.gapMs);
             const sample = await run(variant.body, variant.gzip, 'timing');
-            const expected = variant.gzip && !gzipAccepted ? null : baseline.replyKey;
-            sample.valid = expected !== null && sample.replyKey === expected;
+            const knownPlain = plainBySize.get(variant.body.label);
+            const gzipSupported = checks.some(check => check.client === 'node' && check.size === variant.body.label && check.verdict === 'supported');
+            const expected = variant.gzip && !gzipSupported ? null : knownPlain?.replyKey ?? baseline.replyKey;
+            sample.valid = expected !== null && sample.replyKey === expected && isEffortRejection(sample);
             console.log(`  r${round} ${line(sample)}${sample.valid || expected === null ? '' : '  [different reply, excluded]'}`);
             consecutiveMismatches = sample.valid || expected === null ? 0 : consecutiveMismatches + 1;
             if (consecutiveMismatches >= 3) fail('three replies in a row differed from the baseline; stopping.', 3);
@@ -747,21 +868,10 @@ async function main() {
                 + `median ${ms(row.medianMs)} vs ${ms(plain.medianMs)} (${plain.medianMs - row.medianMs >= 0 ? 'saves' : 'costs'} ${ms(Math.abs(plain.medianMs - row.medianMs))})`);
         }
     }
-    const newConnections = samples.filter(sample => !sample.reusedSocket).length;
-    if (newConnections > 1) console.log(`Note: ${newConnections} of ${samples.length} requests opened a new connection; handshakes add to the fixed overhead, not the slope.`);
-
-    const result = {
-        probe: 'kiro-upload', at: new Date().toISOString(), account: account.label, authMethod: account.authMethod, region: account.region,
-        endpoint: `${url.origin}${url.pathname}`, proxy: describeProxy(proxy), model: opts.model, gzipAccepted,
-        baseline: baseline.reply, fit, summary,
-        samples: samples.map(({ replyKey, ...sample }) => ({ ...sample, ttfbMs: Math.round(sample.ttfbMs), writeMs: sample.writeMs === null ? null : Math.round(sample.writeMs) }))
-    };
-    if (opts.json) {
-        fs.writeFileSync(opts.json, `${JSON.stringify(result, null, 2)}\n`);
-        console.log(`Wrote ${opts.json}`);
-    }
-    console.log(`\nRESULT ${JSON.stringify({ gzipAccepted, fit, summary, proxy: result.proxy, endpoint: result.endpoint, baseline: result.baseline })}`);
-    agent.destroy();
+    const nodeSamples = samples.filter(sample => sample.client === 'node');
+    const newConnections = nodeSamples.filter(sample => !sample.reusedSocket).length;
+    if (newConnections > 1) console.log(`Note: ${newConnections} of ${nodeSamples.length} Node requests opened a new connection; handshakes can affect the timing fit.`);
+    finish(fit, summary);
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {

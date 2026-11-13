@@ -4,12 +4,17 @@ import https from 'node:https';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gunzipSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 
 jest.mock('../src/utils/logger.js', () => ({
     __esModule: true, default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }
 }));
 
-import { createAgent, resolveProxy, send, tunnel } from '../src/scripts/kiro-upload-probe.mjs';
+import {
+    classifyGzipPair, createAgent, describeReply, encode, headersFor, isEffortRejection,
+    makeBody, resolveProxy, send, summarizeGzipChecks, tunnel
+} from '../src/scripts/kiro-upload-probe.mjs';
 
 const agents = new Set();
 const proxy = 'http://127.0.0.1:7890';
@@ -196,6 +201,80 @@ test('the CLI entry point still prints help without reading credentials or sendi
     const output = execFileSync(process.execPath, ['src/scripts/kiro-upload-probe.mjs', '--help'], { cwd: root, encoding: 'utf8' });
     expect(output).toContain('Usage: node src/scripts/kiro-upload-probe.mjs');
     expect(output).toContain('--proxy <url|none>');
+    expect(output).toContain('--client <node|curl|both>');
+    expect(output).toContain('--check-only');
+});
+
+describe('paired request-gzip diagnostics', () => {
+    const enumMessage = 'Invalid additionalModelRequestFields: does not have a value in the enumeration ["low", "medium", "high", "xhigh", "max"]';
+    const sample = (status = 400, type = 'ValidationException', message = enumMessage) => {
+        const reply = describeReply({ status, headers: { 'x-amzn-errortype': type }, text: JSON.stringify({ message }) });
+        return { status, reply: reply.text, replyType: reply.type, replyMessage: reply.message, jsonSha256: 'same-json', transportError: false };
+    };
+
+    test('plain and gzip reuse identical JSON and conversation IDs across requests', () => {
+        const body = makeBody({ label: '1k', bytes: 1000 }, 0, 'claude-opus-5.5');
+        const first = encode(body, false), compressed = encode(body, true), again = encode(body, false);
+        expect(first.payload).toEqual(again.payload);
+        expect(gunzipSync(compressed.payload)).toEqual(first.payload);
+        expect(compressed.json).toEqual(first.json);
+        expect(createHash('sha256').update(first.json).digest('hex')).toBe(body.jsonSha256);
+        const headers = headersFor('mock-only', compressed.payload, true);
+        expect(headers['Content-Encoding']).toBe('gzip');
+        expect(Number(headers['Content-Length'])).toBe(compressed.payload.length);
+        expect(JSON.parse(first.json).additionalModelRequestFields.output_config.effort).toBe('probe-invalid-effort');
+    });
+
+    test('recognizes the actual enum error even when it does not name effort', () => {
+        expect(isEffortRejection(sample())).toBe(true);
+        expect(classifyGzipPair(sample(), sample())).toMatchObject({ verdict: 'supported' });
+    });
+
+    test('uses JSON __type when the AWS error-type header is absent', () => {
+        const reply = describeReply({ status: 400, headers: {}, text: JSON.stringify({ __type: 'service#ValidationException', message: enumMessage }) });
+        expect(isEffortRejection({ status: 400, replyType: reply.type, replyMessage: reply.message })).toBe(true);
+    });
+
+    test('does not treat matching arbitrary HTTP 400 replies as gzip support', () => {
+        const generic = sample(400, 'SerializationException', 'Improperly formed request.');
+        expect(classifyGzipPair(generic, generic)).toMatchObject({ verdict: 'inconclusive' });
+    });
+
+    test.each([
+        [400, 'SerializationException'], [400, 'UnsupportedContentEncoding'], [415, 'UnsupportedMediaType']
+    ])('reports explicit gzip parsing/encoding rejection for %i %s', (status, type) => {
+        expect(classifyGzipPair(sample(), sample(status, type, 'Improperly formed request.'))).toMatchObject({ verdict: 'rejected' });
+    });
+
+    test.each([401, 403, 413, 429, 500, 503])('does not misclassify gzip HTTP %i as no compression support', status => {
+        expect(classifyGzipPair(sample(), sample(status, 'OtherError', 'upstream policy error'))).toMatchObject({ verdict: 'inconclusive' });
+    });
+
+    test('transport errors and changed JSON cannot establish support', () => {
+        expect(classifyGzipPair(sample(), { ...sample(), status: null, transportError: true })).toMatchObject({ verdict: 'inconclusive' });
+        expect(classifyGzipPair(sample(), { ...sample(), jsonSha256: 'different-json' })).toMatchObject({ verdict: 'inconclusive' });
+    });
+
+    test('distinguishes size and client disagreements instead of flattening them to false', () => {
+        const sizeDependent = summarizeGzipChecks([
+            { client: 'node', size: '1k', verdict: 'rejected' },
+            { client: 'node', size: '900k', verdict: 'supported' }
+        ]);
+        expect(sizeDependent).toMatchObject({ gzipAccepted: null, gzipVerdict: 'mixed', sizeDependent: true, clientDependent: false });
+        const clientDependent = summarizeGzipChecks([
+            { client: 'node', size: '1k', verdict: 'rejected' },
+            { client: 'curl', size: '1k', verdict: 'supported' }
+        ]);
+        expect(clientDependent).toMatchObject({ gzipAccepted: null, gzipVerdict: 'mixed', clientDependent: true, independentAgreement: false });
+    });
+
+    test('requires both clients to agree for every size before claiming independent agreement', () => {
+        const checks = ['node', 'curl'].flatMap(client => ['1k', '900k'].map(size => ({ client, size, verdict: 'rejected' })));
+        expect(summarizeGzipChecks(checks)).toMatchObject({ gzipAccepted: false, gzipVerdict: 'rejected', independentAgreement: true });
+        expect(summarizeGzipChecks(checks.slice(0, -1)).independentAgreement).toBe(false);
+        expect(summarizeGzipChecks([...checks, { client: 'curl', size: '450k', verdict: 'inconclusive' }]))
+            .toMatchObject({ gzipAccepted: null, gzipVerdict: 'inconclusive', independentAgreement: false });
+    });
 });
 
 // ---- SOCKS5 (the kiro-sidecar sends socks5:// and socks5h:// proxies through reqwest) ----
